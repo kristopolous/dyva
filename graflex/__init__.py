@@ -224,9 +224,14 @@ def _store():
 
 
 def _store_record(service, host, status, record):
-    """Upsert one host RESULT row. status: 'working'|'notworking'. Overwrites status."""
-    _hoststore.upsert(_store(), service, host, status, record,
-                      record.get("checked") if isinstance(record, dict) else None)
+    """Upsert one host RESULT row. 'working' -> the `host` table (as before). 'notworking' ->
+    the `bad_hosts` table ONLY — never `host` — so a failed probe can never overwrite a good
+    record's payload. The export reduce resolves working-vs-bad by `checked` recency."""
+    checked = record.get("checked") if isinstance(record, dict) else None
+    if status == "notworking":
+        _hoststore.upsert_bad(_store(), service, host, record, checked)
+    else:
+        _hoststore.upsert(_store(), service, host, status, record, checked)
 
 
 def _store_discovery(service, host):
@@ -2836,8 +2841,14 @@ def _recorded_hosts(service):
     """Hosts that already have a check RESULT in the DB (status set) — the running
     record check-new skips against. A discovered-but-unchecked NULL host is NOT a
     record, so it still gets checked."""
-    cur = _store().execute("SELECT host FROM host WHERE service=? AND status IS NOT NULL", (service,))
-    return {h for (h,) in cur.fetchall()}
+    conn = _store()
+    recorded = {h for (h,) in conn.execute(
+        "SELECT host FROM host WHERE service=? AND status IS NOT NULL", (service,)).fetchall()}
+    # A demoted host now lives in bad_hosts (not host), but it IS recorded — check-new must
+    # still skip it rather than re-probe a known host.
+    recorded |= {h for (h,) in conn.execute(
+        "SELECT host FROM bad_hosts WHERE service=?", (service,)).fetchall()}
+    return recorded
 
 
 def _service_host_set(service):
@@ -2949,18 +2960,25 @@ async def _check_all(service, name=None, check_timeout=60, check_new=False, chec
         # check-all re-probes everything; plain check re-probes the unchecked (NULL) and
         # the previously-UNREACHABLE, skipping working + hard-errored; check-new without
         # -i (rare) re-probes only the never-recorded.
-        all_rows = _hoststore.rows(_store(), service)
-        if not all_rows:
+        # Candidate pool = every host in the store across BOTH tables: a demoted host lives in
+        # bad_hosts (not host), and check-all / the previously-unreachable re-probe must still
+        # reach it. Discovery normally also leaves a host row, so this is usually just `host`.
+        pool_hosts = _hoststore.all_hosts(_store(), service)
+        if not pool_hosts:
             log.warning(f"check: no {service or '?'} hosts in the store - run fetch first")
             return
-        hosts = [{"service": service, "host": h} for h, _p, _c in all_rows]
+        hosts = [{"service": service, "host": h} for h in pool_hosts]
         if check_all:
             done = set()
         elif check_new:
             done = _recorded_hosts(service)
         else:
             done = {h for h, _p, _c in _hoststore.rows(_store(), service, "working")}
-            done |= {h for h, p, _c in _hoststore.rows(_store(), service, "notworking")
+            # Skip hosts that HARD-errored (404/auth/bad JSON/...), so plain check doesn't
+            # re-doorknock a known-bad endpoint. New errors live in bad_hosts; legacy ones may
+            # still sit in host (they age out) — read both so the skip survives the table split.
+            done |= {h for h, p, _c in (_hoststore.rows(_store(), service, "notworking")
+                                        + _hoststore.bad_rows(_store(), service))
                      if isinstance(p, dict) and p.get("result") == "error"}
         to_check = [h for h in hosts if _entry_host(h) not in done]
         existing_working = None
@@ -3316,19 +3334,23 @@ async def _check_working(service, name=None, check_timeout=60, workers=10, sessi
                         rec[_gk] = entry[_gk]
                 _store_record(svc, host, "working", rec)
             else:
-                # SOFT-DELETE in real time: demote to notworking (row + payload kept, so it's
-                # reversible and self-heals on the next `check`). Print it live and append to
-                # the audit trail — rollback never needs a whole-pool backup.
                 reason = result.get("error", str(result)) if isinstance(result, dict) else str(result)
-                nw = {"url": f"http://{host}", "reason": reason, "result": "unreachable",
-                      "checked": datetime.now(timezone.utc).isoformat()}
-                for _gk in _GEO_CARRY:          # a dead host's last known location is wanted
-                    if _gk in entry:
-                        nw[_gk] = entry[_gk]
-                _store_record(svc, host, "notworking", nw)
-                removed += 1
-                log.info(f"~ {host} demoted ({reason})")
-                _audit_prune(svc, host, "working", reason)
+                if "timeout" in str(reason).lower():
+                    # Only a timeout (no response at all) demotes. Anything else — HTTP 404,
+                    # wrong dialect, auth, refused — means the host answered, so it's alive and
+                    # the working row is left untouched. SOFT-DELETE: row + payload kept, so it's
+                    # reversible and self-heals on the next `check`; audited as a delta.
+                    nw = {"url": f"http://{host}", "reason": reason, "result": "unreachable",
+                          "checked": datetime.now(timezone.utc).isoformat()}
+                    for _gk in _GEO_CARRY:          # a dead host's last known location is wanted
+                        if _gk in entry:
+                            nw[_gk] = entry[_gk]
+                    _store_record(svc, host, "notworking", nw)
+                    removed += 1
+                    log.info(f"~ {host} demoted ({reason})")
+                    _audit_prune(svc, host, "working", reason)
+                else:
+                    log.info(f"~ {host} kept ({reason})")
         completed += 1
 
     async def _progress():
@@ -4052,7 +4074,7 @@ def main():
     parser = argparse.ArgumentParser(description="Discover public image-generation hosts via FOFA")
     parser.add_argument("--ct", "--check-timeout", dest="check_timeout", type=int, default=60, help="per-host check timeout in seconds (default: 60)")
     parser.add_argument("--curlify", action="store_true", help="print curl command instead of executing")
-    parser.add_argument("-a", "--action", choices=["fetch", "check", "check-new", "check-all", "check-working", "check-zero", "fetch-check", "classify", "enrich", "survey", "reconstruct", "score-bogus", "sample", "strip"], required=True, help="action to perform")
+    parser.add_argument("-a", "--action", choices=["fetch", "check", "check-new", "check-all", "check-working", "check-zero", "fetch-check", "classify", "enrich", "survey", "reconstruct", "export", "score-bogus", "sample", "strip"], required=True, help="action to perform")
     parser.add_argument("-c", "--countries", help="comma-separated country codes to cycle (default: CN,US,CA,JP,KR)")
     parser.add_argument("-d", "--dry", action="store_true", help="report what fetch would do without saving")
     parser.add_argument("-e", "--servers", help="comma-separated server values to cycle (default: uvicorn,nginx)")
@@ -4139,6 +4161,14 @@ def main():
         for svc in pipe_services:
             reconstruct(name=(svc if all_services else (args.name or args.service)),
                         session=args.session)
+        return
+
+    if args.action == "export":
+        # Regenerate <service>-{working,notworking,hosts}.json from the DB (the lobotomy
+        # guard still applies — a >40% working.json shrink is held). `-s all` does every one.
+        log.info("--- export ---")
+        for svc in pipe_services:
+            export(svc)
         return
 
     if args.action in ("check-working", "check-zero"):

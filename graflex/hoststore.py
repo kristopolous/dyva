@@ -26,6 +26,19 @@ CREATE TABLE IF NOT EXISTS host (
   PRIMARY KEY (service, host)
 );
 CREATE INDEX IF NOT EXISTS host_svc_status ON host(service, status);
+
+-- A bad probe writes ONLY here, never to `host`, so a failed probe can never overwrite a
+-- good record's payload. Identical shape to `host`; status is always 'notworking'. Keyed
+-- (service, host): the latest bad observation per host. The export reduce resolves
+-- working-vs-bad by `checked` recency across both tables.
+CREATE TABLE IF NOT EXISTS bad_hosts (
+  service TEXT NOT NULL,
+  host    TEXT NOT NULL,
+  status  TEXT,
+  payload TEXT NOT NULL,
+  checked TEXT,
+  PRIMARY KEY (service, host)
+);
 """
 
 _UNSET = object()
@@ -52,6 +65,26 @@ def upsert(conn, service, host, status, payload, checked):
         (service, host, status, json.dumps(payload, ensure_ascii=False), checked),
     )
     conn.commit()
+
+
+def upsert_bad(conn, service, host, payload, checked):
+    """Record a BAD probe result. Writes ONLY to bad_hosts (status 'notworking') — never to
+    `host` — so a failed probe can never smash a good record's payload. Keyed (service, host),
+    holding the latest bad observation. The export reduce resolves working-vs-bad by `checked`
+    recency, so a stale bad row never suppresses a host that has since come back."""
+    conn.execute(
+        "INSERT INTO bad_hosts(service, host, status, payload, checked) VALUES(?,?,?,?,?) "
+        "ON CONFLICT(service, host) DO UPDATE SET "
+        "status=excluded.status, payload=excluded.payload, checked=excluded.checked",
+        (service, host, "notworking", json.dumps(payload, ensure_ascii=False), checked),
+    )
+    conn.commit()
+
+
+def bad_rows(conn, service):
+    """(host, payload_dict, checked) for every bad_hosts row of a service."""
+    cur = conn.execute("SELECT host, payload, checked FROM bad_hosts WHERE service=?", (service,))
+    return [(h, json.loads(p), c) for h, p, c in cur.fetchall()]
 
 
 def discover(conn, service, host, payload):
@@ -91,14 +124,60 @@ def export_files(conn, save_fn, cache_file_fn, service=None, force=False):
     sweep must not re-serialize every other service's whole (up to 32MB) file."""
     written = []
     for svc in ([service] if service is not None else services(conn)):
-        work = [p for _h, p, _c in sorted(rows(conn, svc, "working"), key=lambda r: (r[2] or "", r[0]))]
+        final = _reduce_service(conn, svc)
+        # working = LIST, sorted by (checked, host) — identical shape to before.
+        work = [p for _c, _h, p in sorted(
+            ((c, h, p) for h, (st, p, c) in final.items() if st == "working"),
+            key=lambda r: (r[0] or "", r[1]))]
         save_fn(cache_file_fn(svc, "working"), work, force=force)
-        notwork = {h: p for h, p, _c in rows(conn, svc, "notworking")}
+        notwork = {h: p for h, (st, p, _c) in final.items() if st == "notworking"}
         save_fn(cache_file_fn(svc, "notworking"), notwork, force=force)
-        hosts = [{"service": svc, "host": h} for h, _p, _c in rows(conn, svc)]
+        hosts = [{"service": svc, "host": h} for h in all_hosts(conn, svc)]
         save_fn(cache_file_fn(svc, "hosts"), hosts, force=force)
         written += [cache_file_fn(svc, s) for s in ("working", "notworking", "hosts")]
     return written
+
+
+def _reduce_service(conn, service):
+    """Final per-host status for a service by LAST-OBSERVATION-WINS across host + bad_hosts,
+    ordered by `checked` ascending — the chronological, serial reduce. `host` carries
+    working / notworking(legacy) / NULL(discovery); `bad_hosts` carries notworking. A working
+    row sets the host working; a notworking row (either table) sets it notworking; the latest
+    `checked` decides. Returns {host: (status, payload_dict, checked)}, excluding hosts whose
+    only observation is a NULL discovery row. A stale bad row can never suppress a host that
+    has a newer working row, and a bad probe can never erase the good payload — it lives in a
+    separate table and is only out-dated, never overwritten."""
+    seq = []
+    for st, h, p, c in conn.execute(
+            "SELECT status, host, payload, checked FROM host WHERE service=?", (service,)):
+        seq.append((c or "", 0, st, h, p))
+    for h, p, c in conn.execute(
+            "SELECT host, payload, checked FROM bad_hosts WHERE service=?", (service,)):
+        seq.append((c or "", 1, "notworking", h, p))
+    # Chronological, stable. On an exact `checked` tie the bad_hosts row (tiebreak 1) is applied
+    # after the host row (0), so a same-instant bad observation wins — conservative: a host that
+    # just failed is kept out of the routing export.
+    seq.sort(key=lambda r: (r[0], r[1]))
+    final = {}
+    for c, _o, st, h, p in seq:
+        if st == "working":
+            final[h] = ("working", json.loads(p), c)
+        elif st == "notworking":
+            final[h] = ("notworking", json.loads(p), c)
+        # NULL (discovery) contributes nothing to working/notworking.
+    return final
+
+
+def all_hosts(conn, service):
+    """Every host of a service across both tables (deduped). Discovery always inserts a `host`
+    row before any probe, so this is normally just `host`; bad_hosts-only hosts (defensive, and
+    the case where a demote precedes any discovery row) are unioned in so neither hosts.json nor
+    the re-probe candidate pool ever drops one."""
+    hs = [r[0] for r in conn.execute("SELECT host FROM host WHERE service=?", (service,))]
+    extra = [r[0] for r in conn.execute(
+        "SELECT host FROM bad_hosts WHERE service=? AND host NOT IN "
+        "(SELECT host FROM host WHERE service=?)", (service, service))]
+    return hs + extra
 
 
 def _import_one(conn, service, status, record, host):

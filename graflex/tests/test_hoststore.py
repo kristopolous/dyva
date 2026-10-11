@@ -161,6 +161,51 @@ def test_import_conflict_most_recent_checked_wins(tmp_path):
     assert got == {"stale-ok:1": "notworking", "fresh-ok:2": "working"}
 
 
+def test_upsert_bad_writes_bad_hosts_and_never_touches_host(tmp_path):
+    # THE guarantee: a bad probe can only ever write to bad_hosts. The good record in
+    # `host` (with its model payload) is structurally untouchable by a failed probe.
+    conn = hoststore.connect(str(tmp_path / "g.db"))
+    good = {"host": "a:1", "models": ["qwen"], "checked": "2026-01-01"}
+    hoststore.upsert(conn, "ollama", "a:1", "working", good, "2026-01-01")
+    hoststore.upsert_bad(conn, "ollama", "a:1", {"host": "a:1", "reason": "timeout"}, "2026-01-02")
+    # host row is byte-for-byte what it was — payload NOT smashed
+    hrow = conn.execute("SELECT status, payload FROM host WHERE service='ollama' AND host='a:1'").fetchone()
+    assert hrow[0] == "working"
+    assert json.loads(hrow[1]) == good
+    # the bad observation lives in its own table, keyed (service, host)
+    brow = conn.execute("SELECT status, payload, checked FROM bad_hosts WHERE service='ollama' AND host='a:1'").fetchone()
+    assert brow[0] == "notworking" and json.loads(brow[1])["reason"] == "timeout" and brow[2] == "2026-01-02"
+    # a second bad probe updates in place (latest bad observation), no second row
+    hoststore.upsert_bad(conn, "ollama", "a:1", {"host": "a:1", "reason": "refused"}, "2026-01-03")
+    assert conn.execute("SELECT COUNT(*) FROM bad_hosts").fetchone()[0] == 1
+
+
+def test_export_reduce_newer_bad_excludes_host_from_working(tmp_path):
+    # host says working (older) but bad_hosts says notworking (newer) -> the latest
+    # observation wins: dropped from working.json, listed in notworking.json.
+    conn = hoststore.connect(str(tmp_path / "g.db"))
+    hoststore.upsert(conn, "ollama", "a:1", "working", {"host": "a:1", "models": ["m"]}, "2026-01-01")
+    hoststore.upsert_bad(conn, "ollama", "a:1", {"host": "a:1", "reason": "timeout"}, "2026-02-01")
+    out = {}
+    hoststore.export_files(conn, lambda p, d, force=False: out.__setitem__(p.rsplit("/", 1)[-1], d),
+                           lambda s, x: f"/{s}-{x}.json")
+    assert out["ollama-working.json"] == []
+    assert out["ollama-notworking.json"] == {"a:1": {"host": "a:1", "reason": "timeout"}}
+
+
+def test_export_reduce_newer_working_beats_bad(tmp_path):
+    # Recovery: a host went bad (older) then came back working (newer) -> in working.json,
+    # dropped from notworking.json. Proves a stale bad row can never suppress a live host.
+    conn = hoststore.connect(str(tmp_path / "g.db"))
+    hoststore.upsert_bad(conn, "ollama", "a:1", {"host": "a:1", "reason": "timeout"}, "2026-01-01")
+    hoststore.upsert(conn, "ollama", "a:1", "working", {"host": "a:1", "models": ["m"]}, "2026-02-01")
+    out = {}
+    hoststore.export_files(conn, lambda p, d, force=False: out.__setitem__(p.rsplit("/", 1)[-1], d),
+                           lambda s, x: f"/{s}-{x}.json")
+    assert out["ollama-working.json"] == [{"host": "a:1", "models": ["m"]}]
+    assert out["ollama-notworking.json"] == {}
+
+
 def test_discover_never_downgrades(tmp_path):
     conn = hoststore.connect(str(tmp_path / "g.db"))
     hoststore.upsert(conn, "ollama", "a:1", "working", {"host": "a:1"}, "t")
