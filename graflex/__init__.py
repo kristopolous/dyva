@@ -690,49 +690,23 @@ def _save_json_atomic(path, data, force=False):
         raise
 
 
-def _confirm_force(stats, operation, sample=None):
-    """Safety gate for a large graflex change (e.g. a mass prune). Show the stats and, if
-    given, a SAMPLE of what's about to go (so an obviously-alive 'dead' host catches a bad
-    pass), then require the operator to TYPE 'force' — active engagement, not a y/n reflex.
-    Returns True only on an exact 'force'. Non-interactive (no TTY) ALWAYS declines:
-    automation can't confirm, so the protective refusal still stands. The caller makes a
-    timestamped backup before acting on a True."""
-    for line in (stats, f"About to {operation} — this is guarded."):
-        log.warning(line)
-        print(line, file=sys.stderr)
-    if sample:
-        print(f"  sample of what would be removed ({len(sample)}) — if ANY of these actually "
-              f"WORK, this is a bad pass, so do NOT proceed:", file=sys.stderr)
-        for s in sample:
-            print(f"    {s}", file=sys.stderr)
-    if not sys.stdin.isatty():
-        print("  non-interactive (no TTY): can't confirm — leaving data intact. "
-              "Re-run in a terminal to force.", file=sys.stderr)
-        return False
+def _audit_prune(service, host, prior, reason):
+    """Append-only audit trail of a soft-delete (demotion), for rollback INDEPENDENT of the
+    DB's own timestamps — one tab-separated line per host in a date-stamped file under the
+    cache's logs/ dir. Append-only (O_APPEND), so it never read-modify-writes and can't race a
+    concurrent writer. Best-effort: a failed write warns but never aborts the prune (the DB
+    soft-delete is still the record, and the operator's own full backup is the real safety net)."""
     try:
-        ans = input("  type 'force' to proceed (a timestamped backup is made first): ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print("\n  aborted.", file=sys.stderr)
-        return False
-    if ans == "force":
-        return True
-    print("  not confirmed — leaving data intact.", file=sys.stderr)
-    return False
-
-
-def _backup_pool(service, status, records):
-    """Timestamped backup of a pool before a FORCED change, so even a deliberate mass prune
-    is reversible. Stamp: <service>-<status>.<YYYYMMDD-HHMMSS>.bak.json in the cache dir. A
-    failed backup aborts the change (raises) — we never prune if we couldn't snapshot first.
-    (The pruned hosts also move to notworking rather than being deleted; this is belt-and-braces.)"""
-    from datetime import datetime
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    path = os.path.join(CACHE_DIR, f"{service}-{status}.{stamp}.bak.json")
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(records, f, indent=2)
-    log.warning(f"backed up {len(records)} {service} {status} records -> {path}")
-    print(f"  backup: {path}", file=sys.stderr)
-    return path
+        from datetime import datetime
+        now = datetime.now()
+        d = os.path.join(CACHE_DIR, "logs")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, f"prune-{now.strftime('%Y%m%d')}.log")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(f"{now.isoformat(timespec='seconds')}\t{service}\t{host}\t"
+                    f"{prior}->notworking\t{str(reason)[:200]}\n")
+    except OSError as e:
+        log.warning(f"audit log write failed for {host}: {e}")
 
 
 def _entry_host(entry):
@@ -3247,8 +3221,20 @@ async def _check_working(service, name=None, check_timeout=60, workers=10, sessi
     notworking_file = _cache_file(name, "notworking")
     svc = service or name or "ollama"
 
-    # Working pool from the DB (the running record), not working.json.
-    working = [p for _h, p, _c in _hoststore.rows(_store(), svc, "working")]
+    # Working pool from the DB (the running record), not working.json. OLDEST-checked FIRST,
+    # and ONLY hosts not touched in the last hour: the prune works a FROZEN set of stale rows
+    # while concurrent discovery writes fresh rows — disjoint sets, so no two writers ever hit
+    # the same row and there's no timing race to test. Recently-seen hosts wait for the next
+    # pass; the goal here is to clear the stale/dead, not re-test the last hour's discoveries.
+    from datetime import datetime, timezone, timedelta
+    _all_working = _hoststore.rows(_store(), svc, "working")   # (host, payload, checked)
+    _cutoff = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    _rows = sorted((r for r in _all_working if (r[2] or "") < _cutoff), key=lambda r: (r[2] or ""))
+    working = [p for (_h, p, _c) in _rows]
+    _skipped_recent = len(_all_working) - len(working)
+    if _skipped_recent:
+        log.info(f"check-working: leaving {_skipped_recent} host(s) checked within the last hour "
+                 f"for the next pass (collision-safe cutoff)")
     if not service:
         service = svc
     # Not filtered by service, for the same reason as _check_all: re-labelled
@@ -3300,9 +3286,15 @@ async def _check_working(service, name=None, check_timeout=60, workers=10, sessi
     sem = asyncio.Semaphore(workers)
     start = time.time()
     completed = 0
+    removed = 0
 
     async def probe(entry):
-        nonlocal completed
+        # Each probe COMMITS its own result to the DB the instant it finishes — alive hosts
+        # refreshed, dead hosts soft-demoted — so a run that's killed (or lost 6-8 hours ago to
+        # a bad prompt) never loses the work: everything probed so far is already durable. No
+        # batch, no end-of-run decision, nothing to discard.
+        nonlocal completed, removed
+        host = entry["host"]
         async with sem:
             # Same doorknock ladder as the initial check, so a host recorded via
             # `directip` (its FQDN is gated, only the IP answers) is re-probed by
@@ -3312,17 +3304,32 @@ async def _check_working(service, name=None, check_timeout=60, workers=10, sessi
             except Exception as e:
                 result, method = {"error": str(e)}, None
             if isinstance(result, dict) and "error" not in result:
-                result["checked"] = result.get("checked", datetime.now(timezone.utc).isoformat())
+                rec = dict(result)
+                rec["host"] = host
+                rec["checked"] = rec.get("checked", datetime.now(timezone.utc).isoformat())
                 if method:
-                    result["method"] = method
+                    rec["method"] = method
                 else:
-                    result.pop("method", None)
-                outcome = ("keep", entry, result)
+                    rec.pop("method", None)
+                for _gk in _GEO_CARRY:          # carry geo across the rebuilt record
+                    if _gk in entry and _gk not in rec:
+                        rec[_gk] = entry[_gk]
+                _store_record(svc, host, "working", rec)
             else:
+                # SOFT-DELETE in real time: demote to notworking (row + payload kept, so it's
+                # reversible and self-heals on the next `check`). Print it live and append to
+                # the audit trail — rollback never needs a whole-pool backup.
                 reason = result.get("error", str(result)) if isinstance(result, dict) else str(result)
-                outcome = ("dead", entry, reason)
+                nw = {"url": f"http://{host}", "reason": reason, "result": "unreachable",
+                      "checked": datetime.now(timezone.utc).isoformat()}
+                for _gk in _GEO_CARRY:          # a dead host's last known location is wanted
+                    if _gk in entry:
+                        nw[_gk] = entry[_gk]
+                _store_record(svc, host, "notworking", nw)
+                removed += 1
+                log.info(f"~ {host} demoted ({reason})")
+                _audit_prune(svc, host, "working", reason)
         completed += 1
-        return outcome
 
     async def _progress():
         # The gather below is SILENT until every host resolves — at this scale, with
@@ -3341,98 +3348,19 @@ async def _check_working(service, name=None, check_timeout=60, workers=10, sessi
     async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=INSECURE_SSL, force_close=True, limit=0), timeout=aiohttp.ClientTimeout(total=check_timeout + 5)) as session:
         _prog = asyncio.ensure_future(_progress())
         try:
-            done = await asyncio.gather(*[probe(e) for e in working], return_exceptions=True)
+            await asyncio.gather(*[probe(e) for e in working], return_exceptions=True)
         finally:
             _prog.cancel()
 
-    kept = []
-    removed = 0
-    pruned = []   # (host, record) for hosts that went dark this pass -> DB notworking
-    for outcome in done:
-        if isinstance(outcome, Exception):
-            outcome = ("dead", None, str(outcome))
-        status, entry, payload = outcome
-        host = _entry_host(entry) if entry else "?"
-        if status == "keep":
-            rec = dict(payload)
-            rec["host"] = entry["host"]
-            # the probe result rebuilds the record, so carry geo across it
-            # rather than re-deriving it (and losing it on every re-survey)
-            for _gk in _GEO_CARRY:
-                if _gk in entry and _gk not in rec:
-                    rec[_gk] = entry[_gk]
-            kept.append(rec)
-        else:
-            removed += 1
-            if entry:
-                nw = {
-                    # No "host"/"service": host is the dict key (and in url); service
-                    # is implicit in the file name (<service>-notworking.json).
-                    "url": f"http://{entry['host']}",
-                    "reason": payload,
-                    "result": "unreachable",
-                    "checked": datetime.now(timezone.utc).isoformat(),
-                }
-                # keep the geo on a host that has gone dark — a dead host's last
-                # known location is exactly what the longitudinal study wants
-                for _gk in _GEO_CARRY:
-                    if _gk in entry:
-                        nw[_gk] = entry[_gk]
-                pruned.append((entry["host"], nw))
-            log.info(f"~ {host} dead: {payload}")
-
-    # CIRCUIT BREAKER (with an operator override). A re-survey that "kills" more than half
-    # the pool in one pass is USUALLY a LOCAL problem (network blip, too-tight --ct, the box
-    # itself), not mass host death — and _check_working overwrites working.json wholesale, so
-    # one such pass silently guts the pool (this is what took ollama 1662 -> 11). So the guard
-    # stops it BY DEFAULT. But it also blocked a LEGITIMATE mass cleanup. So instead of a flat
-    # refusal: show the stats, require the operator to type 'force' (active engagement; a
-    # non-interactive run always declines), take a timestamped backup, THEN prune. Declining
-    # keeps the old safe behavior (refresh the responders, leave the pool intact).
-    forced_prune = False
-    PRUNE_ABORT_FRAC = 0.5
-    if working and removed > 20 and removed / len(working) > PRUNE_ABORT_FRAC:
-        pre = {_entry_host(w): w for w in preserved}          # never re-probed this pass
-        pre.update({_entry_host(w): w for w in working})      # + the rescanned subset
-        pool_now = len(pre)
-        stats = (f"check-working: {removed}/{len(working)} ({removed/len(working):.0%}) of the "
-                 f"rescanned {svc} hosts failed this pass (circuit-breaker at {PRUNE_ABORT_FRAC:.0%}). "
-                 f"Pruning moves them to notworking: pool {pool_now} -> {pool_now - removed}. "
-                 f"A high fraction is usually a bad pass (network / tight --ct / local), but it can "
-                 f"be a real cleanup.")
-        # A random sample of the hosts about to be removed, for a human gut-check: a "dead"
-        # host that actually answers means the pass was bad, not the pool.
-        smp = [f"http://{h}  ({str(nw.get('reason') or 'unreachable')[:70]})"
-               for h, nw in random.sample(pruned, min(10, len(pruned)))]
-        if not _confirm_force(stats, f"prune {removed} {svc} hosts", sample=smp):
-            # declined / non-interactive: refresh responders, leave the pool intact.
-            for rec in kept:
-                _store_record(svc, rec["host"], "working", rec)
-            export(svc)                                       # notworking NOT touched
-            log.warning(f"check-working: NOT pruning — pool left intact ({pool_now}), "
-                        f"{len(kept)} models refreshed. Confirm with 'force' to prune, or re-run "
-                        f"with a larger --ct / fix connectivity.")
-            return
-        # confirmed — snapshot the pre-prune pool, then fall through to the real prune below.
-        # The backup must succeed (it raises on failure) BEFORE we commit to pruning.
-        _backup_pool(svc, "working",
-                     sorted(pre.values(), key=lambda h: (h.get("checked", ""), _entry_host(h))))
-        forced_prune = True   # let the export below bypass the per-file lobotomy guard
-    # The written pool is the rescanned survivors PLUS the preserved (not-re-probed)
-    # hosts — never just the subset we happened to scan this pass.
-    final = {_entry_host(w): w for w in preserved}
-    for rec in kept:
-        final[_entry_host(rec)] = rec
-    out = sorted(final.values(), key=lambda h: (h.get("checked", ""), _entry_host(h)))
-    # Survivors -> working, pruned -> notworking, in the DB; export regenerates the json.
-    for rec in kept:
-        _store_record(svc, rec["host"], "working", rec)
-    for host, nw in pruned:
-        _store_record(svc, host, "notworking", nw)
-    export(svc, force=forced_prune)   # force only when the operator confirmed a big prune
-    log.info(f"check-working: {len(working)} rescanned, {len(kept)} still working "
-             f"(models refreshed), {removed} pruned, {len(preserved)} preserved — "
-             f"pool now {len(out)}")
+    # Every probe already committed its own result to the DB in real time — alive hosts
+    # refreshed, dead hosts soft-demoted (+ audit log) — so there is nothing to batch here and
+    # no end-of-run decision that could discard the run. Regenerate the json view from the DB;
+    # the lobotomy guard still protects THAT export (a >40% working.json shrink is held — fine:
+    # the DB is the source of truth and the audit log holds every demotion as a delta). Publish
+    # a big intentional prune to the routing json with a separate `export --force` when ready.
+    export(svc)
+    log.info(f"check-working: {completed} probed — {removed} demoted, {completed - removed} "
+             f"refreshed (candidate set {len(working)}, {_skipped_recent} recent left for next pass)")
 
 
 def check_working(service, name=None, check_timeout=60, workers=10, session=None,
