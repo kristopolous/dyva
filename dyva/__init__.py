@@ -3937,15 +3937,18 @@ def _find_servers_raw(sub, caps=None):
                  if v.get("host") == host),
                 None)
         is_last = _last is not None and host == _last[0]
-        # A manual 👎 (deprio < 0) STRIPS the sticky top-slot. Otherwise a down-voted
-        # last-good host keeps TIER_LAST — its own tier, ahead of TIER_GOOD — and is routed
-        # to FIRST every time, where the within-tier vote (applied in _race_servers) can
-        # never sink it below the good hosts. "I deprioritized it and it's still tried first."
-        # Dropping it to its real tier lets the vote push it to the back; reputation is
-        # untouched (it's not marked bad), so this stays orthogonal to self-healing.
-        if is_last and votes and any(votes.get((host, m), 0) < 0 for m in ms):
-            is_last = False
+        down_voted = bool(votes) and any(votes.get((host, m), 0) < 0 for m in ms)
+        if down_voted:
+            is_last = False     # a 👎 host can't hold the sticky top-slot
         prio = host_tier(is_last, in_good, in_maybe, in_bad, host in unreachable)
+        if down_voted:
+            # A manual 👎 pushes the host to the BACK — the user said "don't send me right
+            # back to this one", so it stops being a first/early pick and becomes a LAST
+            # RESORT (tried only once everything else is exhausted). Before this, a down-vote
+            # only reordered WITHIN a tier, so a disliked good/sticky host was still raced
+            # first. It stays a candidate and is NOT marked bad in the reputation DB — a
+            # routing-time demotion, orthogonal to self-healing and reversible with 👍.
+            prio = max(prio, TIER_BAD)
         if EXPLORE_MODE:
             # Explore cascade (perpetual, LRU-cycled): race the never-raced frontier
             # first, then LOSERS (raced but never won and no verdict — only ever
@@ -3995,11 +3998,13 @@ def all_models():
 
 
 def parse_model_list(v):
-    """Accept the override as a list of names or as one newline/comma-separated
-    blob (what the dashboard textarea sends). Blank lines and #comments drop out,
-    order and duplicates-after-the-first do not."""
+    """Accept the override as a list of names or as one NEWLINE-separated blob (what the
+    dashboard textarea sends). One entry per line — a comma is NOT a separator here, it's
+    valid INSIDE an entry (the fallback-chain operator, e.g. "qwen3.8,gemma4"), so splitting
+    on it would shatter a chain. Blank lines and #comments drop out, order and
+    duplicates-after-the-first do not."""
     if isinstance(v, str):
-        v = re.split(r"[\r\n,]+", v)
+        v = re.split(r"[\r\n]+", v)
     if not isinstance(v, list):
         return []
     out = []
@@ -7763,20 +7768,11 @@ async def handle_host_info(request):
     def _bare(u):
         return re.sub(r"^https?://", "", u or "").rstrip("/")
 
+    # Exact (bare) match: the HOSTS search resolves partials to a concrete address first
+    # (see handle_host_search), so here we only view ONE host. An unmatched address still
+    # returns a graceful card (found:false) with whatever reputation dyva has for it.
     target = _bare(host)
-    servers = load_servers()
-    rec = next((s for s in servers if _bare(s.get("server")) == target), None)
-    if rec is None and target:
-        # No exact match — resolve a PARTIAL the user typed (e.g. a bare IP without the
-        # port). A UNIQUE substring match is taken as the host; SEVERAL matches come back as
-        # candidates for the client to disambiguate (the host card shows a "did you mean"
-        # list). This is what lets the HOSTS search open a card from just an address.
-        subs = [s for s in servers if target in _bare(s.get("server") or "")]
-        if len(subs) == 1:
-            rec = subs[0]
-        elif len(subs) > 1:
-            cands = sorted({_bare(s.get("server")) for s in subs if s.get("server")})
-            return web.json_response({"host": host, "found": False, "candidates": cands[:50]})
+    rec = next((s for s in load_servers() if _bare(s.get("server")) == target), None)
     server_url = rec.get("server") if rec else host
 
     out = {"host": server_url, "found": rec is not None}
@@ -7819,6 +7815,46 @@ async def handle_host_info(request):
     if rec is None and not out.get("reputation"):
         return web.json_response(out, status=404)
     return web.json_response(out)
+
+
+HOST_SEARCH_MAX = 200   # cap the pick-list; the search ERRS toward too many, but bounded
+
+
+async def handle_host_search(request):
+    """
+    Hosts whose address matches a query, for the HOSTS search box.
+    ---
+    tags: [UI]
+    summary: GET /host-search?q= — a filter over host ADDRESSES for the pick-list
+    description: >
+      Matches the full host:port (and the bare address) against q. If q contains a glob
+      metacharacter it is matched as a glob, otherwise as a plain substring — either way with
+      contains semantics, so "117*76" or "76.29" both find 117.172.76.29:11434. Errs toward
+      MORE matches (Enter is a filter, then you click a row to view the card), capped for size.
+    responses:
+      '200':
+        description: Matching host addresses
+    """
+    q = (request.query.get("q") or "").strip()
+    if not q:
+        return web.json_response({"q": q, "matches": [], "truncated": False})
+    tq = re.sub(r"^https?://", "", q).rstrip("/").lower()
+    is_glob = ("*" in tq) or ("?" in tq)
+    pat = "*" + tq.strip("*") + "*" if is_glob else None   # contains-semantics for the glob too
+    def _hit(b):
+        return fnmatch.fnmatch(b, pat) if is_glob else (tq in b)
+    out, seen = [], set()
+    for s in load_servers():
+        b = re.sub(r"^https?://", "", s.get("server") or "").rstrip("/")
+        bl = b.lower()
+        if not b or bl in seen or not _hit(bl):
+            continue
+        seen.add(bl)
+        out.append({"host": b, "service": s.get("service")})
+        if len(out) >= HOST_SEARCH_MAX:
+            break
+    out.sort(key=lambda r: r["host"])
+    return web.json_response({"q": q, "matches": out, "truncated": len(out) >= HOST_SEARCH_MAX})
 
 
 async def handle_guide(request):
@@ -16624,6 +16660,7 @@ def make_app():
     swagger.add_get("/reload-hosts", handle_reload_hosts)
     swagger.add_post("/shutdown", handle_shutdown)
     swagger.add_get("/host-info", handle_host_info)
+    swagger.add_get("/host-search", handle_host_search)
     swagger.add_get("/api/stats", handle_stats)
     swagger.add_get("/api/source-stats", handle_source_stats)
     swagger.add_get("/api/service-stats", handle_service_stats)

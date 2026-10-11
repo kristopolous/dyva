@@ -246,12 +246,14 @@ def _export_offthread(service):
         conn.close()
 
 
-def export(service=None):
+def export(service=None, force=False):
     """Regenerate <service>-{working,notworking,hosts}.json from the DB, in the exact shapes
     dyva and resume consume. Called at the end of a check (and periodically during one) so the
     json files stay a faithful, byte-shape-identical view of the store. service=None does every
-    service (migration/standalone); a name does only that service's three files (periodic flush)."""
-    return _hoststore.export_files(_store(), _save_json_atomic, _cache_file, service)
+    service (migration/standalone); a name does only that service's three files (periodic flush).
+    force=True bypasses the per-file LOBOTOMY guard — only for an operator-confirmed prune that
+    has already made a backup (see _check_working's circuit breaker)."""
+    return _hoststore.export_files(_store(), _save_json_atomic, _cache_file, service, force=force)
 
 
 def _import_if_empty():
@@ -636,8 +638,12 @@ def _record_count(x):
     return len(x) if isinstance(x, (list, dict)) else 0
 
 
-def _save_json_atomic(path, data):
+def _save_json_atomic(path, data, force=False):
     """Write JSON so a concurrent writer can't corrupt the result.
+
+    `force=True` bypasses the LOBOTOMY guard below — used only when the operator has
+    explicitly confirmed a large shrink (a forced prune), which has already made a
+    timestamped backup. Every normal/automated write keeps the guard.
 
     The temp name has to be unique per write. With a fixed `path + ".tmp"`,
     two writers of the same cache share one temp file: the second
@@ -657,7 +663,7 @@ def _save_json_atomic(path, data):
     # (Normal operation only appends, so it never trips; and refusing self-heals —
     # the next read sees the intact file and re-appends correctly.)
     try:
-        if os.path.exists(path):
+        if not force and os.path.exists(path):
             with open(path, encoding="utf-8") as f:
                 prev_n = _record_count(json.load(f))
             new_n = _record_count(data)
@@ -682,6 +688,51 @@ def _save_json_atomic(path, data):
         except OSError:
             pass
         raise
+
+
+def _confirm_force(stats, operation, sample=None):
+    """Safety gate for a large graflex change (e.g. a mass prune). Show the stats and, if
+    given, a SAMPLE of what's about to go (so an obviously-alive 'dead' host catches a bad
+    pass), then require the operator to TYPE 'force' — active engagement, not a y/n reflex.
+    Returns True only on an exact 'force'. Non-interactive (no TTY) ALWAYS declines:
+    automation can't confirm, so the protective refusal still stands. The caller makes a
+    timestamped backup before acting on a True."""
+    for line in (stats, f"About to {operation} — this is guarded."):
+        log.warning(line)
+        print(line, file=sys.stderr)
+    if sample:
+        print(f"  sample of what would be removed ({len(sample)}) — if ANY of these actually "
+              f"WORK, this is a bad pass, so do NOT proceed:", file=sys.stderr)
+        for s in sample:
+            print(f"    {s}", file=sys.stderr)
+    if not sys.stdin.isatty():
+        print("  non-interactive (no TTY): can't confirm — leaving data intact. "
+              "Re-run in a terminal to force.", file=sys.stderr)
+        return False
+    try:
+        ans = input("  type 'force' to proceed (a timestamped backup is made first): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\n  aborted.", file=sys.stderr)
+        return False
+    if ans == "force":
+        return True
+    print("  not confirmed — leaving data intact.", file=sys.stderr)
+    return False
+
+
+def _backup_pool(service, status, records):
+    """Timestamped backup of a pool before a FORCED change, so even a deliberate mass prune
+    is reversible. Stamp: <service>-<status>.<YYYYMMDD-HHMMSS>.bak.json in the cache dir. A
+    failed backup aborts the change (raises) — we never prune if we couldn't snapshot first.
+    (The pruned hosts also move to notworking rather than being deleted; this is belt-and-braces.)"""
+    from datetime import datetime
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = os.path.join(CACHE_DIR, f"{service}-{status}.{stamp}.bak.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2)
+    log.warning(f"backed up {len(records)} {service} {status} records -> {path}")
+    print(f"  backup: {path}", file=sys.stderr)
+    return path
 
 
 def _entry_host(entry):
@@ -3330,29 +3381,43 @@ async def _check_working(service, name=None, check_timeout=60, workers=10, sessi
                 pruned.append((entry["host"], nw))
             log.info(f"~ {host} dead: {payload}")
 
-    # CIRCUIT BREAKER: a re-survey that "kills" more than half the pool in one pass
-    # is almost always a LOCAL problem (network blip, too-tight --ct, the box itself),
-    # not mass host death — and _check_working overwrites working.json wholesale, so
-    # one such pass silently guts the pool (this is what took ollama 1662 -> 11). When
-    # the prune fraction is implausibly high, DON'T prune: refresh the model lists of
-    # the hosts that did answer, leave the rest in the pool untouched, and warn loudly.
+    # CIRCUIT BREAKER (with an operator override). A re-survey that "kills" more than half
+    # the pool in one pass is USUALLY a LOCAL problem (network blip, too-tight --ct, the box
+    # itself), not mass host death — and _check_working overwrites working.json wholesale, so
+    # one such pass silently guts the pool (this is what took ollama 1662 -> 11). So the guard
+    # stops it BY DEFAULT. But it also blocked a LEGITIMATE mass cleanup. So instead of a flat
+    # refusal: show the stats, require the operator to type 'force' (active engagement; a
+    # non-interactive run always declines), take a timestamped backup, THEN prune. Declining
+    # keeps the old safe behavior (refresh the responders, leave the pool intact).
+    forced_prune = False
     PRUNE_ABORT_FRAC = 0.5
     if working and removed > 20 and removed / len(working) > PRUNE_ABORT_FRAC:
-        by_host = {_entry_host(w): w for w in preserved}      # never re-probed this pass
-        by_host.update({_entry_host(w): w for w in working})  # + the rescanned subset
-        for rec in kept:                                      # refresh the responders
-            by_host[_entry_host(rec)] = rec
-        merged = sorted(by_host.values(), key=lambda h: (h.get("checked", ""), _entry_host(h)))
-        # Refusing to prune: only the refreshed responders change in the DB; the dead
-        # hosts keep their working status. Export regenerates working.json.
-        for rec in kept:
-            _store_record(svc, rec["host"], "working", rec)
-        export(svc)                                           # notworking NOT touched
-        log.warning(f"check-working: {removed}/{len(working)} ({removed/len(working):.0%}) failed this "
-                    f"pass — that's a bad pass (network / tight --ct / local), not mass host death. "
-                    f"REFUSING to prune; pool left intact ({len(merged)}), {len(kept)} models refreshed. "
-                    f"Re-run with a larger --ct or fix connectivity.")
-        return
+        pre = {_entry_host(w): w for w in preserved}          # never re-probed this pass
+        pre.update({_entry_host(w): w for w in working})      # + the rescanned subset
+        pool_now = len(pre)
+        stats = (f"check-working: {removed}/{len(working)} ({removed/len(working):.0%}) of the "
+                 f"rescanned {svc} hosts failed this pass (circuit-breaker at {PRUNE_ABORT_FRAC:.0%}). "
+                 f"Pruning moves them to notworking: pool {pool_now} -> {pool_now - removed}. "
+                 f"A high fraction is usually a bad pass (network / tight --ct / local), but it can "
+                 f"be a real cleanup.")
+        # A random sample of the hosts about to be removed, for a human gut-check: a "dead"
+        # host that actually answers means the pass was bad, not the pool.
+        smp = [f"http://{h}  ({str(nw.get('reason') or 'unreachable')[:70]})"
+               for h, nw in random.sample(pruned, min(10, len(pruned)))]
+        if not _confirm_force(stats, f"prune {removed} {svc} hosts", sample=smp):
+            # declined / non-interactive: refresh responders, leave the pool intact.
+            for rec in kept:
+                _store_record(svc, rec["host"], "working", rec)
+            export(svc)                                       # notworking NOT touched
+            log.warning(f"check-working: NOT pruning — pool left intact ({pool_now}), "
+                        f"{len(kept)} models refreshed. Confirm with 'force' to prune, or re-run "
+                        f"with a larger --ct / fix connectivity.")
+            return
+        # confirmed — snapshot the pre-prune pool, then fall through to the real prune below.
+        # The backup must succeed (it raises on failure) BEFORE we commit to pruning.
+        _backup_pool(svc, "working",
+                     sorted(pre.values(), key=lambda h: (h.get("checked", ""), _entry_host(h))))
+        forced_prune = True   # let the export below bypass the per-file lobotomy guard
     # The written pool is the rescanned survivors PLUS the preserved (not-re-probed)
     # hosts — never just the subset we happened to scan this pass.
     final = {_entry_host(w): w for w in preserved}
@@ -3364,7 +3429,7 @@ async def _check_working(service, name=None, check_timeout=60, workers=10, sessi
         _store_record(svc, rec["host"], "working", rec)
     for host, nw in pruned:
         _store_record(svc, host, "notworking", nw)
-    export(svc)
+    export(svc, force=forced_prune)   # force only when the operator confirmed a big prune
     log.info(f"check-working: {len(working)} rescanned, {len(kept)} still working "
              f"(models refreshed), {removed} pruned, {len(preserved)} preserved — "
              f"pool now {len(out)}")

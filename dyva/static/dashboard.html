@@ -555,6 +555,7 @@ table.hd-model-kv td.hd-kv-k{color:var(--text-faint);white-space:nowrap}
 .hd-attr{margin-top:1em;font-size:.64rem;color:var(--text-faint)}
 .hd-cand{padding:6px 8px;margin-top:4px;border:1px solid var(--border);border-radius:var(--r-md);background:var(--bg-inset);color:var(--text-2);font-family:var(--font-mono);font-size:.8rem;cursor:pointer}
 .hd-cand:hover{background:var(--accent-bg);color:var(--text);border-color:var(--border-hover)}
+.hd-cand-svc{float:right;color:var(--text-faint);font-size:.72rem;font-family:var(--font-ui)}
 .host-checked{color:var(--text-dim);flex-shrink:0;padding-left:var(--sp-3);white-space:nowrap;font-size:var(--fs-xs)}
 .host-model{font-family:var(--font-mono);font-size:var(--fs-sm);color:var(--text-dim);max-width:50%;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .skip-link{opacity:0;color:var(--accent);font-size:var(--fs-xs);text-decoration:underline;margin:0 var(--sp-3);flex-shrink:0;transition:opacity .1s}
@@ -2516,15 +2517,33 @@ function _wireHostVotes(){
       }).catch(function(){b.disabled=false;});
   });
 }
-// HOSTS-card search: resolve a typed address to its host card. The backend (host-info)
-// handles exact / unique-partial / ambiguous matching; we just open the detail card and
-// bring it into view (it sits above the HOSTS card, so a search from there would otherwise
-// land off-screen).
+// HOSTS-card search (on Enter, never per-keystroke): a FILTER over host addresses. The
+// backend matches a substring, or a glob if the query has * / ? — contains-semantics either
+// way, erring toward MORE matches. We render the results as a click-to-view pick-list in the
+// detail card (which sits above the HOSTS card, so bring it into view).
 function hostLookup(val){
   val=(val||'').trim(); if(!val)return;
-  openHostDetail(val);
-  var c=document.getElementById('hostDetailCard');
-  if(c&&c.scrollIntoView)c.scrollIntoView({behavior:'smooth',block:'start'});
+  var card=document.getElementById('hostDetailCard'),body=document.getElementById('hostDetailBody');
+  if(!card||!body)return;
+  var ttl=document.getElementById('hostDetailTitle'); if(ttl)ttl.textContent='Search';
+  body.removeAttribute('data-host');
+  body.innerHTML='<div class="hd-attr">searching…</div>';
+  card.style.display='';
+  if(card.scrollIntoView)card.scrollIntoView({behavior:'smooth',block:'start'});
+  fetch('host-search?q='+encodeURIComponent(val),{cache:'no-store'})
+    .then(function(r){return r.json()})
+    .then(function(j){
+      var ms=(j&&j.matches)||[];
+      if(!ms.length){body.innerHTML='<div class="hd-attr">no hosts match “'+escHtml(val)+'”</div>';return;}
+      var n=ms.length+(j.truncated?'+':'');
+      var h='<div class="hd-attr">'+n+' host'+(ms.length===1?'':'s')+' match “'+escHtml(val)+'” — click to view:</div>';
+      h+=ms.map(function(m){
+        var svc=m.service?' <span class="hd-cand-svc">'+escHtml(m.service)+'</span>':'';
+        return '<div class="hd-cand" onclick="openHostDetail('+JSON.stringify(m.host).replace(/"/g,'&quot;')+')">'+escHtml(m.host)+svc+'</div>';
+      }).join('');
+      body.innerHTML=h;
+    })
+    .catch(function(){body.innerHTML='<div class="hd-attr">search failed</div>';});
 }
 function openHostDetail(host){
   var card=document.getElementById('hostDetailCard'),body=document.getElementById('hostDetailBody');
@@ -2551,14 +2570,6 @@ function usageEmoji(served,failed,won,lost){
   return p.join('  ');
 }
 function hostDetailHtml(host,j){
-  // Ambiguous lookup: the typed text matched several hosts — show a "did you mean" list
-  // of clickable candidates instead of a card for a host we didn't actually resolve.
-  if(j&&j.candidates&&j.candidates.length){
-    var cl=j.candidates.map(function(c){
-      return '<div class="hd-cand" onclick="hostLookup('+JSON.stringify(c).replace(/"/g,'&quot;')+')">'+escHtml(c)+'</div>';
-    }).join('');
-    return '<div class="hd-attr">'+j.candidates.length+' hosts match “'+escHtml(host)+'” — did you mean:</div>'+cl;
-  }
   var h=[];
   var url=j.host||host, href=/^https?:\/\//.test(url)?url:('http://'+url);
   if(j&&j.found===false)h.push('<div class="hd-attr">No survey record for “'+escHtml(host)+'”. Reputation shown below if dyva has routed to it.</div>');
@@ -4479,7 +4490,7 @@ var SLASH_COMMANDS=[
   {cmd:'next',     arg:'',         desc:'drop this model’s sticky host and move to the next one'},
   {cmd:'test',     arg:'',         desc:'probe the hosts with the quick test and cull the bogus ones'},
   {cmd:'retitle',  arg:'',         desc:'regenerate the chat title'},
-  {cmd:'compact',  arg:'',         desc:'summarize the chat so far to free up context'},
+  {cmd:'compact',  arg:'[model]',  desc:'summarize the chat so far to free up context (optionally with a given model)'},
   {cmd:'download', arg:'',         desc:'download this chat as JSON'},
   {cmd:'delete',   arg:'',         desc:'delete the current chat'},
   {cmd:'list',     arg:'',         desc:'system prompt, tools, host and files for this chat'}
@@ -4703,7 +4714,7 @@ function _cheapCompact(msgs){
 // /compact — summarize the conversation and replace the history with [summary] +
 // the last couple of turns, so a long chat keeps fitting a small pool model's
 // context window (the truncation problem). One-shot api/chat call, like regenTitle.
-async function compactChat(chat){
+async function compactChat(chat,modelOverride){
   chat=chat||currentChat;
   var all=(chat&&chat.messages)||[];
   var KEEP=2;                                   // keep the last turn(s) verbatim
@@ -4716,7 +4727,10 @@ async function compactChat(chat){
     .map(function(m){return (m.role||'?')+': '+String(m.content)})
     .join('\n\n').slice(0,12000);
   if(!transcript)return {ok:false,error:'nothing to summarize'};
-  var model=chat.model||document.getElementById('chatModel').value.trim()||'*';
+  // `/compact <model>` summarizes with THAT model (routing pattern, like any dyva name) —
+  // e.g. a small fast model does the compaction while the chat stays on a big one. No arg =
+  // the chat's own model.
+  var model=(modelOverride&&modelOverride.trim())||chat.model||document.getElementById('chatModel').value.trim()||'*';
   try{
     var r=await fetch('api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({model:model,stream:false,messages:[
@@ -4767,8 +4781,8 @@ function handleSlashCommand(text){
       else note.set('Couldn’t retitle: '+escHtml((res&&res.error)||'unknown error'),'err');
     });
   }else if(cmd==='compact'){
-    var cnote=info('Compacting the conversation…','working');
-    compactChat(currentChat).then(function(res){
+    var cnote=info('Compacting the conversation'+(arg?' with `'+escHtml(arg)+'`':'')+'…','working');
+    compactChat(currentChat,arg).then(function(res){
       if(res&&res.ok)renderMessages();   // re-render to the compacted state (summary + last turns)
       else cnote.set('Couldn’t compact: '+escHtml((res&&res.error)||'unknown error'),'err');
     });
@@ -9407,10 +9421,12 @@ function setModelList(list,on){
   var cb=document.getElementById('setModelListOn');
   if(cb&&on!==undefined)cb.checked=!!on;
 }
-// same dedup/comment rules the server applies, so Save stores exactly what's shown
+// same dedup/comment rules the server applies, so Save stores exactly what's shown.
+// Split on NEWLINES ONLY — a comma is valid INSIDE an entry (it's the fallback-chain
+// separator, e.g. "qwen3.8,gemma4"), so splitting on it would break a chain into pieces.
 function parseModelList(text){
   var out=[],seen={};
-  String(text||'').split(/[\r\n,]+/).forEach(function(l){
+  String(text||'').split(/[\r\n]+/).forEach(function(l){
     var n=l.trim();
     if(!n||n.charAt(0)==='#'||seen[n])return;
     seen[n]=1;out.push(n);

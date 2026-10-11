@@ -79,7 +79,7 @@ def services(conn):
     return [r[0] for r in conn.execute("SELECT DISTINCT service FROM host ORDER BY service").fetchall()]
 
 
-def export_files(conn, save_fn, cache_file_fn, service=None):
+def export_files(conn, save_fn, cache_file_fn, service=None, force=False):
     """Regenerate the per-service JSON files from the DB, in the exact shapes consumers
     expect: working = list (sorted by checked,host); notworking = dict keyed by host;
     hosts = list of {service, host}. `save_fn(path, data)` / `cache_file_fn(service, suffix)`
@@ -92,11 +92,11 @@ def export_files(conn, save_fn, cache_file_fn, service=None):
     written = []
     for svc in ([service] if service is not None else services(conn)):
         work = [p for _h, p, _c in sorted(rows(conn, svc, "working"), key=lambda r: (r[2] or "", r[0]))]
-        save_fn(cache_file_fn(svc, "working"), work)
+        save_fn(cache_file_fn(svc, "working"), work, force=force)
         notwork = {h: p for h, p, _c in rows(conn, svc, "notworking")}
-        save_fn(cache_file_fn(svc, "notworking"), notwork)
+        save_fn(cache_file_fn(svc, "notworking"), notwork, force=force)
         hosts = [{"service": svc, "host": h} for h, _p, _c in rows(conn, svc)]
-        save_fn(cache_file_fn(svc, "hosts"), hosts)
+        save_fn(cache_file_fn(svc, "hosts"), hosts, force=force)
         written += [cache_file_fn(svc, s) for s in ("working", "notworking", "hosts")]
     return written
 

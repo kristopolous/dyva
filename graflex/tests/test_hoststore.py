@@ -54,7 +54,7 @@ def test_export_shapes_match_current_files(tmp_path):
 
     written = {}
     hoststore.export_files(conn,
-                           lambda path, data: written.__setitem__(os.path.basename(path), data),
+                           lambda path, data, force=False: written.__setitem__(os.path.basename(path), data),
                            lambda svc, suffix: f"/x/{svc}-{suffix}.json")
     # working = LIST, sorted by (checked, host)
     assert written["ollama-working.json"] == [{"host": "a:1", "models": []}, {"host": "b:2", "models": ["m"]}]
@@ -74,7 +74,7 @@ def test_export_emits_full_set_so_guard_sees_true_count(tmp_path):
         hoststore.upsert(conn, "ollama", f"h:{i}", "working", {"host": f"h:{i}"}, "t")
     seen = {}
     hoststore.export_files(conn,
-                           lambda p, d: seen.__setitem__(p.rsplit("/", 1)[-1], len(d)),
+                           lambda p, d, force=False: seen.__setitem__(p.rsplit("/", 1)[-1], len(d)),
                            lambda s, x: f"{s}-{x}.json")
     assert seen["ollama-working.json"] == 10
 
@@ -119,7 +119,7 @@ def test_roundtrip_fidelity(tmp_path):
 
     out = {}
     hoststore.export_files(conn,
-                           lambda p, data: out.__setitem__(p.rsplit("/", 1)[-1], data),
+                           lambda p, data, force=False: out.__setitem__(p.rsplit("/", 1)[-1], data),
                            lambda s, x: f"/{s}-{x}.json")
     assert out["ollama-working.json"] == working          # same list, sorted by (checked, host)
     assert out["ollama-notworking.json"] == notworking

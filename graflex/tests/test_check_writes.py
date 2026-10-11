@@ -19,7 +19,7 @@ def test_export_writes_files_via_save_fn(tmp_path, monkeypatch):
     monkeypatch.setattr(graflex, "_HOSTSTORE", conn, raising=False)
     graflex._store_record("ollama", "a:1", "working", {"host": "a:1", "checked": "t"})
     saved = {}
-    monkeypatch.setattr(graflex, "_save_json_atomic", lambda p, d: saved.__setitem__(p, d))
+    monkeypatch.setattr(graflex, "_save_json_atomic", lambda p, d, force=False: saved.__setitem__(p, d))
     monkeypatch.setattr(graflex, "_cache_file", lambda s, x: f"{s}-{x}.json")
     graflex.export()
     assert saved["ollama-working.json"] == [{"host": "a:1", "checked": "t"}]
@@ -35,7 +35,7 @@ def test_export_single_service_leaves_others_untouched(tmp_path, monkeypatch):
     graflex._store_record("ollama", "a:1", "working", {"host": "a:1", "checked": "t"})
     graflex._store_record("vllm", "b:2", "working", {"host": "b:2", "checked": "t"})
     saved = {}
-    monkeypatch.setattr(graflex, "_save_json_atomic", lambda p, d: saved.__setitem__(p, d))
+    monkeypatch.setattr(graflex, "_save_json_atomic", lambda p, d, force=False: saved.__setitem__(p, d))
     monkeypatch.setattr(graflex, "_cache_file", lambda s, x: f"{s}-{x}.json")
     graflex.export("ollama")
     assert "ollama-working.json" in saved
