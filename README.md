@@ -10,7 +10,7 @@
 ---
 **Dyva** is a dynamic proxy that transparently routes to insecure [Ollama](https://ollama.com/), [vLLM](https://github.com/vllm-project/vllm), [LM Studio](https://lmstudio.ai/), [LocalAI](https://localai.io/), [SGLang](https://github.com/sgl-project/sglang), [KTransformers](https://github.com/kvcache-ai/ktransformers), [MLX](https://github.com/ml-explore/mlx), [llama.cpp](https://github.com/ggml-org/llama.cpp), [ds4 (DwarfStar)](https://github.com/antirez/ds4), [Fooocus](https://github.com/lllyasviel/Fooocus), [Strata](https://github.com/Niko1221/Strata), [A1111 (stable-diffusion-webui)](https://github.com/AUTOMATIC1111/stable-diffusion-webui), [Gradio](https://gradio.app/), and ComfyUI hosts from [Shodan](https://www.shodan.io/), [ZoomEye](https://www.zoomeye.org/), [Censys](https://search.censys.io/), [hunter.how](https://hunter.how/) and [FOFA](https://fofa.info/) with graceful failover, context-window scaling, and honeypot detection. 
 
-Capable of text generation, embeddings, decision models, vision, tool calling, image generation and editing, video generatoin, TTS, and music generation in a unified interface with state of the art, real-time tunable routing providing sub 1s latency. 
+Capable of text generation, embeddings, decision models, vision, tool calling, image generation and editing, video generatoin, TTS, and music generation in a unified interface with state of the art, real-time tunable router providing sub 1s latency. 
 
 [See a demo](https://9ol.es/11434) or run it yourself with a few keystrokes on Linux, Windows, Mac, and even Android. 
 
@@ -20,6 +20,8 @@ uvx dyva
 ```
 
 It is a feature-rich system with chat that includes image generation, web search, sub agent, documents, video generation, tts, stats, and even graphically tweaking the routing algorithm.
+
+Memory footprint is under 1GB:
 <div align="center">
   <img width="45%" alt="ollama" src="https://github.com/user-attachments/assets/0d9d72bf-01b9-4349-a798-34cd944781d4" />
   <img width="45%"  alt="algo" src="https://github.com/user-attachments/assets/ccd88d55-80cf-4c2e-960c-2d81eb11fb6c" />
