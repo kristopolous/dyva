@@ -1261,9 +1261,9 @@ _WORKERS_MAX = 500
 # the timer you watched run leaves a result behind — how long it took, how many
 # hosts it checked, where it landed. "At minimum" because live jobs are never
 # evicted to make room; only finished ones are trimmed to this many. Two in
-# flight at once is already unusual, so 20 is comfortably more headroom than a
+# flight at once is already unusual, so 50 is comfortably more headroom than a
 # human operator produces.
-_WORKERS_DONE_KEEP = 20
+_WORKERS_DONE_KEEP = 50
 _worker_queues = []
 _worker_lock = asyncio.Lock()
 
