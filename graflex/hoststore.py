@@ -180,6 +180,20 @@ def all_hosts(conn, service):
     return hs + extra
 
 
+def stats(conn, service):
+    """Sanity counts for a service after an export: working / notworking in the DERIVED view
+    (the reduce — what the json files hold), plus the raw table sizes behind them so an
+    operator can see at a glance whether the reduce lines up with the store."""
+    final = _reduce_service(conn, service)
+    return {
+        "working": sum(1 for v in final.values() if v[0] == "working"),
+        "notworking": sum(1 for v in final.values() if v[0] == "notworking"),
+        "hosts": len(all_hosts(conn, service)),
+        "host_rows": conn.execute("SELECT COUNT(*) FROM host WHERE service=?", (service,)).fetchone()[0],
+        "bad_rows": conn.execute("SELECT COUNT(*) FROM bad_hosts WHERE service=?", (service,)).fetchone()[0],
+    }
+
+
 def _import_one(conn, service, status, record, host):
     if not host:
         return 0

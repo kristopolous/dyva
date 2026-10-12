@@ -206,6 +206,17 @@ def test_export_reduce_newer_working_beats_bad(tmp_path):
     assert out["ollama-notworking.json"] == {}
 
 
+def test_stats_counts_derived_view_and_raw_tables(tmp_path):
+    conn = hoststore.connect(str(tmp_path / "g.db"))
+    hoststore.upsert(conn, "ollama", "w:1", "working", {"host": "w:1"}, "2026-01-01")
+    hoststore.upsert(conn, "ollama", "w:2", "working", {"host": "w:2"}, "2026-01-01")
+    hoststore.discover(conn, "ollama", "d:3", {"service": "ollama", "host": "d:3"})  # NULL
+    # w:2 is demoted NEWER -> reduce drops it from working, into notworking
+    hoststore.upsert_bad(conn, "ollama", "w:2", {"host": "w:2", "reason": "timeout"}, "2026-02-01")
+    s = hoststore.stats(conn, "ollama")
+    assert s == {"working": 1, "notworking": 1, "hosts": 3, "host_rows": 3, "bad_rows": 1}
+
+
 def test_discover_never_downgrades(tmp_path):
     conn = hoststore.connect(str(tmp_path / "g.db"))
     hoststore.upsert(conn, "ollama", "a:1", "working", {"host": "a:1"}, "t")

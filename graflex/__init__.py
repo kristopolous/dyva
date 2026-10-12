@@ -4169,6 +4169,9 @@ def main():
         log.info("--- export ---")
         for svc in pipe_services:
             export(svc)
+            s = _hoststore.stats(_store(), svc)
+            log.info(f"{svc}: {s['working']} working, {s['notworking']} notworking "
+                     f"({s['hosts']} hosts; host rows {s['host_rows']}, bad_hosts {s['bad_rows']})")
         return
 
     if args.action in ("check-working", "check-zero"):
