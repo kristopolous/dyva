@@ -1716,6 +1716,7 @@ body.dragging-image .hist-item{cursor:grabbing}
 <div class="rc-grid">
 <label class="setting"><span class="setting-text"><span class="setting-name">Workers</span><small class="setting-help">Parallel hosts tried per request (fan-out).</small></span><input type="number" id="setWorkers" min="1" max="200" step="1"></label>
 <label class="setting"><span class="setting-text"><span class="setting-name">Hedge delay (s)</span><small class="setting-help">How long the last-good host gets to respond before the rest of the pool is raced alongside it. Whoever answers first wins. 0 races everything at once. Keeps a dead-but-connected favourite from stalling the whole request.</small></span><input type="number" id="setHedge" min="0" max="600" step="1"></label>
+<label class="setting"><span class="setting-text"><span class="setting-name">Warm connect wait (s)</span><small class="setting-help">A phase inside the hedge lead: if the warm host hasn’t opened a TCP socket in this long, race the pool early (the warm host keeps running and can still win). Set it equal to the hedge delay to disable — then the warm host gets the full lead. Transport only; never cuts a connected host short.</small></span><input type="number" id="setConnectWait" min="0" max="600" step="1"></label>
 <label class="setting"><span class="setting-text"><span class="setting-name">Minimum timeout (s)</span><small class="setting-help">Floor on the per-host first-token wait. A small prompt uses exactly this; a big prompt scales up from here toward Maximum timeout. Also the base clock for the worker cap in the diagram.</small></span><input type="number" id="setTimeout" min="1" max="600" step="1"></label>
 <label class="setting"><span class="setting-text"><span class="setting-name">Maximum timeout (s)</span><small class="setting-help">Ceiling on the per-host first-token wait &mdash; the longest we'll ever wait on a monster prompt. The budget scales from Minimum up to this with prompt size (at Input rate), and the SAME extra seconds are added to Fanout, so the worker/connection maximum is unchanged &mdash; a big prompt just waits longer on the same number of hosts. Set equal to Minimum timeout to disable scaling.</small></span><input type="number" id="setTimeoutMax" min="1" max="3600" step="1"></label>
 <label class="setting"><span class="setting-text"><span class="setting-name">Max run time (s)</span><small class="setting-help">Hard ceiling on a single response's TOTAL run time, measured from when the worker starts. The timeouts above only cover the wait for the first token and the gap between tokens &mdash; a host that keeps trickling tokens (or keep-alives) can otherwise stream for hours. <b>0 disables.</b> Default 1800 (30&nbsp;min); can be set as high as 30 days.</small></span><input type="number" id="setWorkerMax" min="0" max="2592000" step="1"></label>
@@ -8705,6 +8706,7 @@ function _raceDiagram(){
   var el=document.getElementById('raceDiagram'); if(!el)return;
   function v(id){var e=document.getElementById(id);return e?parseFloat(e.value):NaN}
   var w=v('setWorkers'),t=v('setTimeout'),h=v('setHedge'),f=v('setFanout'),tm=v('setTimeoutMax');
+  var cw=v('setConnectWait');   // warm-host connect sub-phase of the hedge lead; NaN/>=h = off
   if(!(w>0&&t>0&&f>0)){el.innerHTML='';return}
   if(!(h>=0))h=0;
   // Schematic: hedge lead -> wave of N branches (length = Timeout). Wave 2 is the same,
@@ -8747,6 +8749,16 @@ function _raceDiagram(){
   node(hedgeX,w1,A.hedge);
   ln(hedgeX+7,w1,spineX-7,w1,A.hedge,dash);
   tx((hedgeX+spineX)/2,w1-14,A.hedge,'hedge '+Math.round(h)+'s','middle',10);
+  // connect-wait sub-phase: how long dyva waits for the warm host to open a SOCKET before
+  // releasing the insurance pool (the warm host keeps running). A solid overlay on the lower
+  // edge of the dashed lead; OFF (cw NaN or >= hedge) draws nothing and its grip rests at the
+  // lead end. Same time scale as the lead, so its grip drags 1:1 with the others.
+  var cwOn=!isNaN(cw)&&h>0&&cw<h-0.01, cwv=cwOn?Math.max(0,cw):h;
+  var cwX=hedgeX+7+Math.min(pps*cwv,Math.max(hl,6));
+  if(cwOn){
+    ln(hedgeX+7,w1+3,cwX,w1+3,A.hedge);                              // solid = connect phase, lower edge
+    tx((hedgeX+7+cwX)/2,w1+18,A.hedge,'connect '+Math.round(cwv)+'s','middle',9);
+  }
   // cascade connector wave1 -> wave2 (down and to the right = later in time)
   ln(spineX,w1+7,spineX+dx,w2-7,A.ax,dash);
   // the two waves
@@ -8794,6 +8806,9 @@ function _raceDiagram(){
   // Four time handles share the fixed time scale and track the cursor 1:1 up to their
   // display cap; Workers is a vertical drag on the brace's bottom corner (down = more).
   grip(spineX,w1-9,w1+9,'setHedge',0,600,A.hedge);
+  // connect-wait grip on the LOWER part of the lead (hedge grip is upper), so the two phases
+  // read as separate handles. hi = the current hedge, so connect-wait can't exceed the lead.
+  grip(cwX,w1+9,w1+9,'setConnectWait',0,Math.max(0,Math.round(h)),A.hedge);
   grip(e1,topY-16,w1+fanH/2+2,'setTimeout',1,600,A.to);
   if(ext>0.5)grip(eMax,topY-16,topY+4,'setTimeoutMax',1,3600,A.to);
   grip(fdx,fy-12,fy+12,'setFanout',1,600,A.fo);
@@ -8812,7 +8827,7 @@ function _fanoutImpl(){
   _raceDiagram();
 }
 function _wireFanoutImpl(){
-  ['setWorkers','setTimeout','setFanout','setHedge','setTimeoutMax'].forEach(function(id){
+  ['setWorkers','setTimeout','setFanout','setHedge','setConnectWait','setTimeoutMax'].forEach(function(id){
     var e=document.getElementById(id); if(!e||e._fi)return; e._fi=true;
     e.addEventListener('input',_fanoutImpl);
   });
@@ -9345,6 +9360,10 @@ function populateSettings(s){
   document.getElementById('setRaceWatchdog').value=('race_watchdog' in s)?s.race_watchdog:30;
   document.getElementById('setFanout').value=s.fanout;
   document.getElementById('setHedge').value=('hedge_delay' in s)?s.hedge_delay:30;
+  // connect-wait: null/absent = OFF, shown as the full lead (== hedge) so its grip rests at the
+  // lead end; a number shows the connect sub-phase.
+  var _wcw=('warm_connect_wait' in s)&&s.warm_connect_wait!=null?s.warm_connect_wait:(('hedge_delay' in s)?s.hedge_delay:30);
+  document.getElementById('setConnectWait').value=_wcw;
   _wireFanoutImpl();
   document.getElementById('setMinCount').value=s.min_count;
   document.getElementById('setBasePath').value=s.base_path||'';
@@ -9466,6 +9485,8 @@ function saveSettings(){
     race_watchdog:parseInt(document.getElementById('setRaceWatchdog').value,10),
     fanout:parseInt(document.getElementById('setFanout').value,10),
     hedge_delay:parseInt(document.getElementById('setHedge').value,10),
+    // connect-wait >= hedge means OFF -> send null; otherwise the connect sub-phase in seconds.
+    warm_connect_wait:(function(){var cw=parseInt(document.getElementById('setConnectWait').value,10),hd=parseInt(document.getElementById('setHedge').value,10);return(isNaN(cw)||cw>=hd)?null:cw;})(),
     min_count:parseInt(document.getElementById('setMinCount').value,10),
     base_path:document.getElementById('setBasePath').value,
     model_list:parseModelList(document.getElementById('setModelList').value),
@@ -9507,6 +9528,7 @@ function saveSettings(){
   document.getElementById('setRaceWatchdog').value=('race_watchdog' in s)?s.race_watchdog:30;
   document.getElementById('setFanout').value=s.fanout;
       document.getElementById('setHedge').value=('hedge_delay' in s)?s.hedge_delay:30;
+      document.getElementById('setConnectWait').value=('warm_connect_wait' in s)&&s.warm_connect_wait!=null?s.warm_connect_wait:(('hedge_delay' in s)?s.hedge_delay:30);
   _wireFanoutImpl();
       document.getElementById('setMinCount').value=s.min_count;
   document.getElementById('setBasePath').value=s.base_path||'';

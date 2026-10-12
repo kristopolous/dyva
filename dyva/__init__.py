@@ -278,6 +278,13 @@ WORKER_COUNT = 10
 # pool is raced alongside it; first to produce wins, the loser is dropped.
 # Caps the wait on a dead-but-connected favourite. 0 disables (race at once).
 HEDGE_DELAY = 15
+# Opt-in sub-phase of the hedge lead: if the warm/sticky host hasn't opened a TCP socket within
+# this many seconds, release the insurance pool early. The warm attempt is NEVER cancelled — it
+# keeps running and can still win. None = the full hedge lead (today's behaviour: no early
+# release); a value >= the hedge lead also no-ops (the lead ends first). Purely a transport
+# fact (did a socket open), never a judgment about the model. Surfaced as a segment of the
+# hedge lead in the settings race schematic, so the two phases are visible, not hidden.
+WARM_CONNECT_WAIT = None
 # Expected INPUT prefill rate (tokens/second) — how fast a capable host is ASSUMED to
 # chew through the prompt before the first output token. It's the scaling ratio that
 # turns prompt size into expected prefill time, which sets the per-attempt budget
@@ -592,7 +599,7 @@ def model_modalities(model):
 def load_settings():
     """Apply persisted runtime settings (workers/timeout/min_count/local) over
     the CLI defaults, so changes made in the dashboard survive restarts."""
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, RACE_WATCHDOG
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, RACE_WATCHDOG, WARM_CONNECT_WAIT
     if not os.path.exists(SETTINGS_FILE):
         return
     try:
@@ -606,6 +613,9 @@ def load_settings():
         TIMEOUT = s["timeout"]
     if isinstance(s.get("hedge_delay"), (int, float)) and s["hedge_delay"] >= 0:
         HEDGE_DELAY = s["hedge_delay"]
+    if "warm_connect_wait" in s:
+        _wcw = s["warm_connect_wait"]
+        WARM_CONNECT_WAIT = _wcw if isinstance(_wcw, (int, float)) and _wcw >= 0 else None
     if isinstance(s.get("input_rate"), (int, float)) and s["input_rate"] > 0:
         INPUT_RATE = s["input_rate"]
     if isinstance(s.get("reasoning_keys"), list):   # empty list = drop reasoning on /v1
@@ -650,7 +660,7 @@ def save_settings(extra=None):
     if not isinstance(data, dict):
         data = {}
     data.update({"workers": WORKER_COUNT, "timeout": TIMEOUT,
-                 "hedge_delay": HEDGE_DELAY, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS,
+                 "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS,
                  "worker_max": WORKER_MAX, "worker_max_failover": WORKER_MAX_FAILOVER, "race_watchdog": RACE_WATCHDOG,
                  "min_count": MIN_COUNT, "local": _LOCAL, "explore": EXPLORE_MODE,
                  "admin_pw": ADMIN_PW, "model_list": MODEL_LIST, "model_list_on": MODEL_LIST_ON,
@@ -1559,8 +1569,24 @@ async def _unregister_worker(wid, ok=None):
             "completion_tokens": w.get("ctoks"),
             "num_ctx": w.get("num_ctx"),
             "tally": dict(w.get("race_tally") or {}),
+            # Terminal race state + a derived stall flag: a FAILED job whose candidate list
+            # was never exhausted (spent False) and tried far fewer than it had (tried <
+            # candidates) gave up/pinned without considering the pool — the bug signature.
+            # Grep worker-jobs.jsonl for '"stalled": true' to find every occurrence.
+            "spent": w.get("race_spent"),
+            "started": w.get("race_started"),
+            "permit": w.get("race_permit"),
+            "hedge_cut": w.get("hedge_cut"),   # 'connect_wait' when warm-connect-wait released insurance early
+            "stalled": bool(not w["ok"] and w.get("race_spent") is False
+                            and (w.get("race_tried") or 0) < (w.get("race_cand") or 0)),
             "race": w.get("race"),
         })
+        if (not w["ok"] and w.get("race_spent") is False
+                and (w.get("race_tried") or 0) < (w.get("race_cand") or 0)):
+            log.warning("race STALLED [%s]: failed after trying %s/%s candidates without "
+                        "exhausting the pool (started=%s permit=%s)", w.get("model_query"),
+                        w.get("race_tried"), w.get("race_cand"),
+                        w.get("race_started"), w.get("race_permit"))
     _trim_done_workers()
     await _broadcast_workers()
 
@@ -4493,6 +4519,8 @@ async def _race_hosts(entries, attempt, key, job_wid=None, workers=None, host_of
     # which also skewed the race into an age contest where a long-open slow host "wins".
     _started = [0]      # FRESH candidates started so far (retries don't count)
     _permit = [0]       # FRESH candidates currently permitted (set from `initial`, += n per wave)
+    _hedge_cut = [None]  # why the hedge released early, for the job record: 'connect_wait' when
+                         # the opt-in warm-connect-wait fired (warm host never cancelled)
     # Warming-retry queue: a host that answered ALIVE-but-not-ready (cold start /
     # busy -> V_RETRY) is parked here as [ready_at, item] instead of being dropped,
     # and re-fronted once ready_at passes. The race stays open while anything is
@@ -4738,6 +4766,20 @@ async def _race_hosts(entries, attempt, key, job_wid=None, workers=None, host_of
                 # permit is still frozen at 1, so this is the real failover trigger.
                 if race_log and race_log[0].get("outcome") not in (None, V_ACCEPTED):
                     break
+                # Opt-in (warm_connect_wait < hedge lead): the warm host still hasn't opened a
+                # socket (connect_time None) after the configured connect wait — release the
+                # insurance pool early. The warm attempt is NOT cancelled; it keeps running and
+                # can still win. Pure transport fact (no socket yet), never a content judgment.
+                if (WARM_CONNECT_WAIT is not None and time.time() - t0 >= WARM_CONNECT_WAIT
+                        and race_log and race_log[0].get("connect_time") is None
+                        and race_log[0].get("outcome") is None):
+                    _hedge_cut[0] = "connect_wait"
+                    _wh = race_log[0].get("host")
+                    with contextlib.suppress(Exception):
+                        await broadcast_activity(_wh, label or key, "warming",
+                            f"warm host {_wh} no TCP connect in {WARM_CONNECT_WAIT:.0f}s — "
+                            f"racing insurance pool (warm host still running)", wid=wwid)
+                    break
                 await asyncio.sleep(0.1)
             if done.is_set():
                 return
@@ -4808,6 +4850,19 @@ async def _race_hosts(entries, attempt, key, job_wid=None, workers=None, host_of
                             n, _spent[0], len(retry_q), len(tasks),
                             sum(1 for t in tasks if not t.done()), fan.done(), _fe,
                             (_workers.get(wwid) or {}).get("checked", -1))
+                # A stall with permits to spare and the pool unspent (started < permit and
+                # not spent) means workers are parked somewhere they shouldn't be. Dump where
+                # each live task is awaiting, so the NEXT occurrence names the blocked line
+                # instead of staying a mystery. Read-only introspection; capped for noise.
+                if _started[0] < _permit[0] and not _spent[0]:
+                    for t in [x for x in tasks if not x.done()][:6]:
+                        try:
+                            frames = t.get_stack(limit=4)
+                            where = " <- ".join(
+                                f"{fr.f_code.co_name}:{fr.f_lineno}" for fr in reversed(frames))
+                        except Exception as _e:
+                            where = f"(stack unavailable: {_e})"
+                        log.warning("  parked task %s: %s", t.get_name(), where)
         except asyncio.CancelledError:
             pass
     _wd = asyncio.ensure_future(_race_watchdog())
@@ -4844,6 +4899,14 @@ async def _race_hosts(entries, attempt, key, job_wid=None, workers=None, host_of
             _t = w.get("race_tally") or collections.Counter()
             _t.update(tally)
             w["race_tally"] = _t
+            # Terminal race state, so a job that FAILED without exhausting its pool (the
+            # fan-out stalled / stayed pinned — tried << candidates with spent False) is
+            # detectable from the completion record, not just a transient watchdog line.
+            w["race_spent"] = _spent[0]
+            w["race_started"] = (w.get("race_started") or 0) + _started[0]
+            w["race_permit"] = _permit[0]
+            if _hedge_cut[0]:
+                w["hedge_cut"] = _hedge_cut[0]
         if job_wid is None:
             await _unregister_worker(wwid)
 
@@ -6448,6 +6511,46 @@ async def _race_sse_keepalive(request, session, model, servers, payload, req_cap
     return response, result, errors, stopped
 
 
+async def _race_ndjson_keepalive(request, session, model, servers, payload, req_caps, job_wid):
+    """ndjson (/api/chat) twin of _race_sse_keepalive: keep an ollama-dialect streaming client
+    warm during the pre-first-token wait (race + hedge + warming + prefill) so its idle timeout
+    doesn't bail before the first token. The keepalive is an EMPTY assistant chunk
+    (`{"message":{"role":"assistant","content":""},"done":false}`) every KEEPALIVE_INTERVAL —
+    content is empty so the visible answer is unchanged, and it opens NO upstream connection
+    (just a write on the already-open client socket, so it costs nothing against the concurrent-
+    connection ceiling). Returns (response, result, errors, stopped) exactly like the SSE wrapper:
+    a prepared 200 means a no-host outcome is written in-stream, not returned as a non-200."""
+    response = web.StreamResponse()
+    response.headers["Content-Type"] = "application/x-ndjson"
+    response.headers["Cache-Control"] = "no-cache"
+    try:
+        await response.prepare(request)
+    except _STREAM_BREAK_ERRORS:
+        return response, None, [], False
+    task = asyncio.ensure_future(_race_servers(
+        session, model, servers, payload, do_stream=True,
+        remote=request.remote, caps=req_caps, job_wid=job_wid, hedge_delay=HEDGE_DELAY))
+    ka = (json.dumps({"model": model, "created_at": _now_iso(),
+                      "message": {"role": "assistant", "content": ""}, "done": False}) + "\n").encode()
+    while True:
+        done_set, _pending = await asyncio.wait({task}, timeout=KEEPALIVE_INTERVAL)
+        if done_set:
+            break
+        try:
+            await response.write(ka)
+        except _STREAM_BREAK_ERRORS:        # client gave up — stop racing for no one
+            task.cancel()
+            with contextlib.suppress(Exception):
+                await task
+            return response, None, [], False
+    try:
+        result, errors, stopped = task.result()
+    except Exception as e:                  # race blew up AFTER headers were sent
+        log.warning(f"race failed under ndjson keepalive: {e}")
+        return response, None, [str(e)], False
+    return response, result, errors, stopped
+
+
 async def _stream_chat_failover(request, session, model, servers, opayload,
                                 openai_format, req_caps, job_wid, result, cancel=None,
                                 response=None):
@@ -7198,12 +7301,29 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                     await ka_resp.write(sse_str(sse_chunk("", {}, done=True)).encode())
                 return ka_resp
             elif do_stream:
-                result, errors, stopped = await _race_servers(session, model, _servers, opayload, do_stream=True, remote=request.remote, caps=req_caps, job_wid=job_wid, hedge_delay=HEDGE_DELAY)
+                # ndjson client: keep its connection warm during the pre-first-token wait, same
+                # as the SSE branch — a slow search (dead-heavy pool) otherwise outlasts an
+                # ollama-dialect client's idle timeout and it bails before the first token. The
+                # 200 commits up front, so a no-host outcome is written IN-STREAM here rather
+                # than returned as a 502. Like SSE, a no-host on a non-last fallback model is
+                # reported here instead of falling through to the next model; single-model
+                # queries (the common case) are unaffected. Opens no upstream connection.
+                ka_resp, result, errors, stopped = await _race_ndjson_keepalive(
+                    request, session, model, _servers, opayload, req_caps, job_wid)
                 if result:
                     return await _stream_chat_failover(
                         request, session, model, _servers, opayload,
-                        openai_format, req_caps, job_wid, result, cancel)
-                # native (/api/chat) streaming no-host: fall through to the pool-spent 502
+                        openai_format, req_caps, job_wid, result, cancel, response=ka_resp)
+                msg = "worker manually stopped" if stopped else "all servers failed"
+                if errors:
+                    msg += ": " + "; ".join(dict.fromkeys(errors))
+                with contextlib.suppress(Exception):
+                    await ka_resp.write((json.dumps({"model": model, "created_at": _now_iso(),
+                        "error": msg}) + "\n").encode())
+                    await ka_resp.write((json.dumps({"model": model, "created_at": _now_iso(),
+                        "message": {"role": "assistant", "content": ""}, "done": True,
+                        "done_reason": "stop"}) + "\n").encode())
+                return ka_resp
             else:
                 # The CLIENT asked for stream:false, but we ALWAYS stream from the
                 # host (do_stream=True) and buffer it into one response here. A
@@ -8332,7 +8452,7 @@ async def handle_settings_get(request):
         # show a password prompt instead of the controls.
         return web.json_response({"admin": False, "admin_pw_set": True}, status=403)
     return web.json_response({"workers": WORKER_COUNT, "timeout": TIMEOUT,
-                              "hedge_delay": HEDGE_DELAY, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS,
+                              "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS,
                               "worker_max": WORKER_MAX, "worker_max_failover": WORKER_MAX_FAILOVER, "race_watchdog": RACE_WATCHDOG,
                               "min_count": MIN_COUNT, "local": _LOCAL,
                               "explore": EXPLORE_MODE,
@@ -8353,7 +8473,7 @@ async def handle_settings_post(request):
       '200':
         description: Updated settings
     """
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, RACE_WATCHDOG
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, RACE_WATCHDOG, WARM_CONNECT_WAIT
     resp = await _check_local(request) or _check_admin(request)
     if resp:
         return resp
@@ -8376,6 +8496,9 @@ async def handle_settings_post(request):
         TIMEOUT = min(body["timeout"], 600)
     if isinstance(body.get("hedge_delay"), (int, float)) and body["hedge_delay"] >= 0:
         HEDGE_DELAY = min(body["hedge_delay"], 600)
+    if "warm_connect_wait" in body:   # a number = connect sub-phase; null = full lead (off)
+        _wcw = body["warm_connect_wait"]
+        WARM_CONNECT_WAIT = min(_wcw, 600) if isinstance(_wcw, (int, float)) and _wcw >= 0 else None
     if isinstance(body.get("input_rate"), (int, float)) and body["input_rate"] > 0:
         INPUT_RATE = body["input_rate"]
     if isinstance(body.get("reasoning_keys"), list):   # empty list = drop reasoning on /v1
@@ -8424,7 +8547,7 @@ async def handle_settings_post(request):
     if sources_changed:
         await asyncio.get_event_loop().run_in_executor(None, refresh_cache)
     return web.json_response({"workers": WORKER_COUNT, "timeout": TIMEOUT,
-                              "hedge_delay": HEDGE_DELAY, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS,
+                              "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS,
                               "worker_max": WORKER_MAX, "worker_max_failover": WORKER_MAX_FAILOVER, "race_watchdog": RACE_WATCHDOG,
                               "min_count": MIN_COUNT, "local": _LOCAL,
                               "explore": EXPLORE_MODE,

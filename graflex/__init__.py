@@ -3347,7 +3347,7 @@ async def _check_working(service, name=None, check_timeout=60, workers=10, sessi
                             nw[_gk] = entry[_gk]
                     _store_record(svc, host, "notworking", nw)
                     removed += 1
-                    log.info(f"~ {host} demoted ({reason})")
+                    log.info(f"~ {svc} {host} demoted ({reason})")
                     _audit_prune(svc, host, "working", reason)
                 else:
                     log.info(f"~ {host} kept ({reason})")
