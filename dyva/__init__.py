@@ -5536,9 +5536,24 @@ async def _send_chat(session, host, full, payload, endpoint, do_stream, timeout=
         # untouched so its stream isn't drained. aiohttp CACHES a read body, so a peeked
         # response stays fully readable by the caller — no detail lost, no re-fetch.
         peek = ""
+        _peeked = b""
         if resp.status >= 400 or not do_stream:
             try:
                 peek = " ".join((await resp.text()).split())[:300]
+            except Exception:
+                pass
+        elif ("event-stream" not in (resp.content_type or "").lower()
+              and "ndjson" not in (resp.content_type or "").lower()):
+            # do_stream, but the host returned a BUFFERED doc, not an SSE/NDJSON stream — e.g. an
+            # OpenAI gateway answering /api/chat with {"error":"Unexpected endpoint..."} at HTTP 200.
+            # The body is already here, so reading its first line can't drain a token stream or block
+            # on generation (that's why we DON'T do this for a real stream CT — it would move the
+            # first-token wait and the race timing). Peek it for a wrong-dialect miss; if it's NOT
+            # one, stash the consumed line so the streaming consumer reads it instead of an
+            # already-advanced stream — the exact line it would otherwise have read itself.
+            try:
+                _peeked = await resp.content.readline()
+                peek = " ".join(_peeked.decode("utf-8", "replace").split())[:300]
             except Exception:
                 pass
         _pl = peek.lower()
@@ -5546,6 +5561,8 @@ async def _send_chat(session, host, full, payload, endpoint, do_stream, timeout=
                        or "unexpected endpoint" in _pl or "method not allowed" in _pl
                        or "cannot post" in _pl or "cannot get" in _pl or "no route" in _pl)
         if not wrong_route:
+            if _peeked:
+                resp._dyva_peeked_line = _peeked   # hand the peeked first line to the streaming consumer
             return resp, attempt_oai, ep, None   # success or a real error; body cached if read
         st = resp.status
         await resp.release()
@@ -5889,7 +5906,11 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
             return accepted(("ok", host, full, data), extra=full)
 
         try:
-            first_line = await resp.content.readline()
+            # _send_chat may have already read the first line (a buffered non-stream body it
+            # peeked for a wrong-dialect miss) — use that exact line rather than reading past it.
+            first_line = getattr(resp, "_dyva_peeked_line", None)
+            if first_line is None:
+                first_line = await resp.content.readline()
             if oai:
                 # step over SSE keep-alives and blank separators to reach the
                 # first line that actually carries content, and hand the rest

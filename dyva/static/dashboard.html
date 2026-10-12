@@ -709,6 +709,7 @@ button.stop:hover{background:var(--btn-danger-hover)}
 .link-card{flex:0 0 200px;display:flex;flex-direction:column;border:1px solid var(--border);border-radius:var(--r-lg);overflow:hidden;background:var(--surface);text-decoration:none;color:inherit;transition:border-color .12s}
 .link-card:hover{border-color:var(--border-strong)}
 .link-card-img{width:100%;height:112px;object-fit:cover;background:var(--bg-inset);display:block}
+.link-card-img-ph{object-fit:contain;opacity:.5;padding:14px}
 .link-card-body{padding:.5em .6em;display:flex;flex-direction:column;gap:3px}
 .link-card-title{font-size:var(--fs-sm);font-weight:600;line-height:1.25;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .link-card-desc{font-size:var(--fs-2xs);color:var(--text-dim);line-height:1.3;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
@@ -719,6 +720,9 @@ button.stop:hover{background:var(--btn-danger-hover)}
 .link-cards-nav.prev{left:2px}
 .link-cards-nav.next{right:2px}
 @media(max-width:760px){.link-card{flex-basis:168px}}
+/* Touch devices swipe the row natively (and the scroll handler still lazy-loads), so the
+   arrows are dead weight — and a hidden-but-present arrow was uncovering the link beneath it. */
+@media(pointer:coarse){.link-cards-nav{display:none}}
 .msg.note .note-text .asset-glyph{display:flex;align-items:center;justify-content:center;font-size:1.4rem;color:var(--text-faint)}
 .msg.note .note-text .asset-text{min-width:0;flex:1 1 auto}
 .msg.note .note-text .asset-name{font-family:var(--font-mono);font-size:var(--fs-sm);color:var(--text);overflow-wrap:anywhere}
@@ -3882,15 +3886,16 @@ function _linkCardsFor(container,bodyEl){
   var row=document.createElement('div');row.className='link-cards';
   var next=document.createElement('button');next.type='button';next.className='link-cards-nav next';next.textContent='›';next.setAttribute('aria-label','Scroll right');
   wrap.appendChild(prev);wrap.appendChild(row);wrap.appendChild(next);container.appendChild(wrap);
-  var BATCH=4,loaded=0,pending=false;
+  var BATCH=8,loaded=0,pending=false;   // first batch is big enough that there's always something to scroll into on the first arrow click
   function addCard(d,u){
     var card=document.createElement('a');
     card.className='link-card';card.href=u;card.target='_blank';card.rel='noopener noreferrer';
-    if(d.image){
-      var im=document.createElement('img');im.className='link-card-img';im.src=d.image;im.alt='';
-      im.addEventListener('error',function(){im.remove()});   // broken og:image just collapses
-      card.appendChild(im);
-    }
+    var im=document.createElement('img');im.className='link-card-img';im.alt='';
+    var phed=false;
+    function ph(){if(phed)return;phed=true;im.src=ASSET_FALLBACK_IMG;im.classList.add('link-card-img-ph');}
+    im.addEventListener('error',ph);        // broken og:image -> shrugging-llama placeholder, not a hole
+    if(d.image){im.src=d.image;}else{ph();}  // no preview image at all -> same placeholder
+    card.appendChild(im);
     var bd=document.createElement('div');bd.className='link-card-body';
     bd.innerHTML='<div class="link-card-title">'+escHtml(d.title||u)+'</div>'+
       (d.description?'<div class="link-card-desc">'+escHtml(d.description)+'</div>':'')+
@@ -3908,12 +3913,15 @@ function _linkCardsFor(container,bodyEl){
     });
   }
   function sync(){
-    var over=row.scrollWidth-row.clientWidth>4,atEnd=row.scrollLeft>=row.scrollWidth-row.clientWidth-2;
-    prev.style.visibility=(over&&row.scrollLeft>2)?'visible':'hidden';
-    next.style.visibility=((over&&!atEnd)||loaded<urls.length)?'visible':'hidden';   // more to scroll OR more to load
+    // Keep BOTH arrows put whenever this is a gallery (overflows, or more still to load) — do
+    // NOT hide one at an edge: a vanished arrow uncovers the link card under it, so a tap aimed
+    // at the arrow opens the link instead. A stable tap target is the whole point.
+    var gallery=row.scrollWidth-row.clientWidth>4||loaded<urls.length;
+    prev.style.visibility=gallery?'visible':'hidden';
+    next.style.visibility=gallery?'visible':'hidden';
   }
   function page(dir){
-    if(dir>0&&loaded<urls.length&&row.scrollLeft>=row.scrollWidth-row.clientWidth-80)loadBatch();
+    if(dir>0&&loaded<urls.length)loadBatch();   // right arrow IS the lazy-load trigger: pull the next batch into the DOM, then scroll
     row.scrollBy({left:dir*Math.max(row.clientWidth*0.85,180),behavior:'smooth'});
   }
   prev.addEventListener('click',function(){page(-1)});
@@ -4284,16 +4292,27 @@ function renderMessages(){
 // context genuinely shrinks (ctxTokens is reset there). Before the first completed turn,
 // the heuristic alone covers a fresh short chat.
 function _wc(s){var t=String(s||'').trim();return t?t.split(/\s+/).length:0}
+// A vision image's PIXELS tokenize to a roughly fixed budget on the host, NOT its base64
+// length — mirror the server's flat per-image IMAGE_TOKENS so the gauge tracks the num_ctx it
+// actually sizes (see _estimate_prompt_tokens / IMAGE_TOKENS in dyva/__init__.py).
+var IMAGE_TOKENS=2048;
 function _tokEstHeuristic(){
-  var w=0;
+  var w=0,imgN=0;
   if(currentChat){
     w+=_wc(currentChat.system);
-    (currentChat.messages||[]).forEach(function(m){if(m&&m.content)w+=_wc(typeof m.content==='string'?m.content:JSON.stringify(m.content))});
+    (currentChat.messages||[]).forEach(function(m){
+      if(!m)return;
+      if(m.content)w+=_wc(typeof m.content==='string'?m.content:JSON.stringify(m.content));
+      // An attached image costs a flat per-image budget on a vision host (see _payloadCtxTokens),
+      // NOT its base64 length — and a "can't see it" attachment (vision:false) is sent as a text
+      // note, no pixels, so it doesn't. Stored messages hold attachments in m.files.
+      if(m.files&&m.vision!==false)m.files.forEach(function(f){if(f&&(f.type||'').toLowerCase().indexOf('image/')===0)imgN++});
+    });
     (currentChat.documents||[]).forEach(function(d){if(d&&d.content)w+=_wc(d.content)});
     var g=(typeof gens!=='undefined')&&currentChat&&gens[currentChat.id];
     if(g){w+=_wc(g.raw);w+=_wc(g.think)}
   }
-  var t=Math.round(w*1.33);
+  var t=Math.round(w*1.33)+imgN*IMAGE_TOKENS;
   // The tools schema is sent on EVERY turn when tools are enabled — usually the
   // biggest chunk the transcript doesn't show. Estimate it straight from its
   // JSON (dense, so ~chars/4 rather than the prose word ratio).
@@ -4326,11 +4345,32 @@ function noteCtxTokens(chatId,n){
   saveChat(c);
   if(currentChat&&String(currentChat.id)===String(chatId))updateTokEst();
 }
+function _isImgPart(p){return !!(p&&(p.type==='image_url'||p.type==='image'||p.type==='input_image'||p.type==='file'||p.image_url))}
+function _msgImageCount(messages){
+  var n=0;
+  (messages||[]).forEach(function(m){
+    if(!m||typeof m!=='object')return;
+    if(m.images&&m.images.length)n+=m.images.length;                      // ollama shape: bare base64 list
+    if(Array.isArray(m.content))m.content.forEach(function(p){if(_isImgPart(p))n++});   // OpenAI multimodal parts
+  });
+  return n;
+}
+// The same messages with image payloads blanked, so JSON.stringify measures TEXT not image bytes.
+function _msgsTextOnly(messages){
+  return (messages||[]).map(function(m){
+    if(!m||typeof m!=='object'||(!m.images&&!Array.isArray(m.content)))return m;
+    var c={};for(var k in m)if(k!=='images')c[k]=m[k];
+    if(Array.isArray(m.content))c.content=m.content.map(function(p){return _isImgPart(p)?{type:'image'}:p});
+    return c;
+  });
+}
 // Estimate the token size of the exact body we POST. Dense JSON (tool results, schemas)
 // ~= chars/4 — the same order as the server's own sizing, so the gauge tracks num_ctx.
+// Images are counted per-image (IMAGE_TOKENS), never as their base64 length.
 function _payloadCtxTokens(payload){
   try{
-    var n=Math.round(JSON.stringify(payload&&payload.messages||[]).length/4);
+    var msgs=(payload&&payload.messages)||[];
+    var n=Math.round(JSON.stringify(_msgsTextOnly(msgs)).length/4)+_msgImageCount(msgs)*IMAGE_TOKENS;
     if(payload&&payload.tools&&payload.tools.length)n+=Math.round(JSON.stringify(payload.tools).length/4);
     return n;
   }catch(e){return 0;}
@@ -8595,6 +8635,7 @@ function assetForImg(src){
 chatLog.addEventListener('click',function(e){
   var img=e.target.closest('img');
   if(!img||!img.src)return;
+  if(img.closest('.link-card'))return;   // link-card thumbnail: clicking it means "open the link", let the <a> navigate — no lightbox
   _lbMode='chat';
   _lbChat=_chatImages();
   var at=_lbChat.indexOf(img);
@@ -8874,10 +8915,10 @@ function _raceDiagram(){
   // lighter dashed span continuing to the MAXIMUM — the prompt-size stretch range.
   var topY=w1-(N-1)/2*lg;
   ln(b1,topY-13,e1,topY-13,A.to); ln(b1,topY-13,b1,topY-8,A.to); ln(e1,topY-13,e1,topY-8,A.to);
-  tx((b1+e1)/2,topY-16,A.to,'Min '+Math.round(t)+'s','middle',10);
+  tx((b1+e1)/2,topY-16,A.to,'min '+Math.round(t)+'s','middle',10);
   if(ext>0.5){
     ln(e1,topY-13,eMax,topY-13,A.to,dash2); ln(eMax,topY-13,eMax,topY-8,A.to);
-    tx((e1+eMax)/2,topY-16,A.to,'Max '+Math.round(tm)+'s','middle',10);
+    tx((e1+eMax)/2,topY-16,A.to,'max '+Math.round(tm)+'s','middle',10);
   }
   // worker-count brace, past the MAX-timeout end so it clears the stretch zone
   var bx=braceX;
@@ -8888,10 +8929,10 @@ function _raceDiagram(){
   // the same length as the timeout's min->max dash, so the two stretches read as equal.
   var fy=(w1+w2)/2, fdx=spineX+dx;
   ln(spineX,fy,fdx,fy,A.fo); ln(spineX,fy-4,spineX,fy+4,A.fo); ln(fdx,fy-4,fdx,fy+4,A.fo);
-  tx((spineX+fdx)/2,fy-5,A.fo,'Fanout '+Math.round(f)+'s','middle',10);
+  tx((spineX+fdx)/2,fy-5,A.fo,'fanout '+Math.round(f)+'s','middle',10);
   if(ext>0.5){
     ln(fdx,fy,fdx+ext,fy,A.fo,dash2); ln(fdx+ext,fy-4,fdx+ext,fy+4,A.fo);
-    tx((fdx+fdx+ext)/2,fy+13,A.fo,'Max '+Math.round(f+(tm-t))+'s','middle',10);   // below the line; "Fanout Ns" stays on top
+    tx((fdx+fdx+ext)/2,fy+13,A.fo,'max '+Math.round(f+(tm-t))+'s','middle',10);   // below the line; "fanout Ns" stays on top
   }
   g.push('<text x=\'6\' y=\''+(H-9).toFixed(1)+'\' font-size=\'10\' fill=\''+A.fo+'\'>'
     +'<tspan font-weight=\'700\' font-size=\'13\'>'+maxc+'</tspan>'
