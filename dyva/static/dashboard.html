@@ -4489,6 +4489,7 @@ var SLASH_COMMANDS=[
   {cmd:'info',     arg:'',         desc:'show which host and model answered'},
   {cmd:'next',     arg:'',         desc:'drop this model’s sticky host and move to the next one'},
   {cmd:'test',     arg:'',         desc:'probe the hosts with the quick test and cull the bogus ones'},
+  {cmd:'test-all', arg:'',         desc:'sweep: probe every not-yet-verified host for this model and cull all the bogus ones'},
   {cmd:'retitle',  arg:'',         desc:'regenerate the chat title'},
   {cmd:'compact',  arg:'[model]',  desc:'summarize the chat so far to free up context (optionally with a given model)'},
   {cmd:'download', arg:'',         desc:'download this chat as JSON'},
@@ -4828,6 +4829,10 @@ function handleSlashCommand(text){
     _dyvaInfo=true;
     document.getElementById('chatInput').value=DYVA_INFO_TAG+':test';
     return false;   // fall through: probe the hosts and cull the bogus ones
+  }else if(cmd==='test-all'){
+    _dyvaInfo=true;
+    document.getElementById('chatInput').value=DYVA_INFO_TAG+':test-all';
+    return false;   // fall through: sweep-probe every not-yet-verified host and cull the bogus
   }else if(cmd==='list'||cmd==='listassets'||cmd==='assets'){
     info(chatSummaryMd());
   }else{
