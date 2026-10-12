@@ -3681,7 +3681,7 @@ def mark_no_tools(host, model):
         _mark_known(host, model, new_caps)
 
 
-async def trial_balloon(session, host, full, model):
+async def trial_balloon(session, host, full, model, wid=None):
     """Cheap vision probe: send a 1x1 red pixel with no prompt.
 
     A model that actually processed the image says it's red; a model whose
@@ -3694,24 +3694,34 @@ async def trial_balloon(session, host, full, model):
         "stream": False,
     }
     start = time.time()
-    _curlify("POST", f"{host}/api/chat", payload)
+    # Go through the dialect-aware primitive, NOT a hardcoded /api/chat. The balloon used to POST
+    # ollama's /api/chat with the ollama `images` shape at EVERY host, so every non-ollama vision
+    # host (llama.cpp/vLLM/LM Studio) 404'd it and read as "inconclusive" -> skipped, even though
+    # it has vision and the REAL request (which does go through _send_chat) works. _send_chat picks
+    # the endpoint, shapes the image per dialect (openai_payload), and follows redirects.
     try:
-        resp = await asyncio.wait_for(session.post(f"{host}/api/chat", json=payload), timeout=TIMEOUT)
+        resp, _oai, _ep, _why = await _send_chat(session, host, full, payload, "/api/chat", False)
     except (asyncio.TimeoutError, aiohttp.ClientError, OSError):
         return None
-    if resp.status != 200:
-        await resp.release()
+    if resp is None or resp.status != 200:
+        if resp is not None:
+            with contextlib.suppress(Exception):
+                await resp.release()
         return None
     try:
         data = await resp.json()
     except Exception:
-        await resp.release()
+        with contextlib.suppress(Exception):
+            await resp.release()
         return None
     await resp.release()
-    content = (data.get("message") or {}).get("content") or ""
+    # ollama -> {"message":{"content":...}}; openai -> {"choices":[{"message":{"content":...}}]}
+    content = ((data.get("message") or {}).get("content")
+               or ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
+               or "")
     sees = TRIAL_SEE_RE.search(content) is not None
     await broadcast_activity(host, model, "trial",
-        f"trial balloon {full}: {'sees red' if sees else 'no vision'}", duration=time.time() - start)
+        f"trial balloon {full}: {'sees red' if sees else 'no vision'}", duration=time.time() - start, wid=wid)
     return sees
 
 
@@ -3993,16 +4003,29 @@ def _find_servers_raw(sub, caps=None):
             ms = [m for m in ms if f"{host} {canon_pattern(m)}" not in incompatible]
             if not ms:
                 continue
+        # Special-cap ORDERING key (not a filter): 0 = host has a model advertised/known-capable
+        # for the required caps, 1 = only unknown-cap models, 2 = only flagged-incapable. Race
+        # advertised first, then unknown, then flagged-incapable — because the flag is imperfect
+        # (a flagged-vision model may lack it; an unflagged one may have it), so we TEST the
+        # advertised ones first and still fall back to the rest rather than trusting the flag.
+        cap_known = 0
         if caps:
             caps_map = (knowns.get(host) or {}).get("models", {})
             known = [(m, caps_map[m]) for m in ms if caps_map.get(m)]
             capable = [m for m, c in known if _model_capable(c, caps)]
             incapable = [m for m, c in known if not _model_capable(c, caps)]
-            if incapable and len(incapable) == len(ms):
-                continue
             unknown = [m for m in ms if not caps_map.get(m)]
+            _special = set(caps) - {"completion"}
+            if incapable and not capable and not unknown:
+                # Every matching model is FLAGGED incapable for the required caps.
+                if "vision" in _special:
+                    cap_known = 2        # vision flag is unreliable -> LAST RESORT, balloon-tested, not dropped
+                else:
+                    continue             # a reliable capability mismatch (e.g. confirmed no-tools) -> drop
             if capable or unknown:
                 ms = capable + unknown + incapable
+            if _special and cap_known != 2:
+                cap_known = 0 if capable else 1
         key = f"{host} {sub}"
         if sub:
             # Reputation is keyed by the exact model that succeeded (e.g.
@@ -4061,9 +4084,10 @@ def _find_servers_raw(sub, caps=None):
             # Within the normal UNKNOWN tier, most-recently-checked first; other tiers
             # keep their order via a constant secondary key (stable sort).
             crank = _checked_rank(s) if prio == TIER_UNKNOWN else 0
-        matched.append((prio, crank, host, ms))
-    matched.sort(key=lambda x: (x[0], x[1]))
-    return [(p, h, m) for p, c, h, m in matched]
+        matched.append((cap_known, prio, crank, host, ms))
+    # known-capable-first (for special caps), then tier, then the tier's own secondary order.
+    matched.sort(key=lambda x: (x[0], x[1], x[2]))
+    return [(p, h, m) for ck, p, c, h, m in matched]
 
 
 def all_models():
@@ -4571,7 +4595,11 @@ async def _race_hosts(entries, attempt, key, job_wid=None, workers=None, host_of
                     continue
                 return                                 # nothing left to try
             await _worker_checked(wwid)
-            wid = asyncio.current_task().get_name()
+            # Tag per-host attempt lines with the JOB wid (wwid), not the asyncio task name
+            # (current_task().get_name() = "Task-N", whose tail is a meaningless global counter
+            # like "-4822"). The feed and the worker card both group/filter by the job wid's
+            # tail, so an attempt's lines must carry the SAME wid as its job to line up.
+            wid = wwid
             # Run the attempt as its own task so a user "skip" can cancel just
             # this host without tearing the whole race down. A full "stop"
             # cancels the worker task and sets `done`; a "skip" cancels only the
@@ -4590,7 +4618,18 @@ async def _race_hosts(entries, attempt, key, job_wid=None, workers=None, host_of
                     # nothing — rather than failing a request that could queue.
                     if starved_out is not None and _ih not in starved_out:
                         starved_out.append(_ih)
-                    continue          # another job is on it — next candidate
+                    # FAIRNESS: don't ABANDON a busy-but-good host and drift into the slow tail —
+                    # re-queue it so this worker circles back when the lease (deposited the instant
+                    # a race resolves — seconds) likely cleared, instead of a fresh job eating the
+                    # freed host first. The worker just keeps asking; the banker just says free/busy
+                    # — no offset/age math. Bounded by the request deadline; we still try the next
+                    # fresh candidate meanwhile. Reuses the warming-retry park (a leased host is
+                    # "not ready right now", same as a cold one).
+                    _now = time.time()
+                    if not done.is_set() and _now + WARMING_RETRY <= _deadline:
+                        async with iter_lock:
+                            retry_q.append([_now + WARMING_RETRY, item])
+                    continue          # try the next candidate meanwhile
                 _leased = True
             _astart = time.time()
             _fv = (fav or {}).get(_ih) or {}
@@ -5337,6 +5376,28 @@ def _now_iso():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+async def _post_follow(session, url, *, json, timeout):
+    """POST and follow redirects PRESERVING the method. aiohttp downgrades a POST to a GET on a
+    301/302/303 (per the old spec), and many http:80 inference hosts 301 to https — which drops
+    our method AND body, so the API answers "Unexpected endpoint or method (GET /api/chat)" even
+    though it would serve the POST. We follow manually and re-POST to the Location (up to 4 hops)
+    so the body and method survive the hop to https. A host that doesn't redirect behaves exactly
+    as before."""
+    from urllib.parse import urljoin
+    cur = url
+    resp = None
+    for _ in range(4):
+        resp = await session.post(cur, json=json, timeout=timeout, allow_redirects=False)
+        if resp.status in (301, 302, 303, 307, 308):
+            loc = resp.headers.get("Location")
+            if loc:
+                await resp.release()
+                cur = urljoin(cur, loc)
+                continue
+        return resp
+    return resp
+
+
 async def _send_chat(session, host, full, payload, endpoint, do_stream, timeout=None):
     """Send one chat request to a single host IN ITS OWN DIALECT, and return the
     open response. This is the primitive every chat send should go through — the
@@ -5416,7 +5477,7 @@ async def _send_chat(session, host, full, payload, endpoint, do_stream, timeout=
             # CONNECT phase, while a live-but-slow host gets the full TIMEOUT to
             # answer. This is what lets the caller tell "no connection" from "too
             # slow" (see the except handler on the send site).
-            resp = await session.post(
+            resp = await _post_follow(session,
                 f"{host}{ep}", json=p,
                 timeout=aiohttp.ClientTimeout(total=timeout or _slow_timeout(p), sock_connect=CONNECT_TIMEOUT))
         except Exception as e:
@@ -5438,7 +5499,7 @@ async def _send_chat(session, host, full, payload, endpoint, do_stream, timeout=
             log.info(f"[{rid}] {host}{ep} 400 with think:true — retrying without think")
             _t0 = time.time()
             try:
-                resp = await session.post(
+                resp = await _post_follow(session,
                     f"{host}{ep}", json=p,
                     timeout=aiohttp.ClientTimeout(total=timeout or _slow_timeout(p), sock_connect=CONNECT_TIMEOUT))
             except Exception as e:
@@ -5458,7 +5519,7 @@ async def _send_chat(session, host, full, payload, endpoint, do_stream, timeout=
             log.info(f"[{rid}] {host}{ep} 400 with prefill — retrying as aside continuation")
             _t0 = time.time()
             try:
-                resp = await session.post(
+                resp = await _post_follow(session,
                     f"{host}{ep}", json=p,
                     timeout=aiohttp.ClientTimeout(total=timeout or _slow_timeout(p), sock_connect=CONNECT_TIMEOUT))
             except Exception as e:
@@ -5643,7 +5704,7 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
                 return skip("tool smoke inconclusive: " + (tdetail or "no answer in time"))
 
         if "vision" in (caps or []) and not _known_has(host, full, "vision"):
-            sees = await trial_balloon(session, host, full, model)
+            sees = await trial_balloon(session, host, full, model, wid=wid)
             if sees is None:
                 return skip("trial balloon inconclusive")
             if sees:
