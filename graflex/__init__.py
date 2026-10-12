@@ -1852,10 +1852,18 @@ def _parse_hunter_json(path, service):
 
     seen = set()
     hosts = []
+    masked = 0
     for it in lst:
         if not isinstance(it, dict):
             continue
         ip = it.get("ip")
+        # hunter.how TEASER-MASKS host values for over-quota / under-privileged results — the
+        # host comes back partially starred (e.g. '****.tra****.com' or '47.***.**.***'). A
+        # masked host is not a real, probeable target (it fails DNS and pollutes the pool with
+        # unreadable '****' rows), so skip it and count it rather than storing it.
+        if isinstance(ip, str) and "*" in ip:
+            masked += 1
+            continue
         try:
             port = int(str(it.get("port")))  # hunter.how returns port as a string
         except (TypeError, ValueError):
@@ -1868,7 +1876,21 @@ def _parse_hunter_json(path, service):
         seen.add(key)
         hosts.append({"service": service, "host": key, "site": "hunter"})
 
+    if masked:
+        log.warning(
+            f"hunter.how: {masked}/{len(lst)} result(s) came back HOST-MASKED (e.g. "
+            f"'****.tra****.com') in {path} — teaser/over-quota rows with no usable host; "
+            f"skipped, not stored. Check your HUNTER_COOKIE / account quota if you expected "
+            f"real hosts here."
+        )
     if lst and not hosts:
+        if masked == len(lst):
+            log.error(
+                f"hunter.how: all {len(lst)} results in {path} were host-MASKED — the account "
+                f"is returning teaser data only. Refresh HUNTER_COOKIE / check quota; nothing "
+                f"to probe."
+            )
+            raise SystemExit(3)
         log.error(
             f"hunter.how: {len(lst)} results present but none yielded ip:port in "
             f"{path} — the per-result schema changed. Inspect the captured file."
@@ -4074,7 +4096,7 @@ def main():
     parser = argparse.ArgumentParser(description="Discover public image-generation hosts via FOFA")
     parser.add_argument("--ct", "--check-timeout", dest="check_timeout", type=int, default=60, help="per-host check timeout in seconds (default: 60)")
     parser.add_argument("--curlify", action="store_true", help="print curl command instead of executing")
-    parser.add_argument("-a", "--action", choices=["fetch", "check", "check-new", "check-all", "check-working", "check-zero", "fetch-check", "classify", "enrich", "survey", "reconstruct", "export", "score-bogus", "sample", "strip"], required=True, help="action to perform")
+    parser.add_argument("-a", "--action", choices=["fetch", "check", "check-new", "check-everything", "check-all", "check-working", "check-zero", "fetch-check", "classify", "enrich", "survey", "reconstruct", "export", "score-bogus", "sample", "strip"], required=True, help="action to perform. check-new = this session's newly-fetched hosts (light); check-everything = re-probe the whole stored pool; check-all = the whole pool INCLUDING known-good. Bare 'check' is intentionally undefined (the big sweep must be asked for explicitly).")
     parser.add_argument("-c", "--countries", help="comma-separated country codes to cycle (default: CN,US,CA,JP,KR)")
     parser.add_argument("-d", "--dry", action="store_true", help="report what fetch would do without saving")
     parser.add_argument("-e", "--servers", help="comma-separated server values to cycle (default: uvicorn,nginx)")
@@ -4135,6 +4157,15 @@ def main():
     parts = args.action.split("-")
     check_new = args.action == "check-new"
     check_all = args.action == "check-all"
+    # Bare "check" is intentionally undefined: the whole-pool sweep must be asked for by name,
+    # so you can't trigger ~85k host probes with 4 fewer keystrokes than "check-new". Steer to
+    # the explicit actions. (fetch-check and check-* still contain a "check" step; only the bare
+    # word is rejected.) Exit 1, NOT 2 — graflex.sh treats 2 as a rate-limit 2h backoff.
+    if args.action == "check":
+        log.error("'check' is undefined. Use 'check-new' (this session's newly-fetched hosts — "
+                  "the light pass) or 'check-everything' (re-probe the whole stored pool). "
+                  "'check-all' additionally re-probes known-good hosts.")
+        sys.exit(1)
 
     # "all services" for the whole pipeline, so the 5-day cron run is one
     # invocation per action. Triggered by `-s all` or `-n all` (the user reaches
@@ -4263,7 +4294,7 @@ def main():
             hint = f"{base} -a fetch{f' -i {ts}' if ts else ''}"
             log.warning(f"\ninterrupted — already-fetched pages are saved; resume with: {hint}")
         elif step == "check":
-            hint = f"{base} -a check{f' -i {ts}' if ts else ''}"
+            hint = f"{base} -a {args.action}{f' -i {ts}' if ts else ''}"
             log.warning(f"\ninterrupted — checked hosts (working snapshots and failures) are saved; resume with: {hint}")
         else:
             log.warning("\ninterrupted")

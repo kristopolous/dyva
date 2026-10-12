@@ -3316,23 +3316,22 @@ def needs_caps(messages):
 
 
 async def probe_host(session, host):
+    """Liveness probe: is this host REACHABLE (socket connects, host answers)? NOT 'is it
+    ollama'. /api/ps is just a cheap ping — a non-ollama box (llama.cpp/vLLM/... on :8080) 404s
+    it, which still means the host is alive and answering, so it is REACHABLE. Dialect and real
+    capability are the chat request's / smoke test's job, not this probe's. Only a CONNECTION-
+    level failure (dead socket: timeout, refused, no route) is genuinely unreachable."""
     try:
-        # Phased timeout: a dead host fails fast in the connect phase (~CONNECT_TIMEOUT)
-        # instead of tying up a worker for the full TIMEOUT. /api/ps is cheap (no
-        # inference), so a live host answers it quickly regardless of model warm-up.
+        # Phased timeout: a dead host fails fast in the connect phase (~CONNECT_TIMEOUT) instead
+        # of tying up a worker for the full TIMEOUT.
         resp = await session.get(
             f"{host}/api/ps",
             timeout=aiohttp.ClientTimeout(total=TIMEOUT, sock_connect=CONNECT_TIMEOUT))
     except (asyncio.TimeoutError, aiohttp.ClientError, OSError):
         return False
-    if resp.status != 200:
-        await resp.release()
-        return False
-    try:
-        await resp.json()
-    except Exception:
-        await resp.release()
-        return False
+    # ANY HTTP response (200, 404, 401, anything) = the socket connected and the host replied =
+    # reachable. A non-200 is NOT 'unreachable' — treating it as such falsely culls the ~38% of
+    # the chat pool that speaks OpenAI/llama.cpp rather than ollama.
     await resp.release()
     return True
 
@@ -5467,18 +5466,31 @@ async def _send_chat(session, host, full, payload, endpoint, do_stream, timeout=
                          f"after {time.time()-_t0:.1f}s")
                 raise
             log.info(f"[{rid}] resp {host}{ep} HTTP {resp.status} in {time.time()-_t0:.1f}s (deprefill)")
-        if resp.status not in (404, 405, 501):
-            return resp, attempt_oai, ep, None
-        st = resp.status
+        # Decide: hand this response back, or fall over to the OTHER dialect. A wrong-DIALECT
+        # miss ("this endpoint isn't served here") is detected from the BODY, not just the
+        # status — some OpenAI gateways answer /api/chat with "Unexpected endpoint or method"
+        # under a 400, after a POST->GET redirect, OR even an HTTP 200 with an {"error":...}
+        # body. Peek the body when it's cheap and safe: any ERROR status (we never stream an
+        # error), OR a NON-streaming request (already buffered). A STREAMING 2xx is handed back
+        # untouched so its stream isn't drained. aiohttp CACHES a read body, so a peeked
+        # response stays fully readable by the caller — no detail lost, no re-fetch.
         peek = ""
-        try:
-            peek = " ".join((await resp.text()).split())[:160]
-        except Exception:
-            pass
+        if resp.status >= 400 or not do_stream:
+            try:
+                peek = " ".join((await resp.text()).split())[:300]
+            except Exception:
+                pass
+        _pl = peek.lower()
+        wrong_route = (resp.status in (404, 405, 501)
+                       or "unexpected endpoint" in _pl or "method not allowed" in _pl
+                       or "cannot post" in _pl or "cannot get" in _pl or "no route" in _pl)
+        if not wrong_route:
+            return resp, attempt_oai, ep, None   # success or a real error; body cached if read
+        st = resp.status
         await resp.release()
         resp = None
         dia = "openai" if attempt_oai else "ollama"
-        tried.append(f"{dia} {ep} HTTP {st}" + (f": {peek}" if peek else ""))
+        tried.append(f"{dia} {ep} HTTP {st}" + (f": {peek[:160]}" if peek else ""))
         log.debug(f"{host}: {ep} -> {peek[:80]}; trying the other dialect")
     # Both dialects reported the endpoint missing. Hand back WHAT they actually
     # said (status + body) so a real 404 is distinguishable from an intermediary
@@ -8014,15 +8026,26 @@ async def handle_host_info(request):
         db = _get_db()
         capmap = {m: c for (m, c) in db.execute(
             "SELECT model, caps FROM host_caps WHERE host=?", (server_url,)).fetchall()}
-        out["reputation"] = [
-            {"model": m, "state": st, "last_good": lg, "failure_streak": fs,
-             "ttft": ttft, "tps": tps, "fail_smoke": fsm, "smoke_date": sd,
-             "success": succ, "failure": fail, "race_won": rw, "race_lost": rl,
-             "deprio": dep, "caps": capmap.get(m)}
-            for (m, st, lg, fs, ttft, tps, fsm, sd, succ, fail, rw, rl, dep) in db.execute(
+        # The \x00-sentinel rows (unreachable / honeypot) are host-WIDE markers, not models —
+        # pull them OUT of the model list and surface them as a host-level status, so the card
+        # doesn't render a fake model called "unreachable".
+        _SENTINELS = {UNREACHABLE_KEY: "unreachable", HONEYPOT_KEY: "honeypot"}
+        rep, host_flags = [], {}
+        for (m, st, lg, fs, ttft, tps, fsm, sd, succ, fail, rw, rl, dep) in db.execute(
                 f"SELECT model, state, last_good, failure_streak, ttft, tps, fail_smoke, smoke_date, "
                 f"success, failure, race_won, race_lost, deprio "
-                f"FROM host_status WHERE host=? AND {_LIVE_REAL} ORDER BY model", (server_url,)).fetchall()]
+                f"FROM host_status WHERE host=? AND {_LIVE_REAL} ORDER BY model", (server_url,)).fetchall():
+            if m in _SENTINELS:
+                host_flags[_SENTINELS[m]] = {"state": st, "failure_streak": fs,
+                                             "failure": fail, "last_good": lg}
+                continue
+            rep.append({"model": m, "state": st, "last_good": lg, "failure_streak": fs,
+                        "ttft": ttft, "tps": tps, "fail_smoke": fsm, "smoke_date": sd,
+                        "success": succ, "failure": fail, "race_won": rw, "race_lost": rl,
+                        "deprio": dep, "caps": capmap.get(m)})
+        out["reputation"] = rep
+        if host_flags:
+            out["host_flags"] = host_flags
         caps = []
         for (cap, node, voices, checked) in db.execute(
                 "SELECT capability, node, voices, checked FROM host_nodes "
@@ -8044,6 +8067,109 @@ async def handle_host_info(request):
 
 
 HOST_SEARCH_MAX = 200   # cap the pick-list; the search ERRS toward too many, but bounded
+
+
+_UNFURL_CACHE = {}          # url -> preview dict; bounded, process-lifetime
+_UNFURL_CACHE_MAX = 500
+
+
+def _unfurl_public_host(host):
+    """One dumb guard for the link-preview fetch: the host must resolve to PUBLIC IPs only
+    (skip loopback/private/link-local/reserved) and be http(s). Not a fortress — a stranger's
+    model emitting a URL to fetch is a far weaker surface than tool execution — just enough to
+    not fetch localhost / the internal network by accident."""
+    import ipaddress
+    import socket
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except Exception:
+        return False
+    for info in infos:
+        try:
+            addr = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            return False
+        if (addr.is_private or addr.is_loopback or addr.is_link_local
+                or addr.is_reserved or addr.is_multicast or addr.is_unspecified):
+            return False
+    return True
+
+
+def _unfurl_meta(html, *names):
+    """First matching <meta property|name="<n>" content="..."> (either attr order)."""
+    for n in names:
+        for pat in (r'<meta[^>]+(?:property|name)=["\']' + re.escape(n) + r'["\'][^>]+content=["\']([^"\']*)["\']',
+                    r'<meta[^>]+content=["\']([^"\']*)["\'][^>]+(?:property|name)=["\']' + re.escape(n) + r'["\']'):
+            m = re.search(pat, html, re.I)
+            if m and m.group(1).strip():
+                return m.group(1).strip()
+    return None
+
+
+async def handle_unfurl(request):
+    """
+    Link preview (JSON)
+    ---
+    tags: [UI]
+    summary: GET /unfurl?url=<url> — fetch a public page's OG/meta tags for a chat link card.
+    description: >
+      Display-only. Returns {ok,title,image,description,site}. Fetches only public http(s)
+      URLs (private/loopback hosts skipped), bounded to a 6s timeout and 512KB read, and
+      caches the result. A URL that can't be previewed returns {ok:false} and the chat just
+      leaves it as a plain link.
+    responses:
+      '200': {description: Preview (or ok:false)}
+    """
+    from urllib.parse import urlparse, urljoin, unquote
+    url = (request.query.get("url") or "").strip()
+    if url in _UNFURL_CACHE:
+        return web.json_response(_UNFURL_CACHE[url])
+    fail = {"ok": False, "url": url}
+    p = urlparse(url)
+    if p.scheme not in ("http", "https") or not p.hostname or not _unfurl_public_host(p.hostname):
+        return web.json_response(fail)
+    # A real browser UA (many sites 403 a bot-looking one) and dyva's permissive TLS connector
+    # (self-signed / odd handshakes are the norm on the hosts we fetch), same as every other
+    # outbound dyva makes — a plain verifying session fails on a chunk of the live web.
+    _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
+    try:
+        conn = aiohttp.TCPConnector(ssl=INSECURE_SSL)
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6), connector=conn) as s:
+            async with s.get(url, headers={"User-Agent": _UA, "Accept": "text/html,*/*"},
+                             allow_redirects=True, max_redirects=3) as resp:
+                if resp.status != 200:
+                    return web.json_response(fail)
+                raw = await resp.content.read(512 * 1024)
+                html = raw.decode("utf-8", "replace")
+                final_url = str(resp.url)
+    except Exception:
+        return web.json_response(fail)
+    title = _unfurl_meta(html, "og:title", "twitter:title")
+    if not title:
+        tm = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+        title = tm.group(1).strip() if tm else None
+    if not title:   # reachable page, no title tag -> derive a readable name from the path
+        slug = (p.path or "").rstrip("/").rsplit("/", 1)[-1]
+        title = unquote(slug).replace("_", " ").replace("-", " ").strip() or p.hostname
+    image = _unfurl_meta(html, "og:image", "twitter:image", "twitter:image:src")
+    if image:
+        image = urljoin(final_url, image)
+    desc = _unfurl_meta(html, "og:description", "twitter:description", "description")
+    site = _unfurl_meta(html, "og:site_name") or p.hostname
+    # Meta/title text is HTML-ENTITY-encoded in the source (e.g. "Cox&#039;s"); decode it so the
+    # client renders real characters — the client escapes for display, so passing the encoded
+    # form through would double-encode and show the literal "&#039;".
+    import html as _hmod
+    title = _hmod.unescape(title) if title else title
+    desc = _hmod.unescape(desc) if desc else desc
+    site = _hmod.unescape(site) if site else site
+    out = {"ok": bool(title or image), "url": url,
+           "title": (title[:160] if title else None), "image": image,
+           "description": (desc[:200] if desc else None), "site": site}
+    if len(_UNFURL_CACHE) < _UNFURL_CACHE_MAX:
+        _UNFURL_CACHE[url] = out
+    return web.json_response(out)
 
 
 async def handle_host_search(request):
@@ -16890,6 +17016,7 @@ def make_app():
     swagger.add_post("/shutdown", handle_shutdown)
     swagger.add_get("/host-info", handle_host_info)
     swagger.add_get("/host-search", handle_host_search)
+    swagger.add_get("/unfurl", handle_unfurl)
     swagger.add_get("/api/stats", handle_stats)
     swagger.add_get("/api/source-stats", handle_source_stats)
     swagger.add_get("/api/service-stats", handle_service_stats)

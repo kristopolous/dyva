@@ -539,6 +539,7 @@ a.host-name:hover{color:var(--accent);text-decoration:underline}
 @media(max-width:640px){.map-lists{flex:1 1 100%}}
 .hd-badges{display:flex;gap:6px;flex-wrap:wrap;margin:.6em 0}
 .hd-badge{font-size:.72rem;padding:2px 9px;border-radius:20px;background:var(--card);border:1px solid var(--border);color:var(--text-2);white-space:nowrap}
+.hd-badge-bad{background:var(--err-bg,rgba(220,80,80,.14));border-color:var(--err,#d05050);color:var(--err,#d05050)}
 .hd-badge.hd-prov{background:var(--accent-bg);border-color:transparent;color:var(--accent);text-transform:capitalize}
 .hd-row{display:flex;justify-content:space-between;gap:12px;padding:4px 0;border-bottom:1px solid var(--border);font-size:.84rem}
 .hd-row .hd-k{color:var(--text-dim);flex:0 0 auto}
@@ -700,6 +701,24 @@ button.stop:hover{background:var(--btn-danger-hover)}
 .msg.note .note-text .asset-card{display:flex;gap:var(--sp-3);align-items:flex-start;border:1px solid var(--border);border-radius:var(--r-md);padding:.5em;margin:.4em 0;max-width:44rem}
 .msg.note .note-text .asset-thumb{flex:0 0 auto;width:64px;height:64px;border-radius:var(--r-md);object-fit:cover;background:var(--bg-inset);border:1px solid var(--border)}
 .msg.note .note-text .asset-thumb-missing{object-fit:contain;opacity:.55;padding:2px}
+/* "Show links" preview cards — a horizontally-pageable gallery under an assistant reply */
+.link-cards-wrap{position:relative;margin:.55em 0 .1em}
+.link-cards{display:flex;flex-wrap:nowrap;gap:var(--sp-2);overflow-x:auto;scroll-behavior:smooth;-webkit-overflow-scrolling:touch;scrollbar-width:thin;padding-bottom:3px}
+.link-cards::-webkit-scrollbar{height:6px}
+.link-cards::-webkit-scrollbar-thumb{background:var(--border-strong);border-radius:3px}
+.link-card{flex:0 0 200px;display:flex;flex-direction:column;border:1px solid var(--border);border-radius:var(--r-lg);overflow:hidden;background:var(--surface);text-decoration:none;color:inherit;transition:border-color .12s}
+.link-card:hover{border-color:var(--border-strong)}
+.link-card-img{width:100%;height:112px;object-fit:cover;background:var(--bg-inset);display:block}
+.link-card-body{padding:.5em .6em;display:flex;flex-direction:column;gap:3px}
+.link-card-title{font-size:var(--fs-sm);font-weight:600;line-height:1.25;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.link-card-desc{font-size:var(--fs-2xs);color:var(--text-dim);line-height:1.3;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.link-card-site{font-size:var(--fs-2xs);color:var(--text-faint);margin-top:1px}
+/* tall, thin paging arrows flanking the row — shown only when the row overflows */
+.link-cards-nav{position:absolute;top:0;bottom:3px;width:26px;display:flex;align-items:center;justify-content:center;border:1px solid var(--border);background:var(--surface);color:var(--text-dim);border-radius:var(--r-md);cursor:pointer;font-size:17px;line-height:1;padding:0;z-index:2;visibility:hidden;box-shadow:0 1px 6px rgba(0,0,0,.25)}
+.link-cards-nav:hover{color:var(--text);border-color:var(--border-strong)}
+.link-cards-nav.prev{left:2px}
+.link-cards-nav.next{right:2px}
+@media(max-width:760px){.link-card{flex-basis:168px}}
 .msg.note .note-text .asset-glyph{display:flex;align-items:center;justify-content:center;font-size:1.4rem;color:var(--text-faint)}
 .msg.note .note-text .asset-text{min-width:0;flex:1 1 auto}
 .msg.note .note-text .asset-name{font-family:var(--font-mono);font-size:var(--fs-sm);color:var(--text);overflow-wrap:anywhere}
@@ -1383,6 +1402,7 @@ body.dragging-image .hist-item{cursor:grabbing}
 <label class="tool-opt"><input type="checkbox" id="toolWeb"><span class="tool-txt"><b>Web</b><small>Read a page at a URL</small></span></label>
 <label class="tool-opt"><input type="checkbox" id="toolAgents"><span class="tool-txt"><b>Sub-agents</b><small>Split a task across parallel agents</small></span></label>
 <label class="tool-opt"><input type="checkbox" id="toolDocs"><span class="tool-txt"><b>Documents</b><small>Write &amp; edit documents</small></span></label>
+<label class="tool-opt"><input type="checkbox" id="toolLinks"><span class="tool-txt"><b>Show links</b><small>Preview cards for links in replies (display only)</small></span></label>
 </div>
 </div>
 <button id="docToggle" class="mp-tool" title="Documents" style="display:none"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg></button>
@@ -2578,6 +2598,9 @@ function hostDetailHtml(host,j){
   if(j.provider)b.push('<span class="hd-badge hd-prov">'+escHtml(j.provider)+'</span>');
   if(j.country)b.push('<span class="hd-badge">'+flagEmoji(j.country)+' '+escHtml(j.country)+(j.city?' · '+escHtml(j.city):'')+'</span>');
   if(j.service)b.push('<span class="hd-badge">'+escHtml(j.service)+(j.version?' '+escHtml(j.version):'')+'</span>');
+  // host-WIDE status markers (not models): surfaced as badges, not fake model rows
+  if(j.host_flags&&j.host_flags.unreachable)b.push('<span class="hd-badge hd-badge-bad" title="dyva’s socket probe failed on the last '+(j.host_flags.unreachable.failure_streak||0)+' attempt(s) — host-wide; clears automatically on the next successful request">unreachable</span>');
+  if(j.host_flags&&j.host_flags.honeypot)b.push('<span class="hd-badge hd-badge-bad" title="Flagged host-wide as a honeypot (canned / fake responses)">honeypot</span>');
   if(b.length)h.push('<div class="hd-badges">'+b.join('')+'</div>');
   function row(k,v){return v?('<div class="hd-row"><span class="hd-k">'+k+'</span><span class="hd-v">'+v+'</span></div>'):''}
   h.push(row('host','<a href="'+escHtml(href)+'" target="_blank" rel="noopener noreferrer">'+escHtml(url)+' ↗</a>'));
@@ -3832,7 +3855,75 @@ function addMsg(role,text,index){
   if(_tstr){var when=document.createElement('span');when.className='msg-time';when.textContent=_tstr;when.title=fmtWhen(_ts);r.appendChild(when)}
   chatLog.appendChild(d);
   scrollChat();
+  if(role==='assistant')_linkCardsFor(d,b);
   return {roleEl:r,bodyEl:b};
+}
+// "Show links": when on, pull the http(s) links out of an assistant reply, unfurl each via
+// dyva's /unfurl (OG/meta), and append a card row. A link that doesn't preview is simply left
+// as the plain link already in the prose. Display-only, capped, de-duped; opens in a new tab.
+function _hostLabel(u){try{return new URL(u).hostname.replace(/^www\./,'')}catch(e){return u}}
+function _linkCardsFor(container,bodyEl){
+  if(!container)return;
+  var old=container.querySelector('.link-cards-wrap');if(old)old.remove();   // idempotent: no dupes on re-render/finalize, and toggling off clears
+  if(!linksOn||!bodyEl)return;
+  var anchors=bodyEl.querySelectorAll('a[href]'),urls=[],seen={};
+  for(var i=0;i<anchors.length;i++){
+    var h=anchors[i].getAttribute('href')||'';
+    if(!/^https?:\/\//i.test(h)||seen[h])continue;
+    seen[h]=1;urls.push(h);
+    if(urls.length>=40)break;   // collectible cap; actual fetches are lazy (a batch at a time)
+  }
+  if(!urls.length)return;
+  // Horizontally-pageable gallery with LAZY loading: only a small first batch is unfurled;
+  // more are fetched a batch at a time as you page/scroll toward the end, so we never fire N
+  // link requests at once. Native touch-scroll on mobile, arrow clicks on desktop.
+  var wrap=document.createElement('div');wrap.className='link-cards-wrap';
+  var prev=document.createElement('button');prev.type='button';prev.className='link-cards-nav prev';prev.textContent='‹';prev.setAttribute('aria-label','Scroll left');
+  var row=document.createElement('div');row.className='link-cards';
+  var next=document.createElement('button');next.type='button';next.className='link-cards-nav next';next.textContent='›';next.setAttribute('aria-label','Scroll right');
+  wrap.appendChild(prev);wrap.appendChild(row);wrap.appendChild(next);container.appendChild(wrap);
+  var BATCH=4,loaded=0,pending=false;
+  function addCard(d,u){
+    var card=document.createElement('a');
+    card.className='link-card';card.href=u;card.target='_blank';card.rel='noopener noreferrer';
+    if(d.image){
+      var im=document.createElement('img');im.className='link-card-img';im.src=d.image;im.alt='';
+      im.addEventListener('error',function(){im.remove()});   // broken og:image just collapses
+      card.appendChild(im);
+    }
+    var bd=document.createElement('div');bd.className='link-card-body';
+    bd.innerHTML='<div class="link-card-title">'+escHtml(d.title||u)+'</div>'+
+      (d.description?'<div class="link-card-desc">'+escHtml(d.description)+'</div>':'')+
+      '<div class="link-card-site">'+escHtml(d.site||_hostLabel(u))+'</div>';
+    card.appendChild(bd);row.appendChild(card);
+  }
+  function loadBatch(){
+    if(pending||loaded>=urls.length)return;
+    pending=true;
+    var batch=urls.slice(loaded,loaded+BATCH);loaded+=batch.length;var done=0;
+    batch.forEach(function(u){
+      fetch('unfurl?url='+encodeURIComponent(u)).then(function(r){return r.json()}).then(function(d){
+        if(d&&d.ok)addCard(d,u);   // dead / no preview -> stays a plain link in the prose
+      }).catch(function(){}).then(function(){if(++done===batch.length){pending=false;sync();}});
+    });
+  }
+  function sync(){
+    var over=row.scrollWidth-row.clientWidth>4,atEnd=row.scrollLeft>=row.scrollWidth-row.clientWidth-2;
+    prev.style.visibility=(over&&row.scrollLeft>2)?'visible':'hidden';
+    next.style.visibility=((over&&!atEnd)||loaded<urls.length)?'visible':'hidden';   // more to scroll OR more to load
+  }
+  function page(dir){
+    if(dir>0&&loaded<urls.length&&row.scrollLeft>=row.scrollWidth-row.clientWidth-80)loadBatch();
+    row.scrollBy({left:dir*Math.max(row.clientWidth*0.85,180),behavior:'smooth'});
+  }
+  prev.addEventListener('click',function(){page(-1)});
+  next.addEventListener('click',function(){page(1)});
+  row.addEventListener('scroll',function(){
+    sync();
+    if(loaded<urls.length&&row.scrollLeft>=row.scrollWidth-row.clientWidth-200)loadBatch();   // infinite-scroll toward the end
+  });
+  loadBatch();            // first batch only
+  setTimeout(sync,80);
 }
 function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 // Weak models often double-encode a nested array tool-arg as a JSON STRING
@@ -3994,8 +4085,10 @@ function paintGenStatus(el,d){
   else if(d.status==='trying'||d.status==='failed')el.textContent=d.message;
 }
 // looping placeholder animation shown inside the bubble until the first tokens
-var _rummageMuted=false;
-try{_rummageMuted=localStorage.getItem('dyva_rummage_muted')==='1'}catch(e){}
+// Muted on FIRST use (no surprise audio the first time the loading video autoplays); an
+// explicit prior choice in localStorage still wins.
+var _rummageMuted=true;
+try{var _rm=localStorage.getItem('dyva_rummage_muted');if(_rm!==null)_rummageMuted=(_rm==='1');}catch(e){}
 // cycle rummage0..rummage8 (0-based) on each insert, starting at a random one
 var RUMMAGE_COUNT=9;
 var _rummageN=Math.floor(Math.random()*RUMMAGE_COUNT);
@@ -5869,6 +5962,7 @@ function finishStream(bubble,isLive,host,fmodel,tps,chatId,chatCreated,chatTitle
     bubble.bodyEl.removeAttribute('data-stream');
     bubble.bodyEl.innerHTML=thinkHtml(thAll,true)+renderChatText(content);
     highlightBlocks(bubble.bodyEl);
+    _linkCardsFor(bubble.bodyEl.parentNode,bubble.bodyEl);   // link preview cards on a freshly-streamed reply
     scrollChat();
   }
   var _fin=splitDocBlocks(content);
@@ -6413,6 +6507,10 @@ var toolWebChk=document.getElementById('toolWeb');
 var toolAgentsChk=document.getElementById('toolAgents');
 var toolsOffChk=document.getElementById('toolsOff');
 var imageOn=false,docsOn=false,speechOn=false,videoOn=false,webOn=false,agentsOn=false;
+// DISPLAY-only toggle (not a model tool): render preview cards for links in replies.
+var linksOn=false;
+try{linksOn=localStorage.getItem('dyva_links')==='1'}catch(e){}
+var toolLinksChk=document.getElementById('toolLinks');
 // Master override: some pool models don't support tool calls at all, so this
 // sends NO tools (buildTools returns []), regardless of the individual toggles.
 var toolsOff=false;
@@ -6544,6 +6642,7 @@ function paintTools(){
   if(toolSpeechChk)toolSpeechChk.checked=speechOn;
   if(toolVideoChk)toolVideoChk.checked=videoOn;
   if(toolWebChk)toolWebChk.checked=webOn;
+  if(toolLinksChk)toolLinksChk.checked=linksOn;
   if(toolAgentsChk)toolAgentsChk.checked=agentsOn;
   if(toolsOffChk)toolsOffChk.checked=toolsOff;
   // when everything's disabled, grey out the per-tool list so it reads as moot
@@ -6594,6 +6693,13 @@ if(toolWebChk)toolWebChk.addEventListener('change',function(){
   webOn=this.checked;
   try{localStorage.setItem('dyva_tools_web',webOn?'1':'0')}catch(e){}
   paintTools();_persistChatTools();
+});
+// Display-only: not a model tool, so no _persistChatTools / buildTools — just re-render the
+// current chat so cards appear/disappear for the messages already on screen.
+if(toolLinksChk)toolLinksChk.addEventListener('change',function(){
+  linksOn=this.checked;
+  try{localStorage.setItem('dyva_links',linksOn?'1':'0')}catch(e){}
+  if(typeof renderMessages==='function')renderMessages();
 });
 if(toolAgentsChk)toolAgentsChk.addEventListener('change',function(){
   agentsOn=this.checked;
