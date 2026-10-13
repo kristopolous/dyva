@@ -317,15 +317,22 @@ changes only two things: the load-bearing idea, and the transport.
   converged design's "recently-good" lead: the part worth syncing is the REAL-ENDPOINT
   determination, not the moment-in-time liveness bundled with it.
 
-  Honest nuance (how this sits with positive-leads-only): the PASS (real endpoint) is a
-  positive, fully consistent with the rule. The HONEYPOT verdict is a NEGATIVE — worth
-  sharing BECAUSE it's a conclusive observed verdict, not a flaky liveness negative —
-  but it reintroduces the poisoning/sticky risk the positive-only rule guarded against
-  (a bad peer could flag good hosts as honeypots to get them skipped). So a shared
-  honeypot flag is a HINT, not a permanent blind skip: the receiver still owns the
-  verdict and re-verifies (the trap screen is cheap), keeping it self-correcting. The
-  rule's real target was flaky, non-self-correcting negatives (liveness); a high-
-  confidence, re-verifiable smoke verdict is the deliberate, bounded exception.
+  How this sits with positive-leads-only: the PASS (real endpoint) is a positive, fully
+  consistent with the rule. The HONEYPOT verdict is a NEGATIVE, and it is the ONE negative
+  we deliberately TRUST and inherit — skip the host WITHOUT contact. The reason is the whole
+  point of the flag: re-verifying a honeypot means sending it a request, i.e. walking into
+  the bait/RCE trap the flag exists to keep you away from. "Re-verify, don't inherit" is the
+  right rule for FLAKY negatives (down/timeout — cheap and safe to recheck yourself), NOT for
+  a conclusive malicious one where contact IS the hazard and the host won't reform. So the
+  original "always establish negatives yourself" splits cleanly: flaky liveness negatives =
+  never inherit; honeypot = trust and skip, no contact.
+  The residual risk is poisoning — a bad peer flagging good hosts as honeypots to get them
+  skipped. It's bounded, and NOT by re-verifying (that defeats the purpose): (a) the namespace
+  means only holders of the source URL can post to its channel, so an attacker is already a
+  source participant, not the open internet; (b) src_ip is stored per row for retro-
+  invalidation of a bad contributor; (c) the blast radius of a false flag is one skipped host.
+  If permanence ever bites, AGE honeypot flags out (re-admit to discovery after a long cooldown)
+  rather than re-verify-by-contact.
 
 --- SIMPLEST PROTOCOL (the MVP): timestamp-delta sync on /refresh ---------------
 
@@ -373,9 +380,46 @@ changes only two things: the load-bearing idea, and the transport.
     * src_ip on the server is the abuse lever (retro-invalidate a bad client) with no
       up-front auth ceremony — fits "cookies on the top shelf".
 
---- Status / still parked -------------------------------------------------------
+--- STORAGE: quarantine measured vs attested; the router reads ONE view ---------
 
-  Unchanged trigger to actually build: cold start with the graflex SOURCE removed —
+  Our own probes (MEASURED) and peers' (ATTESTED) must NOT share a table — commingling erases
+  provenance and lets a peer overwrite measured truth. So: host_measured (= dyva's host_status
+  in prod) stays untouched, peer rows land in a quarantined `hosts_attested`, and the router
+  reads a unified VIEW `host_resolved`. Canonical schema + view: dyva/gossiper/resolution.sql;
+  its proof (all cases pass): dyva/gossiper/test_resolution.py. Mirrors graflex's host/bad_hosts
+  two-table last-wins split.
+
+  Resolution per (host, model):
+    * a HONEYPOT (measured OR attested) is ONE-WAY sticky and WINS -> trusted skip, no contact
+      (re-probing a claimed honeypot IS the hazard). Measured honeypot outranks attested only
+      for provenance; both mean "skip".
+    * else the MOST-RECENT row wins. With re-measure-on-use this reproduces fill-blanks for
+      free (a host you use => your measured row is freshest => yours wins; one you don't =>
+      attested fills the blank; a fresh peer row beats your stale own row).
+  Verified cases: attested fills a blank; your newer measurement wins; a fresh attested row
+  updates your stale one; attested honeypot beats even your NEWER pass; your own honeypot is
+  sticky against an attested pass (peer can't un-bad your burn); honeypot wins among mixed
+  attesters.
+
+  Quarantine's payoff = INVALIDATION. Each attested row carries the `attester` (the reporter's
+  IP/id — pushed down; no masking needed, the host set is already 10k+). A poisoned/stale report
+  drops with one `DELETE FROM hosts_attested WHERE attester=?` that can't scratch host_measured,
+  and the host recovers in the view (verified: E -> your measured pass; a mixed host -> the
+  remaining attested pass). That is the escape hatch for a trusted-but-wrong honeypot, NOT
+  re-contact; aging attested rows out is the other.
+
+--- Status: SERVER BUILT (2026-10-13); client still gated ----------------------
+
+  The SERVER is built and live-verified on real Apache: dyva/gossiper/gossiper.php (deploy
+  as the subdir ~/www/dyva/gossiper/ -> 9ol.es/dyva/gossiper) + gossiper.py (portable twin).
+  Schema `gossip(id PK AUTOINC, source, host, model, smoke, client_ts, src_ip, server_ts)`,
+  cursor = `id`. Deploy notes: a `gossiper/` SUBDIR with `.htaccess` = `DirectoryIndex
+  gossiper.php` (clean URL, no mod_rewrite needed) + FilesMatch denying *.sqlite*/.db/.py
+  (else the store is one GET away). GOTCHA: POST must use the TRAILING-SLASH url
+  (/dyva/gossiper/) — the no-slash form 301-redirects and the redirect drops the POST body.
+  The CLIENT (dyva POSTing smoke verdicts on /refresh) is the remaining piece, still gated:
+
+  Unchanged trigger to actually wire the client: cold start with the graflex SOURCE removed —
   if securing hosts then takes serious time, build it; else stays parked. "Getting
   closer" on the DESIGN; the namespace-by-URL framing + leak dissolution is the step
   forward. Everything in the CONVERGED DESIGN section still holds; this only reframes

@@ -409,6 +409,12 @@ CLOUD_SKIP = set()
 # flag or the base_path setting (--base wins); EVERY route — dashboard, /v1/*,
 # /api/*, /docs, static, /demos — moves under it, e.g. /some-path/v1/models.
 BASE_PATH = ""
+# Gossiper: peer sync of smoke-test verdicts (see brainstorm/gossiper.md + dyva/gossiper/).
+# GOSSIPER_URL is the server to sync with (the public reference by default; override or clear
+# to run your own / opt out); GOSSIPER_ENABLED is the on/off tick (default ON — a user can
+# decide not to engage). The client that actually syncs is not wired yet; these hold the config.
+GOSSIPER_URL = "https://9ol.es/dyva/gossiper/"   # trailing slash: a POST to the no-slash form 301s and drops the body
+GOSSIPER_ENABLED = True
 
 
 def _normalize_base(s):
@@ -456,6 +462,7 @@ def _resolve_version():
 
 
 VERSION = _resolve_version()
+START_TS = time.time()   # process start (epoch secs); surfaced in /api/stats for the uptime counter
 SETTINGS_FILE = os.path.join(CACHE_DIR, "settings.json")
 
 # The ComfyUI model classifier (shared with graflex) lives in this package so
@@ -626,7 +633,7 @@ def model_modalities(model):
 def load_settings():
     """Apply persisted runtime settings (workers/timeout/min_count/local) over
     the CLI defaults, so changes made in the dashboard survive restarts."""
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, RACE_WATCHDOG, WARM_CONNECT_WAIT
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED
     if not os.path.exists(SETTINGS_FILE):
         return
     try:
@@ -673,6 +680,10 @@ def load_settings():
         CLOUD_SKIP = {x.lower() for x in s["cloudskip"] if isinstance(x, str) and x.strip()}
     if isinstance(s.get("base_path"), str):
         BASE_PATH = _normalize_base(s["base_path"])
+    if isinstance(s.get("gossiper_url"), str):
+        GOSSIPER_URL = s["gossiper_url"].strip()
+    if isinstance(s.get("gossiper_enabled"), bool):
+        GOSSIPER_ENABLED = s["gossiper_enabled"]
 
 
 def save_settings(extra=None):
@@ -691,7 +702,8 @@ def save_settings(extra=None):
                  "worker_max": WORKER_MAX, "worker_max_failover": WORKER_MAX_FAILOVER, "race_watchdog": RACE_WATCHDOG,
                  "min_count": MIN_COUNT, "local": _LOCAL, "explore": EXPLORE_MODE,
                  "admin_pw": ADMIN_PW, "model_list": MODEL_LIST, "model_list_on": MODEL_LIST_ON,
-                 "cloudskip": sorted(CLOUD_SKIP), "base_path": BASE_PATH})
+                 "cloudskip": sorted(CLOUD_SKIP), "base_path": BASE_PATH,
+                 "gossiper_url": GOSSIPER_URL, "gossiper_enabled": GOSSIPER_ENABLED})
     if isinstance(extra, dict):
         data.update(extra)
     try:
@@ -8118,6 +8130,7 @@ async def handle_stats(request):
         "models": _rows(models),
         "hosts": _rows(hosts),
         "totals": {"up": tot_up, "down": tot_down, "reqs": tot_reqs},
+        "started": START_TS,   # server process start (epoch secs) -> the stats header's live uptime
         "q": q,              # echoed so the client can show what's actually applied
     })
 
@@ -9052,6 +9065,7 @@ async def handle_settings_get(request):
                               "base_path": BASE_PATH,
                               "admin_pw_set": bool(ADMIN_PW),
                               "model_list": MODEL_LIST, "model_list_on": MODEL_LIST_ON,
+                              "gossiper_url": GOSSIPER_URL, "gossiper_enabled": GOSSIPER_ENABLED,
                               "admin": True, "sources": _stored_sources()})
 
 
@@ -9065,7 +9079,7 @@ async def handle_settings_post(request):
       '200':
         description: Updated settings
     """
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, RACE_WATCHDOG, WARM_CONNECT_WAIT
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED
     resp = await _check_local(request) or _check_admin(request)
     if resp:
         return resp
@@ -9121,6 +9135,10 @@ async def handle_settings_post(request):
         MODEL_LIST = parse_model_list(body["model_list"])
     if "model_list_on" in body:
         MODEL_LIST_ON = bool(body["model_list_on"])
+    if isinstance(body.get("gossiper_url"), str):
+        GOSSIPER_URL = body["gossiper_url"].strip()
+    if isinstance(body.get("gossiper_enabled"), bool):
+        GOSSIPER_ENABLED = body["gossiper_enabled"]
     # admin_pw: only when the key is present. A non-empty value sets/changes the
     # password (stored hashed); an explicit empty string clears protection. The
     # plaintext is never stored or echoed back.
@@ -9147,6 +9165,7 @@ async def handle_settings_post(request):
                               "base_path": BASE_PATH,
                               "admin_pw_set": bool(ADMIN_PW),
                               "model_list": MODEL_LIST, "model_list_on": MODEL_LIST_ON,
+                              "gossiper_url": GOSSIPER_URL, "gossiper_enabled": GOSSIPER_ENABLED,
                               "admin": True, "sources": _stored_sources(),
                               "refreshed": sources_changed})
 

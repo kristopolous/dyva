@@ -364,7 +364,7 @@ a.host-name:hover{color:var(--accent);text-decoration:underline}
 .map-head .map-proc + .map-help{margin-left:8px}
 .map-head .map-help{margin-left:auto;flex:0 0 auto;width:22px;height:22px;padding:0;border-radius:50%;border:1px solid var(--border);background:var(--surface);color:var(--text-2);font-size:.8rem;cursor:pointer;display:flex;align-items:center;justify-content:center}
 .map-head .map-help:hover{color:var(--text);background:var(--accent-bg)}
-.stats-tot{color:var(--text-muted);font-size:var(--fs-md);font-variant-numeric:tabular-nums}
+.stats-tot{color:var(--text-muted);font-size:11px;font-variant-numeric:tabular-nums}
 /* The granularity dropdown carries the auto-push so it + the token count group right.
    width:auto overrides the global `select{width:100%}` that was stretching it to its
    own full-width row. */
@@ -1447,6 +1447,7 @@ body.dragging-image .hist-item{cursor:grabbing}
 <label class="tool-opt"><input type="checkbox" id="toolVideo"><span class="tool-txt"><b>Video</b><small>Make a short video</small></span></label>
 <label class="tool-opt"><input type="checkbox" id="toolSpeech"><span class="tool-txt"><b>Speech</b><small>Speak dialog out loud</small></span></label>
 <label class="tool-opt"><input type="checkbox" id="toolWeb"><span class="tool-txt"><b>Web</b><small>Read a page at a URL</small></span></label>
+<label class="tool-opt"><input type="checkbox" id="toolHost"><span class="tool-txt"><b>Host access</b><small>Let the model request your location (your browser asks first)</small></span></label>
 <label class="tool-opt"><input type="checkbox" id="toolAgents"><span class="tool-txt"><b>Sub-agents</b><small>Split a task across parallel agents</small></span></label>
 <label class="tool-opt"><input type="checkbox" id="toolDocs"><span class="tool-txt"><b>Documents</b><small>Write &amp; edit documents</small></span></label>
 <label class="tool-opt"><input type="checkbox" id="toolLinks"><span class="tool-txt"><b>Show links</b><small>Preview cards for links in replies (display only)</small></span></label>
@@ -1707,7 +1708,7 @@ body.dragging-image .hist-item{cursor:grabbing}
 
 <div id="stats" class="panel">
 <div class="card"><div class="card-inner">
-<div class="map-head"><input id="statsFilter" class="stats-filter" type="search" placeholder="filter model or host" autocomplete="off"><button id="statsGo" class="stats-go">Apply</button><select id="statsGran" class="stats-gran" title="chart granularity"><option value="hour">Hourly</option><option value="day" selected>Daily</option><option value="week">Weekly</option></select><span id="statsTotals" class="stats-tot"></span><span id="statsAsOf" class="stats-asof"></span></div>
+<div class="map-head"><input id="statsFilter" class="stats-filter" type="search" placeholder="filter model or host" autocomplete="off"><button id="statsGo" class="stats-go">Apply</button><select id="statsGran" class="stats-gran" title="chart granularity"><option value="hour">Hourly</option><option value="day" selected>Daily</option><option value="week">Weekly</option></select><span id="statsTotals" class="stats-tot"></span><span id="statsAsOf" class="stats-asof"></span><span id="statsUptime" class="stats-asof"></span></div>
 <div id="statsChart" class="stats-chart"></div>
 <div class="stats-tabs" id="statsTabs" role="tablist">
 <button type="button" class="htab active" data-view="models">Models</button>
@@ -1811,6 +1812,8 @@ body.dragging-image .hist-item{cursor:grabbing}
 <div class="settings-card-title">Presentation<span class="dirty-flag">needs save</span></div>
 <label class="setting"><span class="setting-text"><span class="setting-name">Minimum model count</span><small class="setting-help">Hide models served by fewer than this many hosts from the <code>/api/tags</code> and <code>/v1/models</code> listings that third-party apps read. 0 = show all. (The dashboard always shows everything.)</small></span><input type="number" id="setMinCount" min="0" step="1"></label>
 <label class="setting"><span class="setting-text"><span class="setting-name">Base path</span><small class="setting-help">Serve dyva under a secret URL path instead of the root. A path like <code>/some-path</code> moves the dashboard to <code>/some-path/</code> and the API to <code>/some-path/v1/models</code> — deterrence by obscurity: a scanner hitting the default paths (<code>/v1/models</code>, <code>/api/tags</code>) finds nothing. Blank = served at the root. <b>Takes effect on restart</b> (like the listen port); the <code>--base</code> flag overrides this.</small></span><input type="text" id="setBasePath" placeholder="/some-path" spellcheck="false" autocomplete="off"></label>
+<label class="setting"><span class="setting-text"><span class="setting-name">Gossiper</span><small class="setting-help">Share high-confidence signals &mdash; starting with smoke-test results (real endpoint vs honeypot) &mdash; with peer dyva instances, scoped by source, so you skip re-probing a host a peer just characterized. The signal set expands conservatively over time. A peer's honeypot flag is trusted: the host is skipped without contact (re-verifying it would mean sending the trap a request &mdash; the exact thing the flag spares you). Privacy-bounded: a sync only reaches peers who already hold the same source URL. <b>On by default</b>; untick to opt out entirely.</small></span><input type="checkbox" id="setGossiperEnabled"></label>
+<label class="setting"><span class="setting-text"><span class="setting-name">Gossiper endpoint</span><small class="setting-help">The gossiper server to sync with. Defaults to the public reference instance; point it at your own, or clear it to run without one. Keep the trailing slash (a POST to the slashless form gets redirected and dropped).</small></span><input type="text" id="setGossiperUrl" placeholder="https://9ol.es/dyva/gossiper/" spellcheck="false" autocomplete="off"></label>
 <label class="setting"><span class="setting-text"><span class="setting-name">Model list override</span><small class="setting-help">Advertise a fixed list of model names from <code>/api/tags</code> and <code>/v1/models</code> instead of the discovered catalog, for tools that make you pick one specific model id. Every dyva model name is a routing pattern, so one entry like <code>qwen3</code> covers every <code>qwen3:*</code> variant on every host. Tick <b>Enabled</b> and put one name per line in the box below (blank lines and <code>#comments</code> are ignored). Untick to go back to the real catalog — the list stays in the box so you can flip it back on. Names no host currently serves stay listed (count 0) so the menu can't shift under a tool that pinned one. <b>Minimum model count</b> doesn't apply to an explicit list.</small></span><input type="checkbox" id="setModelListOn"></label>
 <textarea id="setModelList" class="src-textarea" spellcheck="false" placeholder="one model name per line (blank lines and #comments ignored)"></textarea>
 <div class="settings-actions"><span class="settings-status"></span><button type="button" class="settings-save">Save</button></div>
@@ -4755,11 +4758,11 @@ function _extLinks(el){
 }
 var TOOL_LABELS=[
   ['imageOn','Image'],['videoOn','Video'],
-  ['speechOn','Speech'],['webOn','Web'],['agentsOn','Sub-agents'],['docsOn','Documents']
+  ['speechOn','Speech'],['webOn','Web'],['hostOn','Host access'],['agentsOn','Sub-agents'],['docsOn','Documents']
 ];
 function _toolFlags(){
   return {imageOn:imageOn,videoOn:videoOn,speechOn:speechOn,
-          webOn:webOn,agentsOn:agentsOn,docsOn:docsOn,toolsOff:toolsOff};
+          webOn:webOn,hostOn:hostOn,agentsOn:agentsOn,docsOn:docsOn,toolsOff:toolsOff};
 }
 function enabledToolNames(){
   var live=_toolFlags();
@@ -5799,6 +5802,12 @@ async function runStream(chatId,chatCreated,chatTitle,model,msgs,bubble,depth,ex
             results.push({text:'Shown below: a screenshot of "'+sdoc.title+'" as it renders (static layout; page scripts are not run). Look at it, then answer.',image:spng,md:'`get_screenshot` '+escHtml(sdoc.title)});
           }catch(se){results.push({text:'Could not screenshot "'+sdoc.title+'": '+se.message});}
         }
+      }else if(fn.name==='get_location'){
+        setStatus('locating…');
+        var loc=await _getLocation();
+        results.push(loc.ok
+          ?{text:'User location: latitude '+loc.lat+', longitude '+loc.lon+' (accuracy ±'+loc.acc+' m). Coordinates only — no street address; reverse-geocode if you need a place name.',md:'`get_location`'}
+          :{text:'Could not get the location: '+loc.err+'. Do not retry unless the user asks again.',md:'`get_location` — '+loc.err});
       }else results.push({text:'There is no tool named "'+fn.name+'". Use one of the tools available in this chat.'});
     }
     // Runaway guard: if the model spammed more tool calls than the cap, tell it ONCE
@@ -6637,9 +6646,10 @@ var toolDocsChk=document.getElementById('toolDocs');
 var toolSpeechChk=document.getElementById('toolSpeech');
 var toolVideoChk=document.getElementById('toolVideo');
 var toolWebChk=document.getElementById('toolWeb');
+var toolHostChk=document.getElementById('toolHost');
 var toolAgentsChk=document.getElementById('toolAgents');
 var toolsOffChk=document.getElementById('toolsOff');
-var imageOn=false,docsOn=false,speechOn=false,videoOn=false,webOn=false,agentsOn=false;
+var imageOn=false,docsOn=false,speechOn=false,videoOn=false,webOn=false,hostOn=false,agentsOn=false;
 // DISPLAY-only toggle (not a model tool): render preview cards for links in replies.
 var linksOn=false;
 try{linksOn=localStorage.getItem('dyva_links')==='1'}catch(e){}
@@ -6656,10 +6666,11 @@ try{docsOn=localStorage.getItem('dyva_tools_docs')==='1'}catch(e){}
 try{speechOn=localStorage.getItem('dyva_tools_speech')==='1'}catch(e){}
 try{videoOn=localStorage.getItem('dyva_tools_video')==='1'}catch(e){}
 try{webOn=localStorage.getItem('dyva_tools_web')==='1'}catch(e){}
+try{hostOn=localStorage.getItem('dyva_tools_host')==='1'}catch(e){}
 try{agentsOn=localStorage.getItem('dyva_tools_agents')==='1'}catch(e){}
 // ask_question has no toggle — it is always available (see buildTools), so it is
 // deliberately excluded from anyToolsOn (it must not keep the wrench lit).
-function anyToolsOn(){return !toolsOff&&(imageOn||docsOn||speechOn||videoOn||webOn||agentsOn)}
+function anyToolsOn(){return !toolsOff&&(imageOn||docsOn||speechOn||videoOn||webOn||hostOn||agentsOn)}
 // Full docs live on the tool defs; read_docs serves them on demand so the tool
 // list sent every turn can carry only a terse one-liner per tool. TOOL_DEFS maps
 // name -> the full function object (kept intact); buildTools terses a COPY.
@@ -6669,9 +6680,23 @@ function anyToolsOn(){return !toolsOff&&(imageOn||docsOn||speechOn||videoOn||web
 // this chat runs on a vision-capable model.
 var GET_ASSET_TOOL={type:'function',function:{name:'get_asset',description:'Look at an image in this conversation. Pass an asset name (from list_assets, or one you made with generate_image/edit_image) and the picture is shown to you so you can see, describe or judge it. Images only. Requires a vision-capable model to actually see it.',parameters:{type:'object',properties:{name:{type:'string',description:'The image asset to view, e.g. "beautiful_garden.jpg". Names come from list_assets; do not invent them.'}},required:['name']}}};
 var GET_SCREENSHOT_TOOL={type:'function',function:{name:'get_screenshot',description:'See what the document you are working on looks like rendered. Takes a picture of the current side-panel document and shows it to you so you can check its layout and design. Captures static appearance only (page scripts are not run). Requires a vision-capable model to actually see it.',parameters:{type:'object',properties:{name:{type:'string',description:'Optional: which document to capture, by title. Omit to capture the one currently open.'}}}}};
+// Host access: a CLIENT-executed tool. The model asks, the browser runs it and prompts the
+// user for permission (the real consent gate); the "Host access" tick only exposes the tool.
+var GET_LOCATION_TOOL={type:'function',function:{name:'get_location',description:'Get the user’s current location (latitude, longitude, accuracy in metres). Runs in the user’s browser, which asks their permission first — they may decline. Use it only when the task genuinely needs where they are (local weather, nearby places, their time zone). Returns coordinates, not a street address.',parameters:{type:'object',properties:{}}}};
+// Resolves to {ok,lat,lon,acc} or {ok:false,err}. The browser's own permission prompt is the
+// consent gate; never throws (a decline/unavailable is a normal tool result the model handles).
+function _getLocation(){
+  return new Promise(function(resolve){
+    if(!navigator.geolocation){resolve({ok:false,err:'geolocation is not available in this browser'});return;}
+    navigator.geolocation.getCurrentPosition(
+      function(p){var c=p.coords;resolve({ok:true,lat:+c.latitude.toFixed(5),lon:+c.longitude.toFixed(5),acc:Math.round(c.accuracy||0)});},
+      function(e){resolve({ok:false,err:(e&&e.code===1)?'the user denied permission':((e&&e.message)||'location unavailable')});},
+      {enableHighAccuracy:false,timeout:15000,maximumAge:60000});
+  });
+}
 var _ALL_TOOL_DEFS=[IMG_TOOL,EDIT_TOOL,VIDEO_TOOL,ASK_TOOL,SPEECH_TOOL,WEB_TOOL,
                     SPAWN_TOOL,CALC_TOOL,LIST_ASSETS_TOOL,SEARCH_MODELS_TOOL,
-                    GET_ASSET_TOOL,GET_SCREENSHOT_TOOL].concat(DOC_TOOLS);
+                    GET_ASSET_TOOL,GET_SCREENSHOT_TOOL,GET_LOCATION_TOOL].concat(DOC_TOOLS);
 var TOOL_DEFS={};_ALL_TOOL_DEFS.forEach(function(t){if(t&&t.function)TOOL_DEFS[t.function.name]=t.function});
 // The heavy tools: shipped with a BLANKED parameter schema (just the name + terse
 // description) to keep the biggest schemas off every turn's wire. The model guesses
@@ -6750,6 +6775,7 @@ function buildTools(){
   if(videoOn)t.push(VIDEO_TOOL);
   if(speechOn)t.push(SPEECH_TOOL);
   if(webOn)t.push(WEB_TOOL);
+  if(hostOn)t.push(GET_LOCATION_TOOL);   // client-executed; browser prompts for permission
   if(agentsOn)t.push(SPAWN_TOOL);
   if(docsOn){t=t.concat(DOC_TOOLS);t.push(GET_SCREENSHOT_TOOL);}   // see the rendered document
   // No toggle of its own: it is the index for whatever media tools are on,
@@ -6775,6 +6801,7 @@ function paintTools(){
   if(toolSpeechChk)toolSpeechChk.checked=speechOn;
   if(toolVideoChk)toolVideoChk.checked=videoOn;
   if(toolWebChk)toolWebChk.checked=webOn;
+  if(toolHostChk)toolHostChk.checked=hostOn;
   if(toolLinksChk)toolLinksChk.checked=linksOn;
   if(toolAgentsChk)toolAgentsChk.checked=agentsOn;
   if(toolsOffChk)toolsOffChk.checked=toolsOff;
@@ -6809,7 +6836,7 @@ function _applyChatTools(){
   var t=currentChat&&currentChat.tools;
   if(!t||typeof t!=='object')return;   // no per-chat setting -> keep the default
   imageOn=!!t.imageOn;docsOn=!!t.docsOn;speechOn=!!t.speechOn;
-  videoOn=!!t.videoOn;webOn=!!t.webOn;agentsOn=!!t.agentsOn;toolsOff=!!t.toolsOff;
+  videoOn=!!t.videoOn;webOn=!!t.webOn;hostOn=!!t.hostOn;agentsOn=!!t.agentsOn;toolsOff=!!t.toolsOff;
   paintTools();
 }
 toolImageChk.addEventListener('change',function(){
@@ -6825,6 +6852,11 @@ if(toolsOffChk)toolsOffChk.addEventListener('change',function(){
 if(toolWebChk)toolWebChk.addEventListener('change',function(){
   webOn=this.checked;
   try{localStorage.setItem('dyva_tools_web',webOn?'1':'0')}catch(e){}
+  paintTools();_persistChatTools();
+});
+if(toolHostChk)toolHostChk.addEventListener('change',function(){
+  hostOn=this.checked;
+  try{localStorage.setItem('dyva_tools_host',hostOn?'1':'0')}catch(e){}
   paintTools();_persistChatTools();
 });
 // Display-only: not a model tool, so no _persistChatTools / buildTools — just re-render the
@@ -8928,6 +8960,25 @@ function _wireStatsTabs(){
     });
   }
 }
+// Live server-uptime counter for the stats header. _serverStartTs (epoch secs) comes from
+// /api/stats (d.started); a 1s interval re-renders so the seconds tick. Clock-style HH:MM:SS,
+// with a leading "Nd" once past a day.
+var _serverStartTs=null,_uptimeTimer=null;
+function _fmtUptime(s){
+  s=Math.max(0,Math.floor(s));
+  var dd=Math.floor(s/86400);s-=dd*86400;
+  var h=Math.floor(s/3600);s-=h*3600;
+  var m=Math.floor(s/60);var sec=s-m*60;
+  function p(n){return (n<10?'0':'')+n;}
+  var hms=p(h)+':'+p(m)+':'+p(sec);
+  return dd>0?(dd+'d '+hms):hms;
+}
+function _tickUptime(){
+  var el=document.getElementById('statsUptime');if(!el)return;
+  if(!_serverStartTs){el.textContent='';el.title='';return;}
+  el.textContent='up '+_fmtUptime(Date.now()/1000-_serverStartTs);
+  el.title='server started '+new Date(_serverStartTs*1000).toISOString().replace('T',' ').slice(0,19)+' UTC';
+}
 function renderStats(d){
   var t=(d&&d.totals)||{};
   var tot=document.getElementById('statsTotals');
@@ -8941,6 +8992,9 @@ function renderStats(d){
   // timezone from the graph beside it. Same trailing-Z form the activity feed uses.
   if(as){var t=new Date();as.textContent='as of '+t.toISOString().slice(11,19)+'Z';
          as.title='stats last fetched '+t.toISOString().replace('T',' ').slice(0,19)+' UTC';}
+  if(d&&d.started)_serverStartTs=d.started;
+  _tickUptime();
+  if(!_uptimeTimer)_uptimeTimer=setInterval(_tickUptime,1000);   // seconds tick without a refetch
 }
 function _raceDiagram(){
   var el=document.getElementById('raceDiagram'); if(!el)return;
@@ -9607,6 +9661,8 @@ function populateSettings(s){
   _wireFanoutImpl();
   document.getElementById('setMinCount').value=s.min_count;
   document.getElementById('setBasePath').value=s.base_path||'';
+  document.getElementById('setGossiperEnabled').checked=s.gossiper_enabled!==false;   // default ON
+  document.getElementById('setGossiperUrl').value=s.gossiper_url||'';
   setModelList(s.model_list||[],s.model_list_on);
   document.getElementById('setLocal').checked=!!s.local;
   document.getElementById('setExplore').checked=!!s.explore;
@@ -9729,6 +9785,8 @@ function saveSettings(){
     warm_connect_wait:(function(){var cw=parseInt(document.getElementById('setConnectWait').value,10),hd=parseInt(document.getElementById('setHedge').value,10);return(isNaN(cw)||cw>=hd)?null:cw;})(),
     min_count:parseInt(document.getElementById('setMinCount').value,10),
     base_path:document.getElementById('setBasePath').value,
+    gossiper_enabled:document.getElementById('setGossiperEnabled').checked,
+    gossiper_url:document.getElementById('setGossiperUrl').value,
     model_list:parseModelList(document.getElementById('setModelList').value),
     model_list_on:document.getElementById('setModelListOn').checked,
     local:document.getElementById('setLocal').checked,
@@ -9772,6 +9830,8 @@ function saveSettings(){
   _wireFanoutImpl();
       document.getElementById('setMinCount').value=s.min_count;
   document.getElementById('setBasePath').value=s.base_path||'';
+      document.getElementById('setGossiperEnabled').checked=s.gossiper_enabled!==false;   // default ON
+      document.getElementById('setGossiperUrl').value=s.gossiper_url||'';
       setModelList(s.model_list||[],s.model_list_on);
       document.getElementById('setLocal').checked=!!s.local;
       document.getElementById('setExplore').checked=!!s.explore;
