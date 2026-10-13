@@ -342,6 +342,12 @@ body.chat{height:100vh;height:100dvh}
 .host-name{font-family:var(--font-mono);font-size:var(--fs-sm);flex:1;min-width:0;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-decoration:none}
 a.host-name:hover{color:var(--accent);text-decoration:underline}
 .model-item.host-unreachable .host-name{color:var(--text-faint)}   /* dead socket — muted in the model's host list */
+.model-item.host-smoke-fail .host-name{color:var(--err)}           /* failed the smoke test (honeypot/garbage) — red, so a wall of them can't read as healthy. After unreachable so red wins if both. */
+/* Host-card header: the static "Host" title + a model-query search (pre-filled on click) + count. */
+.hostcard-head{display:flex;align-items:center;gap:var(--sp-3);flex-wrap:wrap;margin-bottom:var(--sp-3)}
+.hostcard-head h2{margin:0;flex-shrink:0}
+.hostcard-q{flex:1;min-width:140px;width:auto;font-size:var(--fs-sm);padding:.4rem .6rem}
+.hostcard-count{color:var(--text-dim);font-size:var(--fs-sm);flex-shrink:0;font-family:var(--font-mono)}
 #hostDetailTitle{font-family:var(--font-mono);font-size:.92rem;overflow-wrap:anywhere}
 :root{--map-land:#26262b;--map-coast:#3a3a42;--map-dot:#1fc7d4;--map-blue:#1fc7d4;--map-pink:#ff3fa8}
 /* light-theme map palette — placed AFTER the dark :root above so it wins the cascade */

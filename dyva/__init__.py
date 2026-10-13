@@ -224,6 +224,12 @@ STATUS_DB = os.path.join(CACHE_DIR, "host-status.db")
 # connection level is dead for every model, so it must not be re-probed
 # per-model). \x00 can't occur in a real canon'd model name.
 UNREACHABLE_KEY = "\x00unreachable"
+# Cooldown (circuit-breaker) for a dead-socket host: once marked UNREACHABLE it's DROPPED from
+# candidate selection for this many seconds instead of being re-probed on every request (a host
+# dead 30s ago is still dead — re-racing it just burns the connection budget on a corpse). After
+# the window it re-enters as a half-open TIER_BAD candidate, so a genuinely-recovered host still
+# self-heals; recovery is just detected at most this late. HONEYPOT_KEY is NOT cooled back in.
+UNREACHABLE_COOLDOWN = 600   # 10 min
 # sentinel "model" for a host-wide HONEYPOT mark: a machine that answered the smoke
 # test with a KNOWN-garbage honeypot response is a honeypot for EVERY model it
 # claims (the canned reply is machine-level), so condemn the whole host. Same
@@ -428,7 +434,28 @@ MODEL_LIST_ON = False  # the UI "Enabled" checkbox — the override applies ONLY
                        # list stays stored (and editable) while it's toggled off
 ADMIN_PW = ""   # sha256 hex of the admin password; when set, viewing/changing
                 # settings & sources requires it (localhost always exempt).
-VERSION = "0"
+def _resolve_version():
+    """Build version, the REAL thing first: `git describe` from the source tree (the actual
+    checked-out tag/commit, `-dirty` when the tree has local edits). Falls back to the installed
+    package version (pip) when this isn't a git checkout, then to '0'. git describe is the source
+    of truth; the pip metadata is only a stand-in for an installed wheel."""
+    import subprocess
+    try:
+        r = subprocess.run(["git", "describe", "--tags", "--always", "--dirty"],
+                           cwd=os.path.dirname(os.path.abspath(__file__)),
+                           capture_output=True, text=True, timeout=2)
+        v = r.stdout.strip()
+        if r.returncode == 0 and v:
+            return v
+    except Exception:
+        pass
+    try:
+        return importlib.metadata.version('dyva')
+    except Exception:
+        return "0"
+
+
+VERSION = _resolve_version()
 SETTINGS_FILE = os.path.join(CACHE_DIR, "settings.json")
 
 # The ComfyUI model classifier (shared with graflex) lives in this package so
@@ -1550,6 +1577,7 @@ async def _unregister_worker(wid, ok=None):
             # from the kind marker), so a job record can be correlated back to the exact
             # worker card / activity line instead of being an anonymous row.
             "wid": w.get("wid"),
+            "version": VERSION,   # dyva build (git describe, else pip) that produced this record
             "model_query": w.get("model_query"),
             "label": w.get("model"),
             # The model that ACTUALLY ran/rendered — for image/edit/tts/etc. the
@@ -3128,6 +3156,19 @@ def load_unreachable():
         (UNREACHABLE_KEY, HONEYPOT_KEY)).fetchall()}
 
 
+def load_unreachable_cooling(within_s=UNREACHABLE_COOLDOWN):
+    """Hosts marked UNREACHABLE (dead socket) within the last `within_s` seconds — the cooldown
+    set that find_servers DROPS so a confirmed-dead host isn't re-probed every request. Once the
+    mark ages past the window the host is no longer returned here, so it re-enters candidate
+    selection (half-open, TIER_BAD) and a recovered host self-heals. UNREACHABLE_KEY only —
+    HONEYPOT_KEY is conclusive and never cooled back in. `last_fail` is the ISO mark time."""
+    cut = (datetime.datetime.now(datetime.timezone.utc)
+           - datetime.timedelta(seconds=within_s)).isoformat()
+    return {h for (h,) in _get_db().execute(
+        f"SELECT host FROM host_status WHERE model=? AND state='bad' AND last_fail>=? AND {_LIVE_REAL}",
+        (UNREACHABLE_KEY, cut)).fetchall()}
+
+
 def load_last():
     global _last_cache
     if os.path.exists(LAST_FILE):
@@ -3949,6 +3990,7 @@ def _find_servers_raw(sub, caps=None):
     good = load_good()
     maybe = load_maybe()
     unreachable = load_unreachable()
+    cooling = load_unreachable_cooling()   # dead-socket hosts still inside UNREACHABLE_COOLDOWN — dropped below
     votes = _load_votes()   # 👎/👍 per (host, resolved-model); only non-zero pairs
     # Explore de-prioritizes hosts dyva has already raced (incl. no-verdict
     # timeouts) so they aren't re-fronted forever; only needed in Explore.
@@ -3976,6 +4018,11 @@ def _find_servers_raw(sub, caps=None):
         # Dropped here so the host never enters any race and dyva never TCP-connects
         # to it. Unknown-provider hosts are never skipped (only known matches).
         if CLOUD_SKIP and (s.get("provider") or "").lower() in CLOUD_SKIP:
+            continue
+        # Unreachable cooldown (circuit breaker): a host confirmed dead at the socket within the
+        # last UNREACHABLE_COOLDOWN is dropped — don't re-probe a corpse every request. It re-enters
+        # as a half-open TIER_BAD candidate once the window elapses (see load_unreachable_cooling).
+        if s.get("server") in cooling:
             continue
         models = s.get("models", [])
         ms = [m for m in models if match_model(m, sub)]
@@ -8585,7 +8632,8 @@ async def handle_model_hosts(request):
     unreachable = load_unreachable()   # host-wide dead-socket marks (UNREACHABLE_KEY)
     hosts = [{"host": s.get("server", ""), "checked": s.get("checked"),
               "state": states.get(s.get("server", ""), "unknown"),
-              "reachable": s.get("server", "") not in unreachable}
+              "reachable": s.get("server", "") not in unreachable,
+              "fail_smoke": s.get("server", "") in smoke_fail}
              for s in load_servers()
              if s.get("server") and q in (s.get("models") or [])]
     # Model-level aggregate for the host card's stats strip: counts across the
@@ -17227,11 +17275,6 @@ def make_app():
     return outer
 
 def banner():
-    global VERSION
-    try:
-        VERSION=importlib.metadata.version('dyva')
-    except Exception as e:
-        VERSION="(git)"
     color = int(random.randint(22,250)/6)*6 - 2
     max=6
     for i in range(0,max):
