@@ -1,0 +1,11 @@
+# Deploy this whole directory to the webroot as .../dyva/gossiper/ — then the default URL
+# 9ol.es/dyva/gossiper resolves here (mod_dir DirectorySlash redirects /gossiper ->
+# /gossiper/, and DirectoryIndex below serves gossiper.php). No mod_rewrite needed.
+DirectoryIndex gossiper.php
+
+# NEVER hand out the data file or the sources. The sqlite db sits in this dir, so without
+# this it would be downloadable at /dyva/gossiper/gossiper.sqlite — the entire store in one
+# GET. Deny it (+ WAL/SHM sidecars) and the .py reference source. Apache 2.4 syntax.
+<FilesMatch "\.(sqlite|sqlite-wal|sqlite-shm|db|py)$">
+    Require all denied
+</FilesMatch>
