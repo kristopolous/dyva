@@ -111,7 +111,7 @@ if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
 
 // Delta back: every row for THIS source newer than the client's cursor.
 $sel = $db->prepare(
-    'SELECT id, host, model, smoke, client_ts, server_ts
+    'SELECT id, host, model, smoke, client_ts, src_ip, server_ts
      FROM gossip WHERE source = ? AND id > ? ORDER BY id ASC'
 );
 $sel->execute([$source, $since]);

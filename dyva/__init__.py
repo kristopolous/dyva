@@ -2682,6 +2682,30 @@ def _get_db():
             "host TEXT NOT NULL, model TEXT NOT NULL, caps TEXT, refreshed REAL, "
             "PRIMARY KEY(host, model))")
         _migrate_known_hosts_to_caps(_status_db)
+        # ---- gossiper (peer sync of smoke verdicts; see brainstorm/gossiper.md) ----
+        # Peer ATTESTATIONS, QUARANTINED from host_status (our MEASURED truth): a peer can
+        # never overwrite what we measured, and a bad contributor's whole output drops with
+        # one DELETE ... WHERE attester=? that can't scratch host_status. verdict in
+        # ('pass','honeypot'); a honeypot row is host-wide (model=''), a pass is per-model.
+        #   attested_at = the ORIGINAL reporter's timestamp carried with the row (client_ts).
+        #   attester    = the src_ip the gossiper server tagged the row with -> invalidate by it.
+        #   source      = the sha1(source url) channel the row arrived on.
+        # Append-only (unbounded by design); the loaders below read latest/any, so repeated
+        # pulls can't accumulate (the per-source cursor only ever fetches NEW ids).
+        _status_db.execute(
+            "CREATE TABLE IF NOT EXISTS hosts_attested("
+            "host TEXT NOT NULL, model TEXT NOT NULL DEFAULT '', verdict TEXT NOT NULL, "
+            "attested_at TEXT, attester TEXT, source TEXT)")
+        _status_db.execute("CREATE INDEX IF NOT EXISTS ix_hosts_attested_hm ON hosts_attested(host, model)")
+        _status_db.execute("CREATE INDEX IF NOT EXISTS ix_hosts_attested_by ON hosts_attested(attester)")
+        _status_db.execute("CREATE INDEX IF NOT EXISTS ix_hosts_attested_vh ON hosts_attested(verdict, host)")
+        # Per-source gossiper cursors (survive restart). source = sha1(source url) channel;
+        # last_refresh_at = OUR clock at the previous sync (bounds the OUTGOING window — which
+        # of our smoke results to send); server_hwm = the autoincrement id the server handed
+        # back (cursor for the INCOMING delta, "send me everything newer than this").
+        _status_db.execute(
+            "CREATE TABLE IF NOT EXISTS gossiper_state("
+            "source TEXT PRIMARY KEY, last_refresh_at TEXT, server_hwm INTEGER NOT NULL DEFAULT 0)")
         _status_db.commit()
         if need_migrate:
             _migrate_status_from_txt()
@@ -2826,6 +2850,194 @@ def load_incompatible():
         if r and _STRUCTURAL_FAIL_RE.search(r):
             out.add(f"{h} {m}")
     return out
+
+
+# ============================ GOSSIPER CLIENT ============================
+# Peer sync of smoke-test verdicts, piggybacked on /refresh. Full design +
+# rationale: brainstorm/gossiper.md. The server (dyva/gossiper/gossiper.php|.py)
+# is a dumb per-source append log; ALL the policy lives here on the client:
+#   * channel = sha1(source url): the namespace IS the capability. You can only
+#     sync a source whose URL you hold, so sync exposure <= source exposure and
+#     you only ever exchange status about hosts you AND the peer both survey.
+#   * positive-leads + honeypot only (v1 scope). A 'pass' (real endpoint) fills a
+#     blank; a 'honeypot' is the one negative we TRUST and inherit — skip without
+#     contact (re-probing the bait IS the hazard). No up/down (flaky, unshared).
+#   * fill-blanks: an attested row is applied only where we have no measurement
+#     of our own, so a peer can never overwrite (or un-bad) what WE measured.
+
+
+def _gossiper_channel(url):
+    """The sync channel for a source = sha1 of its (normalized) URL. Deterministic,
+    registry-free, and a capability: no URL -> no channel."""
+    return hashlib.sha1(_normalize_url(url).encode("utf-8")).hexdigest()
+
+
+def _source_urls():
+    """{source_name: url} for every ENABLED source (built-in + user-configured).
+    Built-ins first; a configured source of the same name overrides (it's fetched
+    with precedence in refresh_cache too). Disabled sources are excluded."""
+    off = disabled_sources()
+    out = {}
+    for s in BUILTIN_SOURCES:
+        if _source_slug(s["name"]) not in off:
+            out[s["name"]] = s["url"]
+    for s in _config_sources():
+        if s.get("url") and _source_slug(s.get("name")) not in off:
+            out[s["name"]] = s["url"]
+    return out
+
+
+def load_attested_honeypots():
+    """Hosts a PEER flagged as honeypots (host-wide). Unioned into find_servers'
+    host-wide skip set so an attested honeypot is treated EXACTLY like a locally
+    discovered one — skipped without contact, the whole point of inheriting it."""
+    return {h for (h,) in _get_db().execute(
+        "SELECT DISTINCT host FROM hosts_attested WHERE verdict='honeypot'").fetchall()}
+
+
+def load_attested_pass():
+    """{f'{host} {model}'} pairs a PEER smoke-passed (real endpoint). A fill-blank
+    positive lead: find_servers lifts such a pair out of cold-unknown only when WE
+    hold no good/maybe/bad verdict of our own for it (measured always wins). The model
+    is CANON'd to match find_servers' reputation keys (stored raw for sharing fidelity,
+    canon'd here for routing)."""
+    return {f"{h} {canon_pattern(m)}" for h, m in _get_db().execute(
+        "SELECT DISTINCT host, model FROM hosts_attested WHERE verdict='pass' AND model<>''").fetchall()}
+
+
+def _gossiper_outgoing(host_set, since_iso):
+    """Our local smoke verdicts for hosts in `host_set`, as (host, model, verdict, ts)
+    rows to POST. honeypot -> (host, '', 'honeypot', ts) host-wide; pass -> per-model.
+    `since_iso` bounds the window to rows written after the last sync (None = send all,
+    the cold-start snapshot). ts = the row's own freshness (updated_at, falling back)."""
+    db = _get_db()
+    out = []
+    win = " AND updated_at > ?" if since_iso else ""
+    # honeypots: the host-wide sentinel row (state='bad', model=HONEYPOT_KEY)
+    rows = db.execute(
+        f"SELECT DISTINCT host, COALESCE(updated_at, last_fail, smoke_date) FROM host_status "
+        f"WHERE model=? AND state='bad' AND {_LIVE_REAL}{win}",
+        ((HONEYPOT_KEY, since_iso) if since_iso else (HONEYPOT_KEY,))).fetchall()
+    for h, ts in rows:
+        if h in host_set:
+            out.append((h, "", "honeypot", ts or _now_iso()))
+    # passes: answered the canned smoke probe straight (smoke_date set, fail_smoke=0),
+    # excluding the sentinel pseudo-models.
+    rows = db.execute(
+        f"SELECT host, model, COALESCE(updated_at, smoke_date) FROM host_status "
+        f"WHERE smoke_date IS NOT NULL AND fail_smoke=0 AND model NOT IN (?,?) AND {_LIVE_REAL}{win}",
+        ((UNREACHABLE_KEY, HONEYPOT_KEY, since_iso) if since_iso
+         else (UNREACHABLE_KEY, HONEYPOT_KEY))).fetchall()
+    for h, m, ts in rows:
+        if h in host_set:
+            out.append((h, m, "pass", ts or _now_iso()))
+    return out
+
+
+def _gossiper_apply(incoming, channel):
+    """INSERT a peer's returned rows into the quarantined hosts_attested. Keeps only
+    well-formed pass/honeypot rows; attester = the src_ip the server tagged (for
+    later invalidation). Returns how many rows landed."""
+    db = _get_db()
+    rows = []
+    for r in incoming:
+        if not isinstance(r, dict):
+            continue
+        h = r.get("host")
+        v = r.get("smoke")
+        if not h or v not in ("pass", "honeypot"):
+            continue
+        rows.append((str(h), str(r.get("model") or ""), v,
+                     r.get("client_ts") or _now_iso(), r.get("src_ip"), channel))
+    if rows:
+        db.executemany(
+            "INSERT INTO hosts_attested(host,model,verdict,attested_at,attester,source)"
+            " VALUES(?,?,?,?,?,?)", rows)
+        db.commit()
+    return len(rows)
+
+
+def _gossiper_cursor(channel):
+    """(last_refresh_at, server_hwm) for a channel; (None, 0) if never synced."""
+    row = _get_db().execute(
+        "SELECT last_refresh_at, server_hwm FROM gossiper_state WHERE source=?",
+        (channel,)).fetchone()
+    return (row[0], row[1]) if row else (None, 0)
+
+
+def _gossiper_set_cursor(channel, last_refresh_at, server_hwm):
+    db = _get_db()
+    db.execute(
+        "INSERT INTO gossiper_state(source,last_refresh_at,server_hwm) VALUES(?,?,?) "
+        "ON CONFLICT(source) DO UPDATE SET last_refresh_at=excluded.last_refresh_at, "
+        "server_hwm=excluded.server_hwm", (channel, last_refresh_at, int(server_hwm)))
+    db.commit()
+
+
+def _gossiper_exchange(channel, since_hwm, out_rows):
+    """One POST: send our delta `out_rows`, pull theirs since `since_hwm`. Returns the
+    parsed {ok,now,rows} dict, or None on any failure (caller leaves the cursor so we
+    retry next refresh). MUST use the trailing-slash URL — the no-slash form 301s and
+    the redirect drops the POST body."""
+    base = (GOSSIPER_URL or "").strip()
+    if not base:
+        return None
+    if not base.endswith("/") and "?" not in base and not base.endswith(".php"):
+        base += "/"
+    try:
+        resp = requests.post(base, params={"source": channel, "since": since_hwm},
+                             json={"since": since_hwm, "rows": out_rows}, timeout=15)
+    except Exception as ex:
+        log.warning(f"gossiper {channel[:8]}: POST failed: {ex}")
+        return None
+    if resp.status_code != 200:
+        log.warning(f"gossiper {channel[:8]}: HTTP {resp.status_code}")
+        return None
+    try:
+        data = resp.json()
+    except Exception as ex:
+        log.warning(f"gossiper {channel[:8]}: bad JSON: {ex}")
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def gossiper_sync():
+    """Piggybacked on /refresh (off the event loop — it does blocking network I/O):
+    for each enabled source, exchange smoke-verdict deltas with its gossiper channel.
+    Gated by GOSSIPER_ENABLED; wholly best-effort (a dead gossiper never breaks a
+    refresh). Groups the freshly-reloaded pool by each host's `source` tag so a
+    private-source host is only ever posted to its own channel (the leak boundary)."""
+    if not GOSSIPER_ENABLED or not (GOSSIPER_URL or "").strip():
+        return
+    try:
+        urls = _source_urls()
+        by_src = {}
+        for s in load_servers():
+            src, srv = s.get("source"), s.get("server")
+            if src and srv:
+                by_src.setdefault(src, set()).add(srv)
+        now = _now_iso()
+        for name, url in urls.items():
+            host_set = by_src.get(name)
+            if not host_set:
+                continue
+            channel = _gossiper_channel(url)
+            last_refresh_at, hwm = _gossiper_cursor(channel)
+            out = [{"host": h, "model": m, "smoke": v, "ts": ts}
+                   for h, m, v, ts in _gossiper_outgoing(host_set, last_refresh_at)]
+            data = _gossiper_exchange(channel, hwm, out)
+            if data is None:
+                continue   # leave the cursor untouched; retry next refresh
+            got = _gossiper_apply(data.get("rows") or [], channel)
+            new_hwm = data.get("now")
+            if not isinstance(new_hwm, int):
+                new_hwm = hwm
+            _gossiper_set_cursor(channel, now, new_hwm)
+            if out or got:
+                log.info(f"gossiper {name}[{channel[:8]}]: sent {len(out)}, got {got}, "
+                         f"hwm {hwm}->{new_hwm}")
+    except Exception as ex:
+        log.warning(f"gossiper sync skipped: {ex}")
 
 
 def add_good(host, model):
@@ -4204,7 +4416,12 @@ def _find_servers_raw(sub, caps=None):
     bad = load_bad()
     good = load_good()
     maybe = load_maybe()
-    unreachable = load_unreachable()
+    # Host-wide skip set = our MEASURED sentinels (unreachable/honeypot) UNION a PEER's
+    # attested honeypots: an inherited honeypot is treated exactly like one we found —
+    # skipped without contact (gossiper). attested_pass fills a blank the other way (below).
+    unreachable = load_unreachable() | load_attested_honeypots()
+    attested_pass = load_attested_pass()
+    attested_pass_hosts = {k.split(" ", 1)[0] for k in attested_pass}   # host-level, for "any" queries
     cooling = load_unreachable_cooling()   # dead-socket hosts still inside UNREACHABLE_COOLDOWN — dropped below
     votes = _load_votes()   # 👎/👍 per (host, resolved-model); only non-zero pairs
     # Explore de-prioritizes hosts dyva has already raced (incl. no-verdict
@@ -4302,11 +4519,20 @@ def _find_servers_raw(sub, caps=None):
             in_good = any(k in good for k in keys)
             in_maybe = any(k in maybe for k in keys)
             in_bad = any(k in bad for k in keys)
+            # gossiper fill-blank: a peer smoke-passed one of these (host,model) pairs and
+            # we hold NO verdict of our own -> lift it from cold-unknown to maybe_good (a
+            # soft positive lead, below our own good, above never-tried). Only fills blanks:
+            # our own good/maybe/bad is untouched, and a honeypot still wins host-wide above.
+            if not (in_good or in_maybe or in_bad) and attested_pass \
+                    and any(k in attested_pass for k in keys):
+                in_maybe = True
         else:
             st = host_state.get(host)
             in_good = st == "good"
             in_maybe = st == "maybe_good"
             in_bad = st == "bad"
+            if st is None and host in attested_pass_hosts:
+                in_maybe = True
         _last = get_last(sub)
         if _last is None and not sub:
             if _last_cache is None:
@@ -9921,6 +10147,10 @@ async def handle_refresh(request):
     _servers_cache = None          # re-read the freshly-written free-ollama.json
     _dead_cache = None
     servers = load_servers()
+    # Gossiper: sync smoke-verdict deltas with each source's peer channel, "with
+    # everything else" on the refresh (off the event loop — blocking network I/O).
+    # Best-effort and gated by GOSSIPER_ENABLED; a dead gossiper never fails a refresh.
+    await asyncio.get_event_loop().run_in_executor(None, gossiper_sync)
     return web.json_response({"status": "ok", "message": "cache refreshed",
                               "servers": len(servers), "models": len(all_models()),
                               "loaded": _hosts_loaded_str()})

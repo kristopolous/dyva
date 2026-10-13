@@ -33,7 +33,7 @@ DB = os.environ.get("GOSSIPER_DB") or os.path.join(
 PORT = int(os.environ.get("GOSSIPER_PORT", "8787"))
 MAX_BODY = 8 * 1024 * 1024          # defensive request cap (NOT a store cap)
 SHA1_RE = re.compile(r"^[0-9a-f]{40}$", re.I)
-_COLS = ("id", "host", "model", "smoke", "client_ts", "server_ts")
+_COLS = ("id", "host", "model", "smoke", "client_ts", "src_ip", "server_ts")
 
 
 def _to_int(v, default=0):
@@ -78,7 +78,7 @@ def exchange(source, since, rows, src_ip):
                   src_ip) for r in good])
             db.commit()
         cur = db.execute(
-            "SELECT id,host,model,smoke,client_ts,server_ts FROM gossip"
+            "SELECT id,host,model,smoke,client_ts,src_ip,server_ts FROM gossip"
             " WHERE source=? AND id>? ORDER BY id ASC", (source, since))
         out = [dict(zip(_COLS, row)) for row in cur.fetchall()]
         now = since
