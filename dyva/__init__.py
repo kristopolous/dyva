@@ -1590,6 +1590,17 @@ async def _unregister_worker(wid, ok=None):
     # race entries were accumulated across every round in _race_hosts.
     if w.get("race") is not None and not w.get("_job_logged"):
         w["_job_logged"] = True
+        # Split the request's wall-clock into SEARCH (request in -> first host committed to
+        # streaming) vs INFERENCE (that point -> done). `found` latches when the race first
+        # secures a streamable host (mark_worker_found), so search_secs is the time spent
+        # hunting (candidate selection, smoke probes, dead/quick-reject candidates) and
+        # inference_secs is everything after — generation PLUS any mid-stream failovers. A
+        # FALSE START is a host we committed to that then stalled or dropped and made us fail
+        # over (race outcome 'timeout'/'error'); counting them next to inference_secs is how a
+        # "wandered through janky hosts" request is told apart from a clean slow generation.
+        _race = w.get("race") or []
+        _found, _start, _end = w.get("found"), w.get("started"), w["done"]
+        _false_starts = sum(1 for r in _race if r.get("outcome") in ("timeout", "error"))
         _write_worker_job({
             # The worker's unique id — the same uuid the dashboard shows (and now copies
             # from the kind marker), so a job record can be correlated back to the exact
@@ -1605,6 +1616,16 @@ async def _unregister_worker(wid, ok=None):
             "rmodel": w.get("rmodel"),
             "start_time": w.get("started"),
             "end_time": w["done"],
+            # The SEARCH -> INFERENCE boundary: when searching stopped and the first host
+            # started streaming. search_secs/inference_secs are derived for convenience so a
+            # trend read doesn't have to recompute them every row.
+            "found_time": _found,
+            "search_secs": (round(_found - _start, 3) if _found and _start else None),
+            "inference_secs": (round(_end - _found, 3) if _found and _end else None),
+            # Hosts we committed to that stalled/dropped and forced a failover (outcome
+            # timeout/error). 0 on a clean request; >0 means time in inference_secs was lost
+            # to false starts, not the winning host's generation.
+            "false_starts": _false_starts,
             "candidates": w.get("race_cand"),
             "tried": w.get("race_tried"),
             "won": w["ok"],

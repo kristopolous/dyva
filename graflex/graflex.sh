@@ -12,11 +12,28 @@ SERVERS=
 ACTION=fetch-check
 source .env
 
+# Aggregate commands (all / shodan / censys / hunter / zoomeye) re-invoke this script once per
+# sub-service. graflex.py mints a FRESH run timestamp (-i/--id, its "session") for every invocation
+# that doesn't pin one, so without this each sub-check of a single logical sweep lands in its OWN
+# session. Mint ONE session up front and thread it through every sub-check via SUB_ARGS — unless the
+# caller already passed -i, in which case honour theirs (and nested aggregates, e.g. `all` -> `shodan`,
+# inherit the same id the same way, so the whole sweep shares one session).
+SUB_ARGS=("${EXTRA_ARGS[@]}")
+case "$SERVICE" in
+  all|shodan|censys|hunter|zoomeye)
+    _has_id=
+    for _a in "${EXTRA_ARGS[@]}"; do
+      [[ "$_a" == "-i" || "$_a" == "--id" ]] && { _has_id=1; break; }
+    done
+    [[ -z "$_has_id" ]] && SUB_ARGS+=(-i "$(date +%Y%m%d%H%M%S)")
+    ;;
+esac
+
 
 case "$SERVICE" in
   all)
     for i in ds4 vllm lmstudio fooocus llama.cpp ollama shodan comfyui a1111 gradio; do
-      $CMD $i ${EXTRA_ARGS[@]}
+      $CMD $i "${SUB_ARGS[@]}"
       last_res="$?"
       echo ">>   "$last_res
       # this is ctrl+c
@@ -206,7 +223,7 @@ ENDL
   # Shodan API key). ZoomEye caps a query at ~250 results, so it's a quick pass.
   zoomeye)
     for service in ollama llamacpp lmstudio; do
-      "$CMD" zoomeye-"$service" "${EXTRA_ARGS[@]}" 
+      "$CMD" zoomeye-"$service" "${SUB_ARGS[@]}" 
     done
     exit 0
     ;;
@@ -236,7 +253,7 @@ ENDL
   # hunter.how section
   hunter)
     for service in ollama llamacpp comfyui lmstudio; do
-      "$CMD" hunter-"$service" "${EXTRA_ARGS[@]}" 
+      "$CMD" hunter-"$service" "${SUB_ARGS[@]}" 
     done
     exit 0
     ;;
@@ -276,7 +293,7 @@ ENDL
   # censys
   censys)
     for service in ollama llamacpp; do
-      "$CMD" censys-"$service" "${EXTRA_ARGS[@]}" 
+      "$CMD" censys-"$service" "${SUB_ARGS[@]}" 
     done
     exit 0
     ;;
@@ -304,7 +321,7 @@ ENDL
   # shodan section
   shodan)
     for service in localai ollama llamacpp; do
-      "$CMD" shodan-"$service" "${EXTRA_ARGS[@]}" 
+      "$CMD" shodan-"$service" "${SUB_ARGS[@]}" 
     done
     exit 0
     ;;
