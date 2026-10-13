@@ -2258,13 +2258,20 @@ def refresh_cache(source=None, cleanse=True):
           entry['models'] = []
         if ip not in host_map:
           host_map[ip] = entry
-        elif str(entry.get('checked') or '') > str(host_map[ip].get('checked') or ''):
+        else:
           # The feed can carry MULTIPLE rows for one host — a re-survey that changed the
           # service/models, with the stale row still present. First-wins kept whichever landed
           # first, often the STALE one, mangling the record (a re-surveyed vLLM host stuck as
-          # its old 'ollama' row). Keep the FRESHEST by `checked` (ISO, lexicographically
-          # ordered); a row with no `checked` sorts oldest and never shadows a dated one.
-          host_map[ip] = entry
+          # its old 'ollama' row). Prefer the FRESHEST by `checked` — BUT a row WITH models must
+          # never be displaced by one WITHOUT: a fresh survey that failed to enumerate (empty
+          # models, often also a generic 'ollama' mislabel) would otherwise ERASE a good older
+          # row and make the host uncandidatable (blanked chatapi.diyi01.com's 26 models). So
+          # models-presence wins first; `checked` (ISO, lexicographic; missing sorts oldest)
+          # only breaks the tie when both carry — or both lack — a model list.
+          _cur = host_map[ip]
+          if (bool(entry.get('models')), str(entry.get('checked') or '')) \
+                  > (bool(_cur.get('models')), str(_cur.get('checked') or '')):
+            host_map[ip] = entry
 
     if 'forrany' not in off and os.path.exists(f'{_db}-forrany.tmp'):
       with open(f'{_db}-forrany.tmp', 'r', encoding="utf-8", errors="replace") as f:
@@ -2802,6 +2809,28 @@ def add_good(host, model):
         (host, model, _now_iso()))
     db.execute("DELETE FROM host_status WHERE host=? AND model=?", (host, UNREACHABLE_KEY))
     db.commit()
+
+
+def favor_host(host, model):
+    """👍 = a ONE-TIME, optimistic tier boost: lift this (host, model) into the 'good' tier so the
+    race actually CONSIDERS it again — and NOTHING else. It is deliberately NOT sticky: no persistent
+    vote, and it does NOT fabricate a success, last_good, or ttft/tps (that would pollute the very
+    record the user is reading). It only sets the tier and clears a stale streak / unreachable mark so
+    the host gets a fair look. From there it earns its keep like everyone else — a real win writes
+    genuine 'good' via add_good, a stall/failure demotes it via add_bad — so a host the user favored
+    that turns out janky falls right back down. The boost buys a LOOK, not a permanent seat; we never
+    remember 'this was thumbs-up, keep it here'."""
+    model = canon_pattern(model)
+    try:
+        db = _get_db()
+        db.execute(
+            "INSERT INTO host_status(host,model,state,failure_streak) VALUES(?,?, 'good', 0)"
+            " ON CONFLICT(host,model) DO UPDATE SET state='good', failure_streak=0",
+            (host, model))
+        db.execute("DELETE FROM host_status WHERE host=? AND model=?", (host, UNREACHABLE_KEY))
+        db.commit()
+    except Exception as e:
+        log.debug(f"favor_host failed: {e}")
 
 
 def record_perf(host, model, ttft=None, tps=None):
@@ -4258,8 +4287,15 @@ def _find_servers_raw(sub, caps=None):
             # keep their order via a constant secondary key (stable sort).
             crank = _checked_rank(s) if prio == TIER_UNKNOWN else 0
         matched.append((cap_known, prio, crank, host, ms))
-    # known-capable-first (for special caps), then tier, then the tier's own secondary order.
-    matched.sort(key=lambda x: (x[0], x[1], x[2]))
+    # REPUTATION FIRST, capability a within-tier hint. Sorting by cap_known BEFORE tier let an
+    # imperfect capability FLAG (a survey/classifier guess, unreliable for the many engines that
+    # don't self-report caps — and faked wholesale by honeypots) override PROVEN reputation: a
+    # good/maybe host whose tools flag was merely absent sank behind every advertised-capable
+    # unknown (clef/vLLM/llama.cpp hosts buried at position ~1200+). Tier (prio) leads now, so a
+    # proven host races in its tier; cap_known only orders WITHIN a tier (advertised, then
+    # unknown, then flagged-incapable), and a real incapability still surfaces at runtime (400 →
+    # mark_no_tools → excluded) rather than being pre-judged from a guess.
+    matched.sort(key=lambda x: (x[1], x[0], x[2]))
     return [(p, h, m) for ck, p, c, h, m in matched]
 
 
@@ -9594,10 +9630,14 @@ async def handle_favor_worker(request):
     model = (w.get("rmodel") if w else None) or request.query.get("model")
     if not host or not model:
         return web.json_response({"error": "no host/model to favor"}, status=404)
-    # 👍 is a within-tier preference, NOT a tier promotion: it records a favor vote and
-    # lets the mechanical tier stand. (A host that keeps failing belongs in bad on its own
-    # merits; a button must never paper over that — it used to call add_good here.)
-    set_vote(host, model, 1)
+    # 👍 = a ONE-TIME optimistic tier boost (favor_host), NOT a sticky within-tier vote and NOT a
+    # permanent promotion. A proven-but-starved host (great record, but dropped to maybe_good/unknown
+    # by a decayed mark, so it never gets raced and never gets re-measured to climb back) is lifted
+    # into 'good' for ONE look. Then it earns its keep like the rest: a real win confirms it, a stall
+    # demotes it right back. We never remember it was favored — the tier ladder stays the law, the
+    # boost just buys a re-measurement. (Earlier this was set_vote, a within-tier nudge that could
+    # never lift a maybe_good host past the good tier, so it was useless for exactly this case.)
+    favor_host(host, model)
     log.warning(f"worker favored (👍): host={host} model={model} wid={wid}")
     await broadcast_activity(host, model, "connected",
         f"favored (good): {model} @ {_norm_host(host)}")
