@@ -204,3 +204,179 @@ the "every time is too much" worry — it's once per rediscovery, not per reques
 MVP = the pull (GET) alone, consumed by fanout + :test-all, positive-leads-only,
 per source. The edge-triggered POST/producer + server TTL cache layer on next;
 thresholds and the cutoff value are the remaining tuning.
+
+
+================================================================================
+REFRESH (2026-10-13): THE SPINE IS THE NAMESPACE, NOT THE TRANSPORT
+================================================================================
+
+The converged design above assumed a custom HTTP endpoint (GET/POST /realtime). The
+refresh keeps ALL of its semantics (positive-leads-only, fill-blanks-only, debounced-
+on-success push, receiver-owns-judgment, stateless/no-provenance, per-source) and
+changes only two things: the load-bearing idea, and the transport.
+
+--- The load-bearing idea: channel = hash(source URL) --------------------------
+
+  The real insight is NOT the transport. It is that the sync channel for a source is
+  DERIVED from the source URL:  channel = hash(source url)  (e.g. sha1). The transport
+  (NATS, HTTP, a file on a CDN, Redis) sits behind that and is interchangeable.
+
+  The source URL then does THREE jobs at once:
+    * Rendezvous key — same URL -> same channel, deterministically, with no registry
+      and no coordination. Channel names aren't assigned; they fall out of the URL
+      every dyva already has. No `sync`-name to curate or collide.
+    * Capability ("keeps the sources clean") — you cannot find, subscribe to, or
+      enumerate a source's channel without knowing its URL to hash. The URL IS the
+      key. The public server can't be scraped for "what sources exist." Top-shelf
+      friction, for free, with no auth layer.
+    * Correctness boundary — you can only push/pull on channels for sources you HAVE,
+      so you structurally only ever exchange status about the host population you and
+      your peer BOTH survey. "skip-if-unknown-host / stay in your lane" stops being a
+      receiver-side rule you must remember and becomes a property of the namespace.
+
+--- This DISSOLVES the leakage problem (it isn't mitigated, it's gone) ----------
+
+  The old, acknowledged leak: "skip-if-unknown at the receiver is correctness, not
+  privacy — by the time a client says '2.3.4.5, never heard of it' the IP already
+  crossed the wire." A global gossiper sprays private host IPs to whoever listens.
+
+  Namespacing by hash(source URL) closes it BY CONSTRUCTION: the capability that lets
+  you join a channel IS the capability that already grants you the hosts — to read a
+  source's channel you must know its URL, and knowing the URL is exactly what lets you
+  fetch those hosts from the source directly. So:
+
+      channel audience  ⊆  people who have the source URL  ⊆  people who already have those hosts
+
+  The IP still crosses the wire, but only to someone who could already pull it from
+  the source itself. The sync never widens the audience beyond the source's existing
+  one; a stranger (no URL) can't derive the channel, so there is no stranger on it to
+  leak to. It degrades gracefully across the whole source mix:
+    * PUBLIC sources (forrany/spider/happyshua — lists already on GitHub): URL public
+      -> channel derivable -> but the hosts were already public. Nothing new leaks.
+    * SEMI-PRIVATE source (the 9ol.es feed): URL not casually known -> channel not
+      derivable -> audience bounded to those who already have the feed.
+  Either way: sync exposure ≤ source exposure, per source, automatically. Still
+  "top shelf," not crypto — the URL is a bearer capability (whoever gets the URL gets
+  the channel, same as whoever gets the URL gets the source) — but that is the SAME
+  boundary the source already has, so the sync adds no new exposure. This REPLACES the
+  "noted leak" caveat in the scope/threat-model section above: privacy = the source
+  URL is the one capability for both source access and sync access.
+
+--- Transport: NATS is the reference backend, not the design --------------------
+
+  Core NATS pub/sub can't serve the query-time PULL (a late subscriber misses
+  history), so the reference backend is NATS JetStream — and its per-subject
+  retention (MaxMsgsPerSubject = N) IS exactly the "most-recent-N recency stack, no
+  TTL, eviction by displacement" specified above, off-the-shelf. The server you
+  maintain is `nats-server` with JetStream + that cap; no custom service to host.
+    * subject = sha1(source url). Pull-on-demand stays stateless via a JetStream
+      direct-get / pull consumer of the last-N at fanout time — no live subscription,
+      no background sync (preserving the deliberate "NOT replication, NOT background
+      sync" choice). Push-subscribe is available if warm caches are ever wanted, at
+      the cost of statelessness.
+    * Model granularity wrinkle: model names (`qwen3.8:27b`) aren't NATS-subject-safe
+      (dots/colons are token separators). MVP: one subject per source, model in the
+      payload, filter client-side after fetching last-N (fine for N~50). Option B:
+      subject = sha1(url).sha1(model) for native per-model MaxMsgsPerSubject.
+    * Cost: adds a `nats-py` dependency (the custom /realtime was dependency-free), in
+      exchange for persistence + retention + pub/sub for free instead of hand-rolling
+      the recency store. Weigh against keep-client-features-light.
+    * Source schema: { name, url, mapping } -> { name, url, sync, mapping } where
+      `sync` = the transport/server (the NATS URL); the CHANNEL is derived from `url`,
+      not stored. Opt-in / overridable / removable, same as any source.
+
+--- WHEN to pull: on /refresh, with everything else ----------------------------
+
+  This RESOLVES the "fanout THRESHOLD that triggers the ask" open knob by ELIMINATING
+  it. The pull is NOT a hot-path, fanout-time query with a threshold to tune. It rides
+  the EXISTING /refresh cycle — the same pass that already re-pulls the configured
+  sources and lands new hosts ("do it with everything else"). The gossiper is just
+  another input to /refresh; its positive leads enter the pool as ORDINARY candidates,
+  so fanout needs ZERO gossiper-specific code — no "about to cold-probe?" trigger, no
+  synced-host special case. This is the stateless/no-provenance keystone paying off: a
+  pulled lead is indistinguishable from a source host once it's in the pool, so it
+  flows through the SAME try-it path with no new branches.
+    * Producer (push) is unchanged and stays event-driven: debounced-on-success,
+      positive-only. Only the CONSUMER/pull timing is resolved here.
+    * Consequence to accept: lead freshness is now bounded by the /refresh cadence,
+      not request time — the trade for the simplicity. Fine as long as /refresh runs
+      often enough to beat the survey delta it papers over (and /refresh can pull the
+      gossiper even when a full source re-pull is skipped, if finer freshness is ever
+      wanted — but that's a knob, not a requirement).
+
+--- SCOPE v1: smoke-test verdicts (observed output), not liveness ---------------
+
+  Start by sharing ONLY the smoke-test result — the observed-output verdict of "real
+  inference endpoint that passed the smoke" vs "honeypot / fake (took the bait / canned
+  reply)". That is the HIGH-CONFIDENCE, DURABLE datum: it describes the host's NATURE,
+  established by actually sending something and reading what came back ("honeypot is we
+  tried something, we got some results"). Explicitly OUT of scope for v1:
+    * "up" — liveness is transient (up now != up in 5 minutes); a stale "up" is worthless.
+    * "down" / unreachable / timeout — low confidence (flaky network, false negatives).
+  Connection state is noise; the smoke verdict is signal. This also sharpens the
+  converged design's "recently-good" lead: the part worth syncing is the REAL-ENDPOINT
+  determination, not the moment-in-time liveness bundled with it.
+
+  Honest nuance (how this sits with positive-leads-only): the PASS (real endpoint) is a
+  positive, fully consistent with the rule. The HONEYPOT verdict is a NEGATIVE — worth
+  sharing BECAUSE it's a conclusive observed verdict, not a flaky liveness negative —
+  but it reintroduces the poisoning/sticky risk the positive-only rule guarded against
+  (a bad peer could flag good hosts as honeypots to get them skipped). So a shared
+  honeypot flag is a HINT, not a permanent blind skip: the receiver still owns the
+  verdict and re-verifies (the trap screen is cheap), keeping it self-correcting. The
+  rule's real target was flaky, non-self-correcting negatives (liveness); a high-
+  confidence, re-verifiable smoke verdict is the deliberate, bounded exception.
+
+--- SIMPLEST PROTOCOL (the MVP): timestamp-delta sync on /refresh ---------------
+
+  This is simpler than NATS and does the whole job, so it's the MVP. The sync is a
+  plain BIDIRECTIONAL DELTA over ONE POST, piggybacked on /refresh. (NATS/JetStream
+  above is no longer needed for v1; the namespace-by-hash insight still holds if a
+  shared transport is ever wanted, but a per-source POST URL carries the same
+  "sync access ≡ source access" property, because the URL lives in the source def.)
+
+  Source schema: { name, url, mapping } -> add a sync/post URL (the server side is the
+  thing "we will have to build"). Opt-in / overridable / removable like any source.
+
+  CLIENT state, persisted to disk (survives restart), per source — TWO timestamps:
+    * last_refresh_at : the client's OWN clock at its previous refresh. Bounds the
+      OUTGOING window (which of my smoke results to send this time).
+    * server_hwm      : the timestamp the SERVER handed back last time. The cursor for
+      the INCOMING delta ("send me everything newer than this").
+
+  EACH /refresh (with everything else):
+    1. outgoing = my local SMOKE-TEST results with local-time in (last_refresh_at, now].
+    2. POST <sync_url>  { rows: outgoing, since: server_hwm }
+    3. SERVER:
+         - ingests `rows`, stored with the client's src_ip (so a bad contributor can be
+           invalidated later) and the timestamps (so it "can do the math" later);
+         - SELECTs its own records with server-time > `since`; returns { rows, now: <its clock> }.
+    4. CLIENT: apply returned rows (SMOKE verdicts only, fill-blanks; honeypot = hint,
+       re-verify) then persist  last_refresh_at := now,  server_hwm := returned `now`.
+
+  SERVER = a dumb append log: "some stupid timeseries data sitting in sqlite or whatever"
+  — rows of (smoke record, src_ip, client_ts, server_ts). Two operations: INSERT the
+  client's payload; SELECT where server_ts > since. No recency stack, no eviction, no
+  pub/sub, no per-client dedup state beyond the src_ip tag. Every timestamp is kept, so
+  invalidation / windowing / analysis are just queries later.
+  UNBOUNDED on purpose — the "most-recent-N (~50) recency stack, eviction by displacement"
+  from the converged section above is CANCELED. A LIMIT/windowed store surfaces repeats in
+  waves (periodic duplicates as the window slides), which is worse than just keeping
+  everything. Leave it unbounded for now; if the table gets huge, deal with it then
+  (archival/compaction), not with a row cap.
+
+  Why it's right:
+    * Reuses /refresh — no new trigger, no hot path ("do it with everything else").
+    * Delta by timestamp both ways — bandwidth ~ the deltas, not the whole set.
+    * Clocks never need to agree: the client windows by ITS clock, the server by ITS
+      clock, each just echoes the other's last token verbatim. No shared time, no skew.
+    * src_ip on the server is the abuse lever (retro-invalidate a bad client) with no
+      up-front auth ceremony — fits "cookies on the top shelf".
+
+--- Status / still parked -------------------------------------------------------
+
+  Unchanged trigger to actually build: cold start with the graflex SOURCE removed —
+  if securing hosts then takes serious time, build it; else stays parked. "Getting
+  closer" on the DESIGN; the namespace-by-URL framing + leak dissolution is the step
+  forward. Everything in the CONVERGED DESIGN section still holds; this only reframes
+  the spine (namespace) and demotes the transport (NATS = reference backend).

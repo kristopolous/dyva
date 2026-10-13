@@ -8573,7 +8573,17 @@ async def handle_unfurl(request):
                              allow_redirects=True, max_redirects=3) as resp:
                 if resp.status != 200:
                     return web.json_response(fail)
-                raw = await resp.content.read(512 * 1024)
+                # aiohttp's StreamReader.read(n) returns the first AVAILABLE chunk, not up to n —
+                # so a single read(512K) grabbed only the first few KB. The <title> is early in
+                # <head> so it survived, but og:image/og:description sit ~tens-of-KB in and were
+                # silently cut off (every card lost its image). Accumulate real chunks up to the cap.
+                _CAP = 512 * 1024
+                raw = b""
+                while len(raw) < _CAP:
+                    chunk = await resp.content.read(_CAP - len(raw))
+                    if not chunk:
+                        break
+                    raw += chunk
                 html = raw.decode("utf-8", "replace")
                 final_url = str(resp.url)
     except Exception:
@@ -11405,7 +11415,16 @@ async def _web_save_image(session, url, ctype):
     if r.status >= 400:
         await r.release()
         raise ComfyError(f"HTTP {r.status} fetching {url}")
-    raw = await r.content.read(WEB_IMAGE_MAX + 1)
+    # read(n) returns only the first available chunk, not up to n — a single read saved a
+    # TRUNCATED image (and the size cap below couldn't even trip, since the partial is under it).
+    # Accumulate real chunks up to MAX+1 so a whole image lands and an oversized one still trips.
+    _lim = WEB_IMAGE_MAX + 1
+    raw = b""
+    while len(raw) < _lim:
+        chunk = await r.content.read(_lim - len(raw))
+        if not chunk:
+            break
+        raw += chunk
     await r.release()
     if len(raw) > WEB_IMAGE_MAX:
         raise ComfyError("image is too large")
