@@ -346,7 +346,7 @@ a.host-name:hover{color:var(--accent);text-decoration:underline}
 /* Host-card header: the static "Host" title + a model-query search (pre-filled on click) + count. */
 .hostcard-head{display:flex;align-items:center;gap:var(--sp-3);flex-wrap:wrap;margin-bottom:var(--sp-3)}
 .hostcard-head h2{margin:0;flex-shrink:0}
-.hostcard-q{flex:1;min-width:140px;width:auto;font-size:var(--fs-sm);padding:.4rem .6rem}
+.hostcard-q{width:100%;font-size:var(--fs-sm);padding:.4rem .6rem;margin:0 0 var(--sp-3)}
 .hostcard-count{color:var(--text-dim);font-size:var(--fs-sm);flex-shrink:0;font-family:var(--font-mono)}
 #hostDetailTitle{font-family:var(--font-mono);font-size:.92rem;overflow-wrap:anywhere}
 :root{--map-land:#26262b;--map-coast:#3a3a42;--map-dot:#1fc7d4;--map-blue:#1fc7d4;--map-pink:#ff3fa8}
@@ -1369,8 +1369,8 @@ body.dragging-image .hist-item{cursor:grabbing}
 </div>
 </div>
 <div class="card" id="hostCard" style="display:none">
-<h2 id="hostCardTitle">Hosts</h2>
-<div class="card-inner"><div id="modelStats" class="model-stats"></div><div id="hostList"></div></div>
+<div class="hostcard-head"><h2 id="hostCardTitle">Host</h2><span id="hostCardCount" class="hostcard-count"></span></div>
+<div class="card-inner"><div id="modelStats" class="model-stats"></div><input id="hostModelQuery" class="hostcard-q" type="text" placeholder="model query — qwen3.8, *coder*, &gt;10gb" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" title="Browse any model's hosts — same query language as the model filter. Enter to search."><div id="hostList"></div></div>
 </div>
 <div class="card" id="hostDetailCard" style="display:none">
 <h2 class="hd-head"><span id="hostDetailTitle">Host</span><button type="button" class="hd-close" title="Close" aria-label="Close host detail" onclick="closeHostDetailCard()">&times;</button></h2>
@@ -3201,6 +3201,15 @@ document.getElementById('serverroom').addEventListener('click',function(e){
   refreshUseBtn();
   renderHostListFor();
 });
+// Health bucket for sorting the host list: good → unknown → no-contact → honeypot. Honeypot
+// (smoke-fail) and no-contact (unreachable) are checked FIRST so they sink to the bottom even if
+// they carry a stale 'good'/'bad' state row — same precedence as the red/dim tinting.
+function _hostRank(o){
+  if(o.fail_smoke)return 3;                                      // honeypot / garbage — red, bottom
+  if(o.reachable===false)return 2;                               // no-contact (dead socket) — dim
+  if(o.state==='good'||o.state==='maybe_good')return 0;          // good
+  return 1;                                                       // unknown / untested / other
+}
 // The host list for the selected model. Extracted so the host-detail card's
 // "back" link can restore it without re-running the model click.
 function renderHostListFor(){
@@ -3208,18 +3217,21 @@ function renderHostListFor(){
   // The pane data is per-model aggregates only (no IPs). Fetch this one model's
   // host list on demand — friction by design ("cookies on the high shelf").
   var card=document.getElementById('hostCard');card.style.display='';
-  var title=document.getElementById('hostCardTitle');title.textContent=model+' (…)';
+  var qin=document.getElementById('hostModelQuery');if(qin&&document.activeElement!==qin)qin.value=model;   // pre-fill on click; don't clobber the user mid-type
+  var count=document.getElementById('hostCardCount');if(count)count.textContent='…';
   var list=document.getElementById('hostList');
   var stats=document.getElementById('modelStats');stats.innerHTML='';
   list.innerHTML='<div style="color:var(--text-muted);font-size:var(--fs-md)">loading hosts…</div>';
   fetch('dashboard-model-hosts?q='+encodeURIComponent(model)).then(function(r){return r.json()}).then(function(res){
     if(_currentModel!==model)return;   // selection changed while the fetch was in flight
     var hosts=(res.hosts||[]).slice().sort(function(a,b){
+      var ra=_hostRank(a),rb=_hostRank(b);
+      if(ra!==rb)return ra-rb;                                   // health bucket first
       var ta=a.checked?Date.parse(a.checked):NaN,tb=b.checked?Date.parse(b.checked):NaN;
       if(isNaN(ta))ta=-Infinity;if(isNaN(tb))tb=-Infinity;
-      return tb-ta||(a.host<b.host?-1:a.host>b.host?1:0);
+      return tb-ta||(a.host<b.host?-1:a.host>b.host?1:0);       // then newest-checked, then host
     });
-    title.textContent=model+' ('+fmtCount(hosts.length)+' hosts)';
+    if(count)count.textContent='('+fmtCount(hosts.length)+' hosts)';
     var st=res.stats||{};var tot=st.total||0;
     function cell(n){n=n||0;return fmtCount(n)+(tot?' <span class="stat-pct">'+Math.round(n/tot*100)+'%</span>':'');}
     stats.innerHTML='<div class="two-column"><div><table>'
@@ -3230,9 +3242,16 @@ function renderHostListFor(){
       +'<tr><td>Untested</td><td>'+cell(st.unknown)+'</td></tr>'
       +'</table></div></div>';
     list.innerHTML='';
-    hosts.forEach(function(o){var h=o.host;var d=document.createElement('div');d.className='model-item'+(o.reachable===false?' host-unreachable':'');d.style.cursor='pointer';d.title=o.reachable===false?'unreachable (dead socket) — host details':'host details';var n=document.createElement('span');n.className='host-name';n.textContent=h;d.appendChild(n);var ago=checkedAgo(o.checked);if(ago){var t=document.createElement('span');t.className='host-checked';t.textContent=ago;t.title=o.checked;d.appendChild(t)}d.addEventListener('click',function(){if(_selHostRow===d){closeHostDetailCard();return}selectHostRow(d);openHostDetail(h)});list.appendChild(d)});
+    hosts.forEach(function(o){var h=o.host;var d=document.createElement('div');d.className='model-item'+(o.reachable===false?' host-unreachable':'')+(o.fail_smoke?' host-smoke-fail':'');d.style.cursor='pointer';d.title=(o.fail_smoke?'failed smoke test (honeypot/garbage) — ':o.reachable===false?'unreachable (dead socket) — ':'')+'host details';var n=document.createElement('span');n.className='host-name';n.textContent=h;d.appendChild(n);var ago=checkedAgo(o.checked);if(ago){var t=document.createElement('span');t.className='host-checked';t.textContent=ago;t.title=o.checked;d.appendChild(t)}d.addEventListener('click',function(){if(_selHostRow===d){closeHostDetailCard();return}selectHostRow(d);openHostDetail(h)});list.appendChild(d)});
   }).catch(function(){if(_currentModel===model)list.innerHTML='<div style="color:var(--err);font-size:var(--fs-md)">failed to load hosts</div>'});
 }
+// Host-card model-query search (Enter, never per-keystroke): re-run the host list for ANY query,
+// same language as the model filter. Purely additive — the click-to-open workflow is unchanged; a
+// click pre-fills this box, and you can edit it to browse another model's hosts without re-clicking.
+(function(){var hq=document.getElementById('hostModelQuery');
+ if(hq)hq.addEventListener('keydown',function(e){
+   if(e.key==='Enter'){e.preventDefault();var v=this.value.trim();if(!v)return;_currentModel=v;renderHostListFor();}
+ });})();
 loadDashboard();
 </script>
 <script>

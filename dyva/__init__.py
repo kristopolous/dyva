@@ -8621,29 +8621,49 @@ async def handle_model_hosts(request):
       '200':
         description: Model plus its host list
     """
-    q = request.query.get("q", "")
+    q = (request.query.get("q", "") or "").strip()
     if not q:
         return web.json_response({"model": q, "hosts": [], "stats": {}})
-    rows = _get_db().execute(
-        f"SELECT host, state, fail_smoke FROM host_status WHERE model=? AND {_LIVE_REAL}",
-        (canon_pattern(q),)).fetchall()
-    states = {h: st for h, st, _fs in rows}
-    smoke_fail = {h for h, _st, fs in rows if fs}
+    qpat = canon_pattern(q)
+    # Match by QUERY (glob/substring — the same match_model the router uses), NOT an exact model
+    # name: "qwen3.8" must sweep every qwen3.8 variant across the pool (qwen3.8:27b, qwen3.8-9b-...,
+    # huihui_ai/Qwen3.8-abliterated), not just a host whose list contains literally "qwen3.8". Each
+    # host is kept if ANY of its models matches.
+    srv_models = {s.get("server"): s for s in load_servers()
+                  if s.get("server")
+                  and any(match_model(m, qpat) for m in (s.get("models") or []))}
+    # Per-host reputation across the MATCHING models: best state (good>maybe>bad>unknown), and
+    # fail_smoke if ANY matching (host, model) failed smoke. Sentinel rows (UNREACHABLE/HONEYPOT
+    # keys) never match a real query so match_model skips them. Chunk the host IN-list to stay
+    # under SQLite's bound-variable cap on a broad query.
+    rank = {"good": 3, "maybe_good": 2, "bad": 1}
+    states, smoke_fail = {}, set()
+    _hlist = list(srv_models)
+    for i in range(0, len(_hlist), 400):
+        chunk = _hlist[i:i + 400]
+        ph = ",".join("?" * len(chunk))
+        for h, m, st, fs in _get_db().execute(
+                f"SELECT host, model, state, fail_smoke FROM host_status "
+                f"WHERE host IN ({ph}) AND {_LIVE_REAL}", tuple(chunk)).fetchall():
+            if not match_model(m, qpat):
+                continue
+            if rank.get(st, 0) > rank.get(states.get(h, ""), 0):
+                states[h] = st
+            if fs:
+                smoke_fail.add(h)
     unreachable = load_unreachable()   # host-wide dead-socket marks (UNREACHABLE_KEY)
-    hosts = [{"host": s.get("server", ""), "checked": s.get("checked"),
-              "state": states.get(s.get("server", ""), "unknown"),
-              "reachable": s.get("server", "") not in unreachable,
-              "fail_smoke": s.get("server", "") in smoke_fail}
-             for s in load_servers()
-             if s.get("server") and q in (s.get("models") or [])]
-    # Model-level aggregate for the host card's stats strip: counts across the
-    # hosts that CURRENTLY serve this model (the displayed list), not stale
-    # host_status rows. untested = hosts with no reputation row (state unknown).
+    hosts = [{"host": srv, "checked": s.get("checked"),
+              "state": states.get(srv, "unknown"),
+              "reachable": srv not in unreachable,
+              "fail_smoke": srv in smoke_fail}
+             for srv, s in srv_models.items()]
+    # Model-level aggregate for the host card's stats strip: counts across the matching hosts
+    # (the displayed list). untested = hosts with no reputation row for a matching model.
     stats = {"total": len(hosts), "good": 0, "bad": 0, "maybe_good": 0,
              "unknown": 0, "fail_smoke": 0}
     for hobj in hosts:
         stats[hobj["state"]] = stats.get(hobj["state"], 0) + 1
-        if hobj["host"] in smoke_fail:
+        if hobj["fail_smoke"]:
             stats["fail_smoke"] += 1
     return web.json_response({"model": q, "hosts": hosts, "stats": stats})
 
