@@ -300,6 +300,7 @@ body.chat{height:100vh;height:100dvh}
 .status-connected{color:var(--ok)}
 .status-failed{color:var(--err)}
 .status-warming{color:var(--warn)}
+.status-abandoned{color:var(--text-faint)}
 .content-line{padding:2px 0;color:var(--text-2)}
 .done-line{color:var(--text-faint);font-style:italic}
 .model-item{padding:var(--sp-2) 0;border-bottom:1px solid var(--border);font-size:var(--fs-md);display:flex;justify-content:space-between}
@@ -2637,6 +2638,8 @@ function usageEmoji(served,failed,won,lost){
   if(won||lost)p.push('<span title="Races won / races lost — times this host answered first vs. lost the hedge race to another host">🏁 '+NUM_FMT.format(won||0)+'/'+NUM_FMT.format(lost||0)+'</span>');
   return p.join('  ');
 }
+// "first seen" value: the date part + a relative age (e.g. "2026-09-20 (23 days ago)").
+function firstSeenStr(iso){var ago=checkedAgo(iso);return escHtml(String(iso).slice(0,10))+(ago?' <span style="color:var(--text-faint)">('+(ago==='today'?ago:ago+' ago')+')</span>':'');}
 function hostDetailHtml(host,j){
   var h=[];
   var url=j.host||host, href=/^https?:\/\//.test(url)?url:('http://'+url);
@@ -2653,6 +2656,7 @@ function hostDetailHtml(host,j){
   h.push(row('host','<a href="'+escHtml(href)+'" target="_blank" rel="noopener noreferrer">'+escHtml(url)+' ↗</a>'));
   if(j.asn)h.push(row('network','AS'+j.asn+(j.as_org?' · '+escHtml(j.as_org):'')));
   h.push(row('source',j.source?escHtml(j.source):''));
+  h.push(row('first seen',j.first_seen?firstSeenStr(j.first_seen):''));
   h.push(row('checked',j.lastUpdate?escHtml(String(j.lastUpdate)):''));
   // honeypot signal from graflex's model/size-signature detection (higher = more suspect)
   h.push(row('bogus score',(j.bogus_score!=null&&j.bogus_score!=='')?escHtml(String(j.bogus_score)):''));

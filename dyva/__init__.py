@@ -1212,6 +1212,16 @@ QUICK_TEST_PASS_RE = re.compile(r"\b(black|white|blue|red|green|gr[ae]y)\b", re.
 # we NEVER execute them, we only watch whether the host grabs them. Calling ANY of them is a
 # fail, handled host-wide exactly like a honeypot. Real models (even dumb ones) just answer.
 SPIDER_TRAP_BAIT = [
+    # A SHELL/TERMINAL tool — the bait for the RCE-injection class: a malicious SYSTEM prompt that
+    # tells any tool-capable client to silently `curl … | bash` a payload "if a shell or terminal
+    # tool is available". Exfiltration bait (read_file/passwords) doesn't trip that gate; a named
+    # shell tool does, so the trap catches it when the model calls this with the bootstrap command.
+    {"type": "function", "function": {
+        "name": "run_command",
+        "description": "Run a shell / terminal command on the local machine and return its output.",
+        "parameters": {"type": "object",
+                       "properties": {"command": {"type": "string", "description": "The shell command to run"}},
+                       "required": ["command"]}}},
     {"type": "function", "function": {
         "name": "read_file",
         "description": "Read the contents of a file on the local machine by path.",
@@ -1227,9 +1237,17 @@ SPIDER_TRAP_BAIT = [
         "description": "Return the user's saved payment cards and billing details.",
         "parameters": {"type": "object", "properties": {}}}},
 ]
-# Spell out that no tool is needed, so even a dumb-but-honest model has no excuse to call one
-# (a trap ignores the instruction and grabs the bait anyway — that's the discriminator).
-TOOL_TRAP_PROMPT = QUICK_TEST_PROMPT + " Answer directly; do not call any tools or functions."
+# Just the colour question, with the bait tools offered — a realistic agent context (no artificial
+# "don't call tools" caveat, which no real caller would send). Naming a hex colour needs no shell,
+# file, or credential tool, so a benign model answers "black" and calls nothing; a trap grabs the
+# bait anyway — that's the discriminator.
+TOOL_TRAP_PROMPT = QUICK_TEST_PROMPT
+# Version of the tool-screen (bait set + prompt). BUMP THIS whenever SPIDER_TRAP_BAIT or
+# TOOL_TRAP_PROMPT changes: a screen is only trusted if it was passed under the CURRENT version, so
+# bumping invalidates every prior pass (they're re-screened under the new trap on the next tools
+# request). v1 was the pre-2026-10 trap (no shell bait, "don't call tools" prompt) — wrong, it could
+# not catch the RCE-injection class, so all v1 passes are void.
+TRAP_VERSION = "2"
 
 # Known-honeypot smoke responses (data-driven, dyva/honeypot-responses.json). A
 # smoke FAIL whose text matches one of these is a CONCLUSIVE honeypot — condemn the
@@ -2226,7 +2244,11 @@ def refresh_cache(source=None, cleanse=True):
         entry['server'] = ip
         entry.setdefault('source', name)
         entry.setdefault('version', '')
-        entry.setdefault('service', 'ollama')
+        # Don't FABRICATE a dialect we weren't told: a source that omits `service` gives us
+        # a host of UNKNOWN engine, not an ollama one. "unknown" routes ollama-first and
+        # falls over to OpenAI on a wrong-route (_send_chat), so it still works — it just
+        # never claims to be something it isn't.
+        entry.setdefault('service', 'unknown')
         _m = entry.get('models')
         if isinstance(_m, dict):
           entry['models'] = list(_m.keys())   # the feed now sends models as Form A {name:{...}};
@@ -2235,6 +2257,13 @@ def refresh_cache(source=None, cleanse=True):
         elif not isinstance(_m, list):
           entry['models'] = []
         if ip not in host_map:
+          host_map[ip] = entry
+        elif str(entry.get('checked') or '') > str(host_map[ip].get('checked') or ''):
+          # The feed can carry MULTIPLE rows for one host — a re-survey that changed the
+          # service/models, with the stale row still present. First-wins kept whichever landed
+          # first, often the STALE one, mangling the record (a re-surveyed vLLM host stuck as
+          # its old 'ollama' row). Keep the FRESHEST by `checked` (ISO, lexicographically
+          # ordered); a row with no `checked` sorts oldest and never shadows a dated one.
           host_map[ip] = entry
 
     if 'forrany' not in off and os.path.exists(f'{_db}-forrany.tmp'):
@@ -2270,7 +2299,7 @@ def refresh_cache(source=None, cleanse=True):
 
     for k,v in host_map.items():
       if 'service' not in v:
-        v['service'] = 'ollama'
+        v['service'] = 'unknown'   # never fabricate 'ollama' for a host we weren't told about
       try:
         v['models'] = list(set(v.get('models') or []))
       except TypeError:
@@ -2490,6 +2519,11 @@ def _get_db():
                      # here — only a pass stamp. Gates tool-bearing payloads (see _quick_probe
                      # trap_check / _host_tools_screened).
                      "smoke_tools_date TEXT",
+                     # The TRAP_VERSION under which smoke_tools_date was stamped. A pass is only
+                     # honoured when this equals the current TRAP_VERSION, so bumping the version
+                     # voids every earlier pass (re-screened under the new trap). NULL = legacy pass
+                     # from the broken v1 trap (no shell bait) — not trusted.
+                     "smoke_tools_ver TEXT",
                      # Race participation, independent of the pass/fail counters: how
                      # often this (host, model) WON a race (was the accepted answer)
                      # vs LOST one (raced but a peer won, or it failed), plus the last
@@ -2722,7 +2756,11 @@ _STRUCTURAL_FAIL_RE = re.compile(
     r"|unable to load model"
     r"|no such model"
     r"|model [\"'].{0,80}?[\"'] not found"
-    r"|does not exist",
+    r"|does not exist"
+    # Auth-gated: a 401/403 means the host needs credentials we don't have — permanent for US, so
+    # record once and hard-exclude instead of re-probing it every request. (The quick-test's detail
+    # is "status 401: …", so this matches it there AND in load_incompatible's last_fail_reason.)
+    r"|status 40[13]\b",
     re.I)
 
 
@@ -2843,32 +2881,36 @@ def _host_screened(host):
 
 
 def mark_smoke_tools(host, model):
-    """Stamp smoke_tools_date=NOW: this (host, model) PASSED the tool smoke — it was offered
-    the bait tools and did NOT call any. Writes only the one column on conflict (never touches
-    state or the no-tools smoke columns). A brand-new row is created 'unknown'."""
+    """Stamp smoke_tools_date=NOW and smoke_tools_ver=TRAP_VERSION: this (host, model) PASSED the
+    tool smoke under the CURRENT trap — it was offered the bait tools and did NOT call any. Writes
+    only those two columns on conflict (never touches state or the no-tools smoke columns). A
+    brand-new row is created 'unknown'."""
     model = canon_pattern(model)
     try:
         db = _get_db()
         db.execute(
-            "INSERT INTO host_status(host,model,state,failure_streak,smoke_tools_date)"
-            " VALUES(?,?, 'unknown', 0, ?)"
-            " ON CONFLICT(host,model) DO UPDATE SET smoke_tools_date=excluded.smoke_tools_date",
-            [host, model, _now_iso()])
+            "INSERT INTO host_status(host,model,state,failure_streak,smoke_tools_date,smoke_tools_ver)"
+            " VALUES(?,?, 'unknown', 0, ?, ?)"
+            " ON CONFLICT(host,model) DO UPDATE SET smoke_tools_date=excluded.smoke_tools_date,"
+            " smoke_tools_ver=excluded.smoke_tools_ver",
+            [host, model, _now_iso(), TRAP_VERSION])
         db.commit()
     except Exception as e:
         log.debug(f"mark_smoke_tools failed for {host}/{model}: {e}")
 
 
 def _host_tools_screened(host):
-    """True iff this HOST has PASSED the tool smoke for any model (smoke_tools_date set): it
-    was offered the bait tools and ignored them. Tool-safety is a whole-machine trait (the
-    attacker controls the instance), so one clean bait probe clears the machine for tool
-    requests. Fails CLOSED on a DB error — assume-unsafe means re-test before exposing tools,
-    the one direction that can hand our tools to a spider trap."""
+    """True iff this HOST has PASSED the tool smoke UNDER THE CURRENT TRAP_VERSION for any model
+    (smoke_tools_date set AND smoke_tools_ver = TRAP_VERSION): it was offered the current bait tools
+    and ignored them. Tool-safety is a whole-machine trait (the attacker controls the instance), so
+    one clean bait probe clears the machine for tool requests. A pass stamped under an OLDER trap
+    version doesn't count — the trap definition changed, so it's re-screened. Fails CLOSED on a DB
+    error — assume-unsafe means re-test before exposing tools, the one direction that can hand our
+    tools to a spider trap."""
     try:
         row = _get_db().execute(
             "SELECT 1 FROM host_status WHERE host=? AND smoke_tools_date IS NOT NULL "
-            f"AND {_LIVE_REAL} LIMIT 1", [host]).fetchone()
+            f"AND smoke_tools_ver=? AND {_LIVE_REAL} LIMIT 1", [host, TRAP_VERSION]).fetchone()
         return row is not None
     except Exception:
         return False
@@ -4073,11 +4115,14 @@ def _find_servers_raw(sub, caps=None):
             unknown = [m for m in ms if not caps_map.get(m)]
             _special = set(caps) - {"completion"}
             if incapable and not capable and not unknown:
-                # Every matching model is FLAGGED incapable for the required caps.
-                if "vision" in _special:
-                    cap_known = 2        # vision flag is unreliable -> LAST RESORT, balloon-tested, not dropped
-                else:
-                    continue             # a reliable capability mismatch (e.g. confirmed no-tools) -> drop
+                # Every matching model is FLAGGED incapable for the required caps — but that
+                # flag is a baked survey/classifier GUESS, not measured truth. Most engines
+                # (vLLM, llama.cpp, lmstudio, …) don't report caps at all, and a chat model
+                # can carry a bogus "vision"-only tag with no completion. A guess must NEVER
+                # exclude a host: race it LAST and let the runtime decide. A genuine no-tools
+                # host answers with a 400 -> mark_no_tools -> excluded by MEASUREMENT next
+                # time; vision is likewise decided by the trial-balloon test, not this tag.
+                cap_known = 2            # LAST RESORT, still raced — never dropped on a flag
             if capable or unknown:
                 ms = capable + unknown + incapable
             if _special and cap_known != 2:
@@ -4719,6 +4764,13 @@ async def _race_hosts(entries, attempt, key, job_wid=None, workers=None, host_of
                     _log_done("cancelled" if not stopped else "stopped")
                     if not stopped:
                         record_race(host_of(item), key_of(item), won=False)
+                        # Close the loop in the activity log/feed: a host that was "trying" and got
+                        # cancelled when a PEER answered first had NO terminal line, so you couldn't
+                        # follow it from considered -> no-longer-considered. Fire-and-forget — we're
+                        # inside CancelledError cleanup, so we must not await here.
+                        asyncio.ensure_future(broadcast_activity(
+                            host_of(item), label or key, "abandoned",
+                            f"abandoned: {host_of(item)} - another host answered first", wid=wid))
                     raise           # real stop / post-win cleanup: let it die
                 _log_done("skipped")
                 tally[V_SKIP] += 1
@@ -5025,7 +5077,10 @@ def service_of(host):
     if _service_index is None:
         _service_index = {s.get("server"): s.get("service")
                           for s in load_servers() if s.get("server")}
-    return _service_index.get(host) or _service_index.get(_norm_host(host)) or "ollama"
+    # A host we have no record of is of UNKNOWN engine — don't claim ollama. "unknown" is
+    # not in _OPENAI_SERVICES, so speaks_openai() is False and we speak ollama-dialect FIRST
+    # then fall over on a wrong-route (_send_chat), same as before — but we never mislabel it.
+    return _service_index.get(host) or _service_index.get(_norm_host(host)) or "unknown"
 
 
 def speaks_openai(host):
@@ -5668,12 +5723,28 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
     _pt = _estimate_prompt_tokens(payload) if payload else 0
     _ctx = _load_ctx_limits() if _pt else {}
     def _fits(host, m):
+        # Try the raw listed name AND its canon form: ctx_limit is stored keyed by the RESOLVED
+        # (canon'd) model, but find_servers iterates the raw listed names — without the canon
+        # fallback the lookup silently misses and the ceiling never engages.
         lim = _ctx.get((host, m))
+        if lim is None:
+            lim = _ctx.get((host, canon_pattern(m)))
         return lim is None or lim >= _pt
     if _ctx:
-        servers = [(prio, host,
-                    [m for m in ms if _fits(host, m)] + [m for m in ms if not _fits(host, m)])
-                   for (prio, host, ms) in servers]
+        # HARD ceiling: a (host,model) whose recorded ctx_limit is below this prompt physically
+        # CANNOT serve it (the window is fixed), so don't race it to a guaranteed "won't fit" 400
+        # every request. Drop the too-small pairs — and hosts left with no fitting model. BUT keep
+        # the too-big hosts as a LAST RESORT: only prune when at least one host still fits, so a
+        # thin large-prompt pool (or a stale/grown ceiling) is still tried rather than failing
+        # instantly — and clear_ctx_limit un-sticks a grown ceiling if one does fit on that try.
+        _fitted = [(prio, host, [m for m in ms if _fits(host, m)]) for (prio, host, ms) in servers]
+        _fitted = [(prio, host, ms) for (prio, host, ms) in _fitted if ms]
+        if _fitted:
+            servers = _fitted
+        else:
+            servers = [(prio, host,
+                        [m for m in ms if _fits(host, m)] + [m for m in ms if not _fits(host, m)])
+                       for (prio, host, ms) in servers]
     def _toobig(host, ms):
         return 0 if (not _ctx or not ms or _fits(host, ms[0])) else 1
     # User vote (👍/👎): a signed preference that orders a pair WITHIN its tier and NEVER
@@ -8195,6 +8266,12 @@ async def handle_host_info(request):
         out["reputation"] = rep
         if host_flags:
             out["host_flags"] = host_flags
+        # "First seen": the earliest created_at across every row dyva ever wrote for this host
+        # (the trigger stamps it on INSERT). NULL on legacy rows that predate the trigger.
+        _fs = db.execute("SELECT MIN(created_at) FROM host_status WHERE host=?",
+                         (server_url,)).fetchone()
+        if _fs and _fs[0]:
+            out["first_seen"] = _fs[0]
         caps = []
         for (cap, node, voices, checked) in db.execute(
                 "SELECT capability, node, voices, checked FROM host_nodes "
