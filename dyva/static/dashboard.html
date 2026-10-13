@@ -1370,7 +1370,7 @@ body.dragging-image .hist-item{cursor:grabbing}
 </div>
 <div class="card" id="hostCard" style="display:none">
 <div class="hostcard-head"><h2 id="hostCardTitle">Host</h2><span id="hostCardCount" class="hostcard-count"></span></div>
-<div class="card-inner"><div id="modelStats" class="model-stats"></div><input id="hostModelQuery" class="hostcard-q" type="text" placeholder="model query — qwen3.8, *coder*, &gt;10gb" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" title="Browse any model's hosts — same query language as the model filter. Enter to search."><div id="hostList"></div></div>
+<div class="card-inner"><div id="modelStats" class="model-stats"></div><form id="hostQueryForm" class="hostcard-qform"><input id="hostModelQuery" class="hostcard-q" type="text" placeholder="model query — qwen3.8, *coder*, &gt;10gb" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" title="Browse any model's hosts — same query language as the model filter. Enter / Go to search."></form><div id="hostList"></div></div>
 </div>
 <div class="card" id="hostDetailCard" style="display:none">
 <h2 class="hd-head"><span id="hostDetailTitle">Host</span><button type="button" class="hd-close" title="Close" aria-label="Close host detail" onclick="closeHostDetailCard()">&times;</button></h2>
@@ -3245,12 +3245,15 @@ function renderHostListFor(){
     hosts.forEach(function(o){var h=o.host;var d=document.createElement('div');d.className='model-item'+(o.reachable===false?' host-unreachable':'')+(o.fail_smoke?' host-smoke-fail':'');d.style.cursor='pointer';d.title=(o.fail_smoke?'failed smoke test (honeypot/garbage) — ':o.reachable===false?'unreachable (dead socket) — ':'')+'host details';var n=document.createElement('span');n.className='host-name';n.textContent=h;d.appendChild(n);var ago=checkedAgo(o.checked);if(ago){var t=document.createElement('span');t.className='host-checked';t.textContent=ago;t.title=o.checked;d.appendChild(t)}d.addEventListener('click',function(){if(_selHostRow===d){closeHostDetailCard();return}selectHostRow(d);openHostDetail(h)});list.appendChild(d)});
   }).catch(function(){if(_currentModel===model)list.innerHTML='<div style="color:var(--err);font-size:var(--fs-md)">failed to load hosts</div>'});
 }
-// Host-card model-query search (Enter, never per-keystroke): re-run the host list for ANY query,
-// same language as the model filter. Purely additive — the click-to-open workflow is unchanged; a
-// click pre-fills this box, and you can edit it to browse another model's hosts without re-clicking.
-(function(){var hq=document.getElementById('hostModelQuery');
- if(hq)hq.addEventListener('keydown',function(e){
-   if(e.key==='Enter'){e.preventDefault();var v=this.value.trim();if(!v)return;_currentModel=v;renderHostListFor();}
+// Host-card model-query search: re-run the host list (and the stats, which update together) for
+// ANY query, same language as the model filter. Fires on FORM SUBMIT — Enter on desktop AND the
+// Android "Go" key, which doesn't reliably emit a keydown Enter — so it works on mobile. Purely
+// additive: the click-to-open workflow is unchanged; a click pre-fills this box.
+(function(){var hf=document.getElementById('hostQueryForm');
+ if(hf)hf.addEventListener('submit',function(e){
+   e.preventDefault();
+   var v=document.getElementById('hostModelQuery').value.trim();if(!v)return;
+   _currentModel=v;renderHostListFor();
  });})();
 loadDashboard();
 </script>

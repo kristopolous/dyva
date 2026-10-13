@@ -2227,7 +2227,12 @@ def refresh_cache(source=None, cleanse=True):
         entry.setdefault('source', name)
         entry.setdefault('version', '')
         entry.setdefault('service', 'ollama')
-        if not isinstance(entry.get('models'), list):
+        _m = entry.get('models')
+        if isinstance(_m, dict):
+          entry['models'] = list(_m.keys())   # the feed now sends models as Form A {name:{...}};
+                                               # keep the NAMES. This used to zero a dict, nuking the
+                                               # model list on ~84% of hosts and gutting the routable pool.
+        elif not isinstance(_m, list):
           entry['models'] = []
         if ip not in host_map:
           host_map[ip] = entry
@@ -2904,12 +2909,16 @@ def add_bad(host, model, kind="other", reason=None):
     reason = (" ".join(str(reason).split())[:500] or None) if reason else None
     db = _get_db()
     cur = _state_of(host, model)
-    if cur is None:
+    if cur is None or cur == "unknown":
+        # No verdict yet, OR an explicit 'unknown' row (mark_smoke creates one before the caller
+        # decides a tier) — a failure makes it bad. Without the 'unknown' case, a host smoke-probed
+        # first (so a row already exists) could NEVER reach 'bad', so load_incompatible() never saw
+        # its structural failure and it was re-probed every request.
         new_state = "bad"
     elif cur == "good":
-        new_state = "maybe_good"
+        new_state = "maybe_good"       # one failure right after good -> maybe, not straight to bad
     else:
-        new_state = cur
+        new_state = cur                # maybe_good / bad stay
     col = _FAIL_COLS.get(kind, "fail_other")
     db.execute(
         f"INSERT INTO host_status(host,model,state,last_good,failure_streak,failure,{col},last_fail,last_fail_reason)"
@@ -7157,7 +7166,13 @@ async def _quick_probe(session, host, full, model_in, tools=None, grade=True, tr
             f"quick test: {host} for {model_in} - {msg}", duration=dur, wid=wid)
         return False, msg
     if resp is None:
-        if grade:
+        # Both dialects missed. A STRUCTURAL miss (the host lists a model it doesn't actually have —
+        # "model '…' not found") is PERMANENT, so record it even on the race's grade=False probe →
+        # load_incompatible() hard-excludes the (host,model) and it stops being re-probed EVERY
+        # request. A plain wrong-route/endpoint miss stays grade-gated (re-testable). This is the
+        # branch the both-dialects-404 actually takes — mirrors the status!=200 branch below.
+        structural = bool(_STRUCTURAL_FAIL_RE.search(why or ""))
+        if grade or structural:
             add_bad(host, full, reason=f"smoke: {why}")
         await broadcast_activity(host, model_in, "failed",
             f"quick test: {host} for {model_in} - {why}",
@@ -7183,9 +7198,14 @@ async def _quick_probe(session, host, full, model_in, tools=None, grade=True, tr
         # them bad here was condemning hosts that should have passed. Inconclusive ->
         # skip, no penalty, still re-testable. Anything else keeps the bad mark.
         benign = (resp.status in (400, 503)) or ("loading model" in body.lower())
-        if not benign:
-            if grade:
-                add_bad(host, full, reason=f"smoke: {detail}")
+        # A STRUCTURAL failure (the host lists a model it doesn't actually have — "model '…' not
+        # found", "no such model", …) is PERMANENT, so record it even on the race's grade=False
+        # inline probe: load_incompatible() then hard-excludes the pair and we stop re-probing it
+        # every request. ("Once is enough" — unlike a transient failure, which grade=False skips so
+        # the host stays re-testable.)
+        structural = bool(_STRUCTURAL_FAIL_RE.search(detail or ""))
+        if not benign and (grade or structural):
+            add_bad(host, full, reason=f"smoke: {detail}")
         await broadcast_activity(host, model_in, "warming" if benign else "failed",
             f"quick test: {host} for {model_in} - {detail}",
             duration=time.time() - start, wid=wid)
@@ -17303,11 +17323,12 @@ def banner():
      l'>  \033[38;5;{color-i+1}m    █▍  ▐█  ▜▄▛    █▄  ▄█   ▄▛▜▄  \033[0m <-l
      ll   \033[38;5;{color-i+2}m    █▍  ▐█   █      █▄▄█   ▄█  █▄  \033[0m ll
      llama~\033[38;5;{color-i+3}m  ███▆▆▛▘   █       ▜▛   ▄█    █▄ \033[0m llama~
-     || ||               v{VERSION}               || ||
+     || ||                                    || ||
      '' ''              epixerus              '' ''
+     {VERSION}
     """)
         if i < max-1:
-            print("\033[9A")
+            print("\033[10A")
             time.sleep(0.04)
 
 def main():
