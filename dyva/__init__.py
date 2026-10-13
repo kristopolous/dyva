@@ -2978,6 +2978,36 @@ def _failure_kind(verdict, detail):
     return "other"
 
 
+def add_soft_fail(host, model, kind="timeout", reason=None):
+    """Alive but DIDN'T DELIVER — a read timeout, a stream stall, or connected-but-no-answer.
+    The host is SOMETIMES-good, not offline, so demote it OUT of the winner circle but NEVER to
+    'bad' (bad means dead/structural — "don't come back"). good -> maybe_good; maybe_good / unknown
+    / bad stay where they are; a brand-new (host, model) lands 'unknown' (alive but unproven),
+    never 'bad'. Bumps the timeout counter + failure_streak and records last_fail_reason so the
+    record shows WHY. Still re-testable — a later success re-promotes via add_good. This is the
+    deliberate contrast with add_bad (which sends unknown -> bad): a slow/stalling host shouldn't
+    be treated as offline, but it also shouldn't keep a 'try me first, I usually succeed' good."""
+    model = canon_pattern(model)
+    reason = (" ".join(str(reason).split())[:500] or None) if reason else None
+    db = _get_db()
+    cur = _state_of(host, model)
+    if cur == "good":
+        new_state = "maybe_good"       # out of the winner circle, but still sometimes-good
+    elif cur is None:
+        new_state = "unknown"          # alive but unproven — NOT bad
+    else:
+        new_state = cur                # maybe_good / unknown / bad all stay
+    col = _FAIL_COLS.get(kind, "fail_timeout")
+    db.execute(
+        f"INSERT INTO host_status(host,model,state,failure_streak,failure,{col},last_fail,last_fail_reason)"
+        f" VALUES(?,?,?,1,1,1,?,?)"
+        f" ON CONFLICT(host,model) DO UPDATE SET"
+        f" state=?, failure_streak=failure_streak+1, failure=failure+1,"
+        f" {col}={col}+1, last_fail=excluded.last_fail, last_fail_reason=excluded.last_fail_reason",
+        (host, model, new_state, _now_iso(), reason, new_state))
+    db.commit()
+
+
 def add_bad(host, model, kind="other", reason=None):
     """Failure: good -> maybe_good, maybe_good stays, unknown -> bad, bad stays.
     failure_streak is incremented in every case. Also bumps the cumulative
@@ -4625,7 +4655,13 @@ def record_verdict(host, key, outcome, sticky_key=None):
         # host-wide, so it isn't re-probed as "unknown" for every other key...
         mark_unreachable(host)
         add_bad(host, key, "conn", reason=outcome.detail)  # ...plus the per-key mark
-    elif v in (V_UNSUITABLE, V_FAILED, V_TIMEOUT):   # this key shows who failed it
+    elif v == V_TIMEOUT:
+        # Alive but didn't deliver (read timeout / stream stall). SOFT demote — good -> maybe_good,
+        # never -> bad: a slow/stalling host is sometimes-good, not offline. Keeps it out of the
+        # winner circle (so heavy requests prefer proven hosts) while leaving it usable for cheap
+        # ones and re-testable.
+        add_soft_fail(host, key, "timeout", reason=outcome.detail)
+    elif v in (V_UNSUITABLE, V_FAILED):   # a real fault — this key shows who failed it
         add_bad(host, key, _failure_kind(v, outcome.detail), reason=outcome.detail)
     # V_SKIP records nothing on purpose
 
@@ -6005,17 +6041,17 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
                 # line above keeps the human-readable prefix.
                 return unreachable_host(detail)
             if isinstance(e, asyncio.TimeoutError):
-                # Connected but too slow (cold start / slow inference). It's alive,
-                # not dead — so DON'T penalise it (a slow cold host is often fast
-                # once warm): no bad mark. But DO record that we visited it, via a
-                # race stamp (last_race, state stays 'unknown'), so Explore stops
-                # re-fronting it as unmapped and racking up repeat timeouts.
+                # Connected but too slow to answer. It's alive, not dead — so NOT bad — but it
+                # DID fail to deliver this request, so SOFT-demote it (timed_out -> add_soft_fail:
+                # good -> maybe_good, never bad). That pulls it out of the winner circle (heavy
+                # requests prefer proven hosts) while keeping it usable for cheap ones and
+                # re-testable once warm. Also stamp the race visit so Explore stops re-fronting it.
                 msg = f"too slow — connected, no answer in {dur:.0f}s"
                 with contextlib.suppress(Exception):
                     record_race(host, model, won=False)
                 await broadcast_activity(host, model, "warming",
                     f"slow: {host} for {model} - {msg}", duration=dur, wid=wid)
-                return skip(msg)
+                return timed_out(msg)
             # some other mid-connection error (disconnect, payload) — a real fault
             await broadcast_activity(host, model, "failed",
                 f"failure: {host} for {model} - {detail}", duration=dur, wid=wid)
@@ -6112,12 +6148,16 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
                     resp.close()          # drop the connection, don't leak it
                 raise
             except asyncio.TimeoutError:
+                # Connected, started the (non-streamed) read, then timed out — alive but didn't
+                # deliver, so SOFT-fail (timed_out -> add_soft_fail: good -> maybe_good, never bad),
+                # not a no-penalty skip. A host that times out reading the body is sometimes-good,
+                # out of the winner circle, still re-testable.
                 dur = time.time() - start
                 await resp.release()
                 resp = None
                 await broadcast_activity(host, model, "failed",
                     f"failure: {host} for {model} - timeout", duration=dur, wid=wid)
-                return skip("read timeout")
+                return timed_out("read timeout")
             except json.JSONDecodeError:
                 dur = time.time() - start
                 await resp.release()
@@ -7365,9 +7405,13 @@ async def _quick_probe(session, host, full, model_in, tools=None, grade=True, tr
         no_socket = (isinstance(e, (aiohttp.ClientConnectorError, ConnectionRefusedError))
                      or (isinstance(e, asyncio.TimeoutError) and dur < CONNECT_TIMEOUT + 2))
         if isinstance(e, asyncio.TimeoutError) and not no_socket:
-            # Connected but too slow to answer — INCONCLUSIVE, not a failure. Don't
-            # mark it (no add_bad, no smoke date), so a slow/cold host stays eligible
-            # to be re-probed once warm. `None` verdict = neither pass nor fail.
+            # Connected but too slow to answer. Alive, not dead — so NOT bad — but it DID fail to
+            # deliver, so SOFT-demote it (good -> maybe_good, never bad), the same as a real-request
+            # timeout. The verdict stays `None` (inconclusive for the smoke PASS/FAIL gate, so the
+            # caller just skips to the next host), but reputation now reflects that it stalled: it
+            # leaves the winner circle and a later success re-promotes it. (Was left UNMARKED, which
+            # is why a chronically-slow host kept sitting in 'good' and getting raced first.)
+            add_soft_fail(host, full, "timeout", reason=f"quick test too slow: no answer in {dur:.0f}s")
             await broadcast_activity(host, model_in, "warming",
                 f"quick test: {host} for {model_in} - too slow, connected (no answer in {dur:.0f}s)",
                 duration=dur, wid=wid)
@@ -11704,7 +11748,12 @@ async def handle_txt2img(request):
                     await broadcast_activity(last_host, activity_label, "failed",
                         f"failure: {last_host} for {activity_label} - HTTP {r.status}")
         except (asyncio.TimeoutError, aiohttp.ClientError, OSError) as _e:
-            add_bad(last_host, IMG_KEY, reason=f"a1111 img: {' '.join(str(_e).split())[:200] or type(_e).__name__}")
+            # A TIMEOUT on image gen is alive-but-slow (rendering is slow by nature) — SOFT-fail
+            # (maybe_good, never bad). A connection error is the host being dead — that's a real
+            # add_bad.
+            _reason = f"a1111 img: {' '.join(str(_e).split())[:200] or type(_e).__name__}"
+            (add_soft_fail if isinstance(_e, asyncio.TimeoutError) else add_bad)(
+                last_host, IMG_KEY, reason=_reason)
             await broadcast_activity(last_host, activity_label, "failed",
                 f"failure: {last_host} for {activity_label} - {type(_e).__name__}")
 
@@ -17136,7 +17185,10 @@ async def _run_music_job(session, jid):
         job["error"] = str(e) or type(e).__name__
         if host:
             log.warning(f"music: {host}: {job['error']}")
-            add_bad(host, MUSIC_KEY, reason=f"music: {job['error']}")
+            # A timeout on music gen is alive-but-slow (rendering is slow) -> SOFT-fail; a real
+            # fault/connection error -> add_bad.
+            (add_soft_fail if isinstance(e, asyncio.TimeoutError) else add_bad)(
+                host, MUSIC_KEY, reason=f"music: {job['error']}")
             await broadcast_activity(host, label, "failed", f"{label}: {job['error']}", duration=time.time() - t0)
         _music_job_save()
 
