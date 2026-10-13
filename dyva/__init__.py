@@ -2548,6 +2548,15 @@ def _get_db():
                      # (still raced, never banned), and it's cleared the moment the host
                      # succeeds on a prompt that big (it was reloaded bigger). NULL = unknown.
                      "ctx_limit INTEGER",
+                     # Physical micro-batch ceiling (ubatch / num_batch) a DECISION-model host
+                     # reported when it rejected an oversized input: "input (N tokens) is too large
+                     # to process. increase the physical batch size (current batch size: M)". Raw
+                     # llama.cpp bakes -ub at launch and ignores a per-request num_batch, so a
+                     # decision request bigger than M will ALWAYS 500 on that host — record M and
+                     # skip the host for inputs over it (route to one that fits). Same SOFT, learned,
+                     # size-conditional idea as ctx_limit; cleared when the host later ingests that
+                     # big (relaunched with a larger -ub). NULL = unknown.
+                     "batch_limit INTEGER",
                      # User VOTE (👍/👎): a signed, reputation-ORTHOGONAL preference that
                      # orders this (host,model) WITHIN its tier — it NEVER moves the tier.
                      # +1 = 👍 (sort to the front), -1 = 👎 (sort to the back, next request
@@ -3066,6 +3075,69 @@ def _load_ctx_limits():
             f"WHERE ctx_limit IS NOT NULL AND {_LIVE_REAL}")}
     except Exception:
         return {}
+
+
+_BATCH_LIMIT_RE = re.compile(
+    r"too large to process.*?current batch size:\s*(\d+)", re.I | re.S)
+
+
+def _parse_batch_limit(body):
+    """Pull the physical micro-batch ceiling out of a decision model's oversized-input 500:
+    'input (N tokens) is too large to process. increase the physical batch size (current batch
+    size: M)'. Returns M — the ubatch the host was launched with, which a per-request num_batch
+    cannot raise on a raw llama.cpp server."""
+    m = _BATCH_LIMIT_RE.search(body or "")
+    return int(m.group(1)) if m else None
+
+
+def mark_batch_limit(host, model, n_batch):
+    """Record the ubatch ceiling a decision-model host reported. Per (host, resolved-model);
+    upserts a neutral 'unknown' row if none exists (an over-batch is a skip, not a bad mark).
+    Soft + reversible — cleared by clear_batch_limit when the host later ingests that big."""
+    if not n_batch:
+        return
+    try:
+        db = _get_db()
+        db.execute(
+            "INSERT INTO host_status(host,model,state,batch_limit) VALUES(?,?, 'unknown', ?)"
+            " ON CONFLICT(host,model) DO UPDATE SET batch_limit=excluded.batch_limit",
+            (host, model, int(n_batch)))
+        db.commit()
+    except Exception as e:
+        log.debug(f"mark_batch_limit failed: {e}")
+
+
+def clear_batch_limit(host, model, ingested):
+    """A decision host just SUCCEEDED on an `ingested`-token input; if that meets or beats a
+    recorded ubatch ceiling, the ceiling was stale (the host was relaunched with a bigger -ub)
+    — clear it so the host returns to normal order. One conditional UPDATE, no hot-path read."""
+    if not ingested:
+        return
+    try:
+        db = _get_db()
+        db.execute("UPDATE host_status SET batch_limit=NULL "
+                   "WHERE host=? AND model=? AND batch_limit IS NOT NULL AND batch_limit<=?",
+                   (host, model, int(ingested)))
+        db.commit()
+    except Exception as e:
+        log.debug(f"clear_batch_limit failed: {e}")
+
+
+def _load_batch_limits():
+    """{host: smallest known batch_limit} — host-keyed, because -ub is a SERVER property (one
+    value for every model the instance serves), so the min across its rows is the ceiling that
+    governs the host. Only non-NULL rows (few), cheap to load per decision request."""
+    out = {}
+    try:
+        db = _get_db()
+        for h, lim in db.execute(
+                f"SELECT host, batch_limit FROM host_status "
+                f"WHERE batch_limit IS NOT NULL AND {_LIVE_REAL}"):
+            if lim and (h not in out or lim < out[h]):
+                out[h] = lim
+    except Exception:
+        pass
+    return out
 
 
 def set_vote(host, model, score):
@@ -6247,6 +6319,17 @@ def _auto_num_ctx(payload):
     return max(NUM_CTX_MIN, min(NUM_CTX_MAX, stepped))
 
 
+def _auto_num_batch(input_tokens):
+    """Physical micro-batch (ubatch / Ollama num_batch) sized to hold the WHOLE input in
+    one pass. Decision models (clef/kev/jev et al.) run in llama.cpp EMBEDDING mode, where
+    the entire input must fit in a SINGLE ubatch or the runner 500s before it starts
+    (llama.cpp #30073) — there is no chunked prefill. So, unlike num_ctx, this needs no
+    reply reserve; it just has to COVER the input, with the same generous PAD (our tiktoken
+    count is a proxy for the host's tokenizer) and the same STEP/MIN/MAX idiom as num_ctx."""
+    stepped = ((int(input_tokens * NUM_CTX_PAD) + NUM_CTX_STEP - 1) // NUM_CTX_STEP) * NUM_CTX_STEP
+    return max(NUM_CTX_MIN, min(NUM_CTX_MAX, stepped))
+
+
 def _stash_want_ctx(wid, payload):
     """Record on the worker the context window we INTEND to send for this request.
 
@@ -6447,6 +6530,29 @@ async def _pump_stream(response, resp, first_line, host, full, openai_format,
                 accum(json.loads(first_line))
             except Exception:
                 pass
+
+        # first_line can itself be the TERMINAL chunk: a buffered / single-shot response
+        # (vLLM, llama.cpp, a short answer) puts done:true + usage on the ONE line we already
+        # peeked off the socket for dialect detection, so the read loop below never sees it.
+        # The loop is the ONLY place that calls account_tokens, so without this a single-line
+        # response is never token-accounted — its stats line, ttft and tps all vanish (the
+        # "stats stopped recording" regression: the dialect-fallback peek pulled the one line
+        # that carried done+usage out of the accounting path). Content was already forwarded
+        # above; here we only account and, on the OpenAI path, emit the terminal finish marker.
+        try:
+            _fobj = json.loads(first_line)
+        except Exception:
+            _fobj = None
+        if isinstance(_fobj, dict) and _fobj.get("done"):
+            await account_tokens(wid, host, full, _fobj, num_ctx)
+            if _fobj.get("done_reason") == "length":
+                return "length"
+            if openai_format:
+                fin = _fobj.get("done_reason") or "stop"
+                if tool_phase[0] and fin == "stop":
+                    fin = "tool_calls"
+                await cw(sse_str(sse_chunk(full, {}, done=True, finish_reason=fin)).encode())
+            return "done"
 
         # Absolute run-time ceiling for this stream, anchored to the worker's START
         # (so it caps TOTAL run time — even across agentic rounds — not per read). The
@@ -9966,10 +10072,38 @@ async def handle_systemone(request):
         return web.json_response(
             err_obj("at most 64 questions per request", "too_many_questions"), status=400)
 
+    # Decision models run in llama.cpp EMBEDDING mode: the ENTIRE input — state + every
+    # question block — must fit in ONE physical micro-batch (ubatch / Ollama num_batch), with
+    # no chunked prefill. If it exceeds the host's num_batch (a small default) the runner 500s
+    # before it starts (llama.cpp #30073). State+questions aren't `messages`, so estimate tokens
+    # from the serialized body (minus routing/options keys).
+    try:
+        _intoks = _count_tokens(json.dumps(
+            {k: v for k, v in body.items() if k not in ("options", "model", "stream")},
+            ensure_ascii=False))
+    except (TypeError, ValueError):
+        _intoks = 0
+    # Size num_batch to cover the input — at the API level, the one lever we have — unless the
+    # caller pinned one. This fixes OLLAMA-served decision models; a raw llama.cpp host bakes
+    # -ub at launch and ignores it (handled by the batch-ceiling skip below).
+    _sopts = dict(body.get("options") or {})
+    if "num_batch" not in _sopts and _intoks:
+        _sopts["num_batch"] = _auto_num_batch(_intoks)
+        body["options"] = _sopts
+
     servers = find_servers(model)
     if not servers:
         return web.json_response(
             err_obj(f"no servers for '{model}'", "model_not_found"), status=404)
+
+    # Detect-before-failing: a host that already reported "current batch size: M" (raw llama.cpp,
+    # which can't be raised per-request) will 500 again on any input over M — so skip it for this
+    # input and route to one that fits, instead of eating a wasted attempt every request. Don't
+    # empty the pool: if the ceiling filter removes everyone (all known-too-small, or stale after
+    # a relaunch), keep them all and let the race try — a success then clears the stale ceiling.
+    if _intoks:
+        _bl = _load_batch_limits()
+        servers = [t for t in servers if _bl.get(t[1]) is None or _bl[t[1]] >= _intoks] or servers
 
     session = request.app["session"]
 
@@ -9999,6 +10133,11 @@ async def handle_systemone(request):
         if code == 503:                       # alive but busy — park and retry, no penalty
             return retry_later("busy (HTTP 503)")
         if code != 200:
+            # Learn a raw-llama.cpp host's ubatch ceiling from the oversized-input 500 so the
+            # next decision request this big skips it (our num_batch can't raise a baked -ub).
+            _blim = _parse_batch_limit(text)
+            if _blim:
+                mark_batch_limit(host, full, _blim)
             detail = f"HTTP {code}: {' '.join(text.split())[:160]}"
             await broadcast_activity(host, model, "failed",
                 f"failure: {host} for {model} - {detail}", duration=time.time() - t0, wid=wid)
@@ -10012,6 +10151,9 @@ async def handle_systemone(request):
         if done.is_set():
             return skip("another host won")
         data["_dyva_host"] = host
+        # It handled this input size — if a smaller ubatch ceiling was on record it was stale
+        # (host relaunched with a bigger -ub), so clear it.
+        clear_batch_limit(host, full, _intoks)
         await broadcast_activity(host, model, "connected",
             f"success: {host} for {model}", duration=time.time() - t0, wid=wid, rmodel=full)
         return accepted(data, extra=full)
@@ -17400,12 +17542,13 @@ def banner():
      l'>  \033[38;5;{color-i+1}m    █▍  ▐█  ▜▄▛    █▄  ▄█   ▄▛▜▄  \033[0m <-l
      ll   \033[38;5;{color-i+2}m    █▍  ▐█   █      █▄▄█   ▄█  █▄  \033[0m ll
      llama~\033[38;5;{color-i+3}m  ███▆▆▛▘   █       ▜▛   ▄█    █▄ \033[0m llama~
-     || ||                                    || ||
-     '' ''              epixerus              '' ''
+     || ||              epixerus              || ||
+     '' ''                                    '' ''
      {VERSION}
+
     """)
         if i < max-1:
-            print("\033[10A")
+            print("\033[11A")
             time.sleep(0.04)
 
 def main():
