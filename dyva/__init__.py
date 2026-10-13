@@ -5673,7 +5673,7 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
         trusted = prio < 0
         if not trusted and not await probe_host(session, host):
             await broadcast_activity(host, model, "failed",
-                f"unreachable: {host}")
+                f"unreachable: {host}", wid=wid)
             return unreachable_host("probe failed")
         if not trusted and caps and caps != {"completion"}:
             await refresh_host_caps(session, host)
@@ -8582,8 +8582,10 @@ async def handle_model_hosts(request):
         (canon_pattern(q),)).fetchall()
     states = {h: st for h, st, _fs in rows}
     smoke_fail = {h for h, _st, fs in rows if fs}
+    unreachable = load_unreachable()   # host-wide dead-socket marks (UNREACHABLE_KEY)
     hosts = [{"host": s.get("server", ""), "checked": s.get("checked"),
-              "state": states.get(s.get("server", ""), "unknown")}
+              "state": states.get(s.get("server", ""), "unknown"),
+              "reachable": s.get("server", "") not in unreachable}
              for s in load_servers()
              if s.get("server") and q in (s.get("models") or [])]
     # Model-level aggregate for the host card's stats strip: counts across the
