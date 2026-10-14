@@ -323,27 +323,31 @@
     {
       "name": "QwenImage21",
       "style": "encode",
+      "encode_unified": true,
+      "resolution": 1024,
+      "max_images": 16,
       "patterns": [
         "^TextEncodeQwenImage21$"
       ],
       "images": [
-        "image1",
-        "image2",
-        "image3"
+        "image_1",
+        "image_2",
+        "image_3"
       ],
       "model": "(?i)qwen[-_. ]?image[-_. ]?2[._-]?1(?![0-9])",
       "clip": [
-        "(?i)qwen3[-_. ]?vl",
-        "(?i)qwen.*vl"
+        "(?i)qwen3[-_. ]?vl[-_. ]?8b",
+        "(?i)qwen3[-_. ]?vl(?!.*minimax)",
+        "(?i)qwen.*vl(?!.*minimax)"
       ],
       "vae": [
         "(?i)qwen[-_. ]?image[-_. ]?2[._-]?1.*vae",
         "(?i)qwen.*image.*vae"
       ],
       "clip_type": "qwen_image",
-      "cfg": 2.5,
+      "cfg": 1.0,
       "steps": 25,
-      "note": "Qwen-Image-2.1 (released 2026-09; unified t2i + edit — same weights serve both, zero reference images = text-to-image). Loaded as parts: UNETLoader qwen_image_2.1_int8_convrot + CLIPLoader qwen3vl_8b (type 'qwen_image') + VAELoader qwen_image_2.1_vae. Encode node TextEncodeQwenImage21, reference slots image1.. . Recipe + node classes taken from the official ComfyUI template image_qwen_image_2_1_image_edit.json; NOT yet run against a live host."
+      "note": "Qwen-Image-2.1 (released 2026-09; unified t2i + edit — same weights serve both, zero reference images = text-to-image). Loaded as parts: UNETLoader qwen_image_2.1_int8_convrot + CLIPLoader qwen3vl_8b (type 'qwen_image') + VAELoader qwen_image_2.1_vae. UNLIKE the other encode families, TextEncodeQwenImage21 is a UNIFIED node: one instance emits positive[0], negative[1] AND the latent[2], and takes required `prompt` + `negative_prompt` (STRING) + `resolution` (INT, default 1024, step 32) plus reference images in a COMFY_AUTOGROW_V3 `images` input named image_1..image_16 — hence encode_unified + the _edit_workflow branch, not the two-encode-node path. cfg 1.0 / 25 steps / euler / simple per the official image_qwen_image_2_1_image_edit.json template (cached in dyva/comfy-templates/). Node spec confirmed against a live host's /object_info (2026-10-13)."
     },
     {
       "name": "QwenImageEditPlus",

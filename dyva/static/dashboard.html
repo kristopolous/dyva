@@ -6455,7 +6455,7 @@ function _resultMetaMd(name,model,service,host){
   if(!bits.length)return '';
   return '\n\n<span class="result-meta">'+bits.map(escHtml).join(' \u00b7 ')+'</span>';
 }
-var SEARCH_MODELS_TOOL={type:'function',function:{name:'search_models',description:'List the models available across discovered hosts for a kind of generation, optionally filtered. Read-only; returns names and how many hosts have each.',parameters:{type:'object',properties:{type:{type:'string',enum:['image','edit','video','speech','text'],description:'Which capability: image create, image edit, video, speech, or text.'},substring:{type:'string',description:'Optional filter \u2014 plain text matches as a case-insensitive substring ("cartoon", "flux"), and globs work too ("z*image" matches z-image / zImage / z_image, "flux*2" matches flux.2 and flux-2).'},page:{type:'integer',description:'1-based page number'}},required:['type']}}};
+var SEARCH_MODELS_TOOL={type:'function',function:{name:'search_models',description:'List the models available across discovered hosts for a kind of generation, optionally filtered by partial name or a * wildcard. Read-only; returns names and how many hosts have each.',parameters:{type:'object',properties:{type:{type:'string',enum:['image','edit','video','speech','text'],description:'Which capability: image create, image edit, video, speech, or text.'},substring:{type:'string',description:'Optional name filter. Two rules cover almost everything: a PARTIAL NAME matches as a case-insensitive substring ("flux" finds flux.1-dev, FLUX_schnell), and * is a WILDCARD ("z*image" matches z-image / zImage / z_image, "flux*2" matches flux.2 and flux-2). Combine them freely; omit to list all.'},page:{type:'integer',description:'1-based page number'}},required:['type']}}};
 var LIST_ASSETS_TOOL={type:'function',function:{name:'list_assets',description:'List the files in this conversation by name — images, videos and audio the user attached or a tool created, plus any files written in the side panel. Call this when you need to work on something from earlier and want its name, for example before combining two pictures with edit_image. Returns names like "garden.jpg" that other tools accept.',parameters:{type:'object',properties:{}}}};
 var CALC_TOOL={type:'function',function:{name:'calc',description:'Evaluate a math expression  and get the precise result. It is a math language (mathjs): + - * / ^ %, parentheses, and functions like sqrt, abs, log, exp, sin/cos, gcd, factorial, plus variables and matrices.',parameters:{type:'object',properties:{expression:{type:'string',description:'The expression to evaluate, e.g. "sqrt(19310)", "2^64", "(1+0.05)^30 * 1000", "det([[1,2],[3,4]])".'}},required:['expression']}}};
 // A locked-down mathjs instance for calc: BigNumber precision, and the
@@ -6710,11 +6710,12 @@ var TOOL_DEFS={};_ALL_TOOL_DEFS.forEach(function(t){if(t&&t.function)TOOL_DEFS[t
 var TERSE_TOOLS={generate_image:1,edit_image:1,generate_video:1,generate_speech:1,spawn_agents:1};
 // Terse tools keep their REQUIRED params AND these explicit-selector params — the
 // ones that carry a choice the user MADE and the model cannot guess (a named model
-// like "flux*2", a source image to edit/animate, a named voice). Blanking these
-// meant an explicitly-requested model was silently dropped because the schema had
-// nowhere to put it. Everything else (negative_prompt, aspect, size, seconds, steps)
-// is a defaultable knob and still comes off every turn, discoverable via help.
-var TERSE_KEEP={model:1,image:1,images:1,voice:1};
+// like "flux*2", a source image to edit/animate, a named voice, an output SHAPE like
+// "make it a tall/portrait image"). `aspect` is kept because a hidden one made the
+// model conclude there was no way to control the ratio and give up — "long image"
+// requests silently came out square. Everything else (negative_prompt, size, seconds,
+// steps) is a defaultable knob and still comes off every turn, discoverable via help.
+var TERSE_KEEP={model:1,image:1,images:1,voice:1,aspect:1};
 // A call is "valid" (the model figured the tool out on its own) when every REAL
 // required arg is present — read from the untouched TOOL_DEFS, since a terse tool's
 // wire schema hides its params. A valid guess runs; an invalid one bounces the docs.

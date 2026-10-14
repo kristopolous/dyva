@@ -3738,8 +3738,13 @@ def _flatten_content(messages):
                 if isinstance(url, dict):
                     url = url.get("url") or ""
                 mt = _DATA_URL_RE.match(url) if isinstance(url, str) else None
+                _loc = None if (mt and mt.group(2)) else _inline_local_image(url)
                 if mt and mt.group(2):
                     images.append(mt.group(3))
+                elif _loc:
+                    # A local-store URL (sdapi/v1/images/…): read it and inline so the
+                    # vision model actually sees it, rather than losing it to a text note.
+                    images.append(_loc.split(",", 1)[1])
                 elif url:
                     # A remote image we can't inline: say it exists rather than
                     # dropping it silently.
@@ -5549,6 +5554,27 @@ def _oai_data_url(b64):
     return f"data:{mime};base64,{b64}"
 
 
+def _inline_local_image(url):
+    """A dyva image URL (…/sdapi/v1/images/NAME.png, relative or absolute) -> a base64
+    data: URL read from the local store. A host can't fetch OUR url (it's on us, not
+    reachable from the host) and strict OpenAI hosts (LM Studio) require base64 inline,
+    so a bare url in an image_url part 400s ("'url' field must be a base64 encoded
+    image"). Returns the data URL, or None if it isn't a local image we can read."""
+    if not isinstance(url, str):
+        return None
+    m = re.search(r"(?:^|/)sdapi/v1/images/([^/?#]+\.png)(?:[?#]|$)", url)
+    if not m:
+        return None
+    path = os.path.join(IMG_DIR, os.path.basename(m.group(1)))
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            return "data:image/png;base64," + base64.b64encode(f.read()).decode()
+    except OSError:
+        return None
+
+
 def _messages_openai(messages):
     """Reshape ollama-style tool history into what strict OpenAI hosts (e.g. LM
     Studio) require: assistant tool_calls need an `id`, `type:"function"`, and
@@ -5633,6 +5659,27 @@ def _messages_openai(messages):
                     parts.append({"type": "image_url", "image_url": {"url": _oai_data_url(b64)}})
             mm["content"] = parts if parts else ""
         out[i] = mm
+    # image_url parts whose url is NOT a data: URL won't work on a host — it can't fetch our
+    # relative/local URL, and a strict host requires base64 inline (400: "'url' field must be
+    # a base64 encoded image"). Inline a local store image; replace any other non-data url
+    # with a text note so the request still goes through instead of failing the whole host.
+    for i, m in enumerate(out):
+        if not (isinstance(m, dict) and isinstance(m.get("content"), list)):
+            continue
+        changed, newc = False, []
+        for part in m["content"]:
+            if isinstance(part, dict) and part.get("type") == "image_url":
+                iu = part.get("image_url")
+                url = iu.get("url") if isinstance(iu, dict) else (iu if isinstance(iu, str) else "")
+                if isinstance(url, str) and url and not url.startswith("data:"):
+                    inlined = _inline_local_image(url)
+                    newc.append({"type": "image_url", "image_url": {"url": inlined}} if inlined
+                                else {"type": "text", "text": f"[image not shown: {url[:120]}]"})
+                    changed = True
+                    continue
+            newc.append(part)
+        if changed:
+            out[i] = dict(m, content=newc)
     return out
 
 
@@ -16443,7 +16490,7 @@ def _edit_plan(info, model_filter=None, exclude=(), n_images=0, reasons=None):
         # the extras and render a confidently wrong picture, so a family that
         # can't hold them all isn't a candidate. Reference-style families chain
         # a ReferenceLatent per image and take any number.
-        if fam.get("style") == "encode" and n_images > len(fam.get("images") or []):
+        if fam.get("style") == "encode" and n_images > (fam.get("max_images") or len(fam.get("images") or [])):
             continue
         out_node = comfy_image_out(info)
         for need in ("KSampler", "VAEDecode", "LoadImage"):
@@ -16581,6 +16628,58 @@ def _edit_workflow(plan, prompt, image_names, params=None):
     if seed == -1:
         seed = random.randint(0, 2**31 - 1)
     sampler = params.get("sampler_name", "euler")
+
+    if fam.get("encode_unified"):
+        # Qwen-Image-2.1 and kin: a SINGLE encode node is the whole front end — it emits
+        # positive[0], negative[1] AND the latent[2] (reference images encoded at `resolution`,
+        # aspect preserved; zero references => text-to-image at that resolution). So there is NO
+        # second encode node and NO separate VAEEncode/EmptyLatent. Reference images go in flat
+        # image_1.. slots (the node's `images` input is a COMFY_AUTOGROW_V3 that names them
+        # image_1..image_16). Verified against a live host's /object_info and the official
+        # image_qwen_image_2_1_image_edit.json template (cached in dyva/comfy-templates/).
+        _res = int(params.get("resolution_px") or fam.get("resolution", 1024))
+        _res = max(0, min(4096, (_res // 32) * 32))      # node wants a multiple of 32 in [0,4096]
+        enc_in = {"clip": CLIP, "prompt": prompt,
+                  "negative_prompt": params.get("negative_prompt") or "",
+                  "resolution": _res, "vae": VAE}
+        enc_in.update(fam.get("encode_inputs") or {})
+        if img_nodes:
+            # The references feed the node's COMFY_AUTOGROW_V3 `images` input as a LIST of
+            # image links — NOT flat image_1/image_2 keys. Flat keys PASS submit-validation
+            # but blow up at execution ("TextEncodeQwenImage21.execute() got an unexpected
+            # keyword argument 'image_1'"), which looked like a host problem and poisoned the
+            # host's edit reputation. Verified live: a list of links renders. (image1/2/3 ->
+            # none -> t2i; up to 16 refs supported.)
+            enc_in["images"] = list(img_nodes)
+        g["200"] = {"class_type": plan["encode"], "inputs": enc_in}
+        # Output SHAPE. The node's own latent[2] follows the reference(s) — the right default
+        # for an edit (and why a square reference gave a square result). But an EXPLICIT aspect
+        # (long/tall/square), or no reference at all (t2i), needs a sized canvas: use an
+        # EmptySD3LatentImage at the requested width/height (16-channel, as the reference-style
+        # edit path does) and let the reference still guide the result through the encode's
+        # `images` conditioning. This is what makes "make it a long/portrait image" actually
+        # change the ratio instead of silently staying square.
+        _ms = params.get("match_source", True)
+        if isinstance(_ms, str):
+            _ms = _ms.lower() not in ("0", "false", "no", "")
+        if img_nodes and _ms and _asp not in VIDEO_ASPECTS:
+            LATENT = ["200", 2]
+        else:
+            g["500"] = {"class_type": "EmptySD3LatentImage",
+                        "inputs": {"width": width, "height": height, "batch_size": 1}}
+            LATENT = ["500", 0]
+        g["600"] = {"class_type": "KSampler", "inputs": {
+            "model": MODEL, "seed": seed, "steps": steps, "cfg": cfg,
+            "sampler_name": sampler, "scheduler": "simple",
+            "positive": ["200", 0], "negative": ["200", 1], "latent_image": LATENT,
+            "denoise": float(params.get("denoise", 1.0))}}
+        g["700"] = {"class_type": "VAEDecode", "inputs": {"samples": ["600", 0], "vae": VAE}}
+        out_node = plan.get("out") or "SaveImage"
+        g["800"] = ({"class_type": "PreviewImage", "inputs": {"images": ["700", 0]}}
+                    if out_node == "PreviewImage" else
+                    {"class_type": "SaveImage",
+                     "inputs": {"images": ["700", 0], "filename_prefix": "dyva/edit"}})
+        return g
 
     if fam.get("style") == "encode":
         slots = fam.get("images") or []
