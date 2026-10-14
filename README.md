@@ -41,20 +41,18 @@ The details:
 * By size like `qwen >10gb`
 * By release date like `qwen>2026`.
 
-They can be stacked so `qwen>2026>5gb` means the newer large qwens. [More details](https://github.com/kristopolous/free-ollama/tree/main/dyva#model-names-are-routing-patterns)
+They can be stacked so `qwen>2026>5gb` means the newer large qwens. [You can also slice by many other fields](https://github.com/kristopolous/free-ollama/tree/main/dyva#model-names-are-routing-patterns).
 
 ## Finding new hosts
-You can multi source host lists or bring your own. There's a separate survey tool called [graflex](graflex).
+You can multi-source host lists or bring your own. There's a separate survey tool called [graflex](graflex).
 
-That means [dyva](dyva) can sit on top of your own infrastructure as well. 
-
+That means [dyva](dyva) can sit on top of your own infrastructure as well as strangers from the Internet.
 
 
 There's also a [simple command line](freeollama.md).
 
 #### Notes
 
-* This project has been named to be hard to google and find online. If you're here, you found it for a reason.
 * Dyva's architecture draws a hard line at incurring any *additional* costs. Only unused time on idle machines.
 * The largest collection of hosts, done through the [graflex surveys](https://github.com/kristopolous/free-ollama/tree/main/graflex) are kept private because "don't be a dick" isn't an instruction everyone feels obligated to follow. You can reconstruct them with the tool. I'm happy to share it for legitimate research purposes. You can find me.
 * Other dyva servers get flagged and excluded from the survey so this will not just become a hall of mirrors. You can avoid getting picked up by other scanners in the wild by adding a `base_path`, this is configurable in settings on the dash. 
