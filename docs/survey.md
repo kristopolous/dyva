@@ -2,7 +2,7 @@
 
 This is an overview of some of the interesting survey results including new attack vectors hitherto undocumented (and how Dyva protects against them)
 
-## The wild venomous internet
+# The wild venomous internet
 
 Some of the surveys reveal hardware specs and it's mostly CPU, about 70%. This makes economical sense: A cheap VPS is about 1/70th the cost of a decent GPU but only about 1/7th the inference speed.
 
