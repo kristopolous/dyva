@@ -1,3 +1,5 @@
+<img width="736" height="514" alt="mystery" src="https://github.com/user-attachments/assets/5f3f1de7-6215-48ba-893e-c801f0e727da" />
+
 ## What's actually out there?
 
 Some of the surveys reveal hardware specs and it's mostly CPU, about 70%. This makes economical sense: A cheap VPS is about 1/70th the cost of a decent GPU but only about 1/7th the inference speed.
