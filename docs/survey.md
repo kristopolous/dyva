@@ -1,4 +1,4 @@
-<img width="736" height="514" alt="mystery" src="https://github.com/user-attachments/assets/5f3f1de7-6215-48ba-893e-c801f0e727da" />
+<img width="1280" height="704" alt="2026-10-14-01h41m04s_seed864719626_upscale the image  the hat should have the letters DYVA_1" src="https://github.com/user-attachments/assets/68f0a425-be23-4fba-9a6f-6cb86abf20b8" />
 
 ## What's actually out there?
 
