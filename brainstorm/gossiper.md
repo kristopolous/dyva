@@ -408,19 +408,38 @@ changes only two things: the load-bearing idea, and the transport.
   remaining attested pass). That is the escape hatch for a trusted-but-wrong honeypot, NOT
   re-contact; aging attested rows out is the other.
 
---- Status: SERVER BUILT (2026-10-13); client still gated ----------------------
+--- Status: SERVER + CLIENT BUILT (2026-10-13) ---------------------------------
 
   The SERVER is built and live-verified on real Apache: dyva/gossiper/gossiper.php (deploy
   as the subdir ~/www/dyva/gossiper/ -> 9ol.es/dyva/gossiper) + gossiper.py (portable twin).
   Schema `gossip(id PK AUTOINC, source, host, model, smoke, client_ts, src_ip, server_ts)`,
-  cursor = `id`. Deploy notes: a `gossiper/` SUBDIR with `.htaccess` = `DirectoryIndex
-  gossiper.php` (clean URL, no mod_rewrite needed) + FilesMatch denying *.sqlite*/.db/.py
-  (else the store is one GET away). GOTCHA: POST must use the TRAILING-SLASH url
-  (/dyva/gossiper/) — the no-slash form 301-redirects and the redirect drops the POST body.
-  The CLIENT (dyva POSTing smoke verdicts on /refresh) is the remaining piece, still gated:
+  cursor = `id`. The delta SELECT NOW RETURNS `src_ip` so the client can store the attester
+  (invalidation hatch); live round-trip confirmed. Deploy notes: a `gossiper/` SUBDIR with
+  `.htaccess` = `DirectoryIndex gossiper.php` (clean URL, no mod_rewrite needed) + FilesMatch
+  denying *.sqlite*/.db/.py (else the store is one GET away). GOTCHA: POST must use the
+  TRAILING-SLASH url (/dyva/gossiper/) — the no-slash form 301-redirects and the redirect
+  drops the POST body.
 
-  Unchanged trigger to actually wire the client: cold start with the graflex SOURCE removed —
-  if securing hosts then takes serious time, build it; else stays parked. "Getting
-  closer" on the DESIGN; the namespace-by-URL framing + leak dissolution is the step
-  forward. Everything in the CONVERGED DESIGN section still holds; this only reframes
-  the spine (namespace) and demotes the transport (NATS = reference backend).
+  The CLIENT is built (dyva/__init__.py, "GOSSIPER CLIENT" section; tests in
+  tests/test_gossiper_client.py, 16 green). It rides /refresh (handle_refresh ->
+  gossiper_sync, off the event loop, best-effort, gated by GOSSIPER_ENABLED):
+    * TABLES in host_status.db: `hosts_attested` (QUARANTINED peer rows: host, model,
+      verdict in pass|honeypot, attested_at, attester=src_ip, source=sha1(url)) and
+      `gossiper_state` (per-channel cursor: last_refresh_at + server_hwm).
+    * channel = sha1(source url). Hosts are grouped by their pool `source` tag, so a host
+      is only ever POSTed to ITS source's channel (the leak boundary, structural).
+    * OUTGOING = our smoke verdicts since last_refresh_at (honeypot = host-wide sentinel,
+      model=''; pass = smoke_date set & fail_smoke=0, per-model). INCOMING -> hosts_attested.
+    * RESOLUTION into the router is via the EXISTING loaders, NOT a literal host_resolved
+      view (dyva's find_servers reads good/maybe/bad/unreachable sets, richer than the
+      prototype's pass/honeypot grain): attested honeypot UNIONs into find_servers' host-wide
+      skip set (load_attested_honeypots -> treated exactly like a measured honeypot); attested
+      pass fills a blank (load_attested_pass -> lifts an UNKNOWN host to maybe_good, never
+      overriding our own good/maybe/bad). honeypot still wins host-wide above any pass.
+      resolution.sql + test_resolution.py remain the canonical proof of the resolution rules
+      and the bridge if find_servers' reputation model is ever unified onto one view.
+    * INVALIDATION = `DELETE FROM hosts_attested WHERE attester=?` (src_ip now carried end to
+      end). Aging attested rows out is the other escape hatch; neither re-contacts the host.
+
+  Everything in the CONVERGED DESIGN section still holds; this only reframed the spine
+  (namespace) and demoted the transport (NATS = reference backend, unused for v1).

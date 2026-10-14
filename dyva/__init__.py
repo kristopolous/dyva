@@ -18044,7 +18044,7 @@ def main():
     _url = f"http://{_disp_host}:{PORT}{BASE_PATH}"
     _iw = len(_url) + 6                                   # 3 spaces of padding each side
     _link = f"\x1b]8;;{_url}\x1b\\\x1b[1;96m{_url}\x1b[0m\x1b]8;;\x1b\\"   # bold bright-cyan + clickable
-    _pad = " " * 14                                       # fixed 14-space indent, not centered
+    _pad = " " * 13                                       # fixed 14-space indent, not centered
     _label = "DASHBOARD"
     _lp = (_iw - len(_label)) // 2                         # center the label within the box
     _dash = "│" + " " * _lp + "\x1b[1m" + _label + "\x1b[0m" + " " * (_iw - len(_label) - _lp) + "│"
