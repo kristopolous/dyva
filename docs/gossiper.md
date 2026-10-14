@@ -1,7 +1,5 @@
 <img width="1633" height="963" alt="70152" src="https://github.com/user-attachments/assets/18e7e398-6c74-4b35-a87d-034b9cc6cc65" />
 
-<img width="1633" height="963" alt="70152" src="https://github.com/user-attachments/assets/4056a3b0-205a-4340-9bd1-1921260419c7" />
-
 The gossiper is how independent dyva instances share **inference-time survey data** —
 primarily the smoke-test verdict of "is this a real inference endpoint, or a
 honeypot?" — without a central registry, without replication, and without widening
