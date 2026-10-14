@@ -1,25 +1,11 @@
 <img width="1633" height="963" alt="70152" src="https://github.com/user-attachments/assets/18e7e398-6c74-4b35-a87d-034b9cc6cc65" />
 
-**Gossiper** is how independent dyva instances share **inference-time survey data** —
-primarily the smoke-test verdict of "is this a real inference endpoint, or a
-honeypot?" — without a central registry, without replication, and without widening
-who can see a given host.
+**Gossiper** is how independent dyva instances share **inference-time survey data**.
 
-Graflex (the survey tool) already solves *discovery* distribution: its host lists are
-public artifacts a dyva pulls on `/refresh`. But dyva also learns things at inference
-time that graflex never captures — most importantly that a host answered with canned
-garbage or grabbed a bait tool, i.e. it's a honeypot. That knowledge is expensive to
-re-derive (you have to contact the host, and contacting a honeypot is the hazard) and
-is worth sharing. The gossiper is that two-way channel.
+This includes honeypot results.
 
-This document describes the protocol and the implementation. The design rationale that
-produced it lives in the git history of this file (it began as a brainstorm).
-
----
-
-## The load-bearing idea: `channel = hash(source url)`
-
-Every exchange happens on a **channel derived from a graflex source's URL**:
+## Source Scoped 
+Every exchange happens on a **channel derived from a graflex source's URL**. This maintains the privacy of the source.
 
 ```
 channel = sha1(source_url)
