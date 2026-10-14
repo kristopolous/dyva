@@ -2,6 +2,8 @@
 
 **free-ollama** was the first thing written in the dyva project. It introduced model query syntax, honeypot testing, proxying, priorities and multi-sourcing. It's all it was for the first three months.
 
+This is most of the original README.
+
 It outputs parsable host lists for easy shell scripting.
 
 It's still pretty useful although it's more of a machine shop than a car with wheels 
