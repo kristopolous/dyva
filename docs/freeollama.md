@@ -1,4 +1,8 @@
-## Artisanal Ollamas in Terminal Space
+<img width="1536" height="1024" alt="70153" src="https://github.com/user-attachments/assets/eecf2390-cfd8-4b62-90a9-b82973e02766" />
+
+**free-ollama** was the first thing written in the dyva project. It introduced model query syntax, testing, proxying, priorities and multi-sourcing. And it outputs things at parsable host lists for easy shell scripting.
+
+It's still pretty useful although it's more of a machine shop than a car with wheels 
 
 https://github.com/user-attachments/assets/b5b99780-2526-4ebc-ba23-2870d84a7516
 
