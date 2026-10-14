@@ -12,6 +12,9 @@ Each service has a separate query run on each service. These are in resumable se
 
 There's all inclusives for the services such as zoomeye or hunter. 
 
+The RSS peaks out about 150MB and averages around 100 so the 512MB VPS can handle it. You can also `mkswap` on them to avoid the OOM if you run into problems. Also, you may be able to run this "serverless" depending on whatever a providers definition of that magical word is. Report in on your progress.
+
+
 ## Disclaimer
 
 Graflex is a fast track to get you soft-blocked from places like Cloudflare and Huggingface. There's trap servers (jargoned as canaries) that will report your ip if you doorknock them and I haven't found a way of quarantining them yet. 
