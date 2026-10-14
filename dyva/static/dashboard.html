@@ -2653,7 +2653,10 @@ function hostDetailHtml(host,j){
   if(j.service)b.push('<span class="hd-badge">'+escHtml(j.service)+(j.version?' '+escHtml(j.version):'')+'</span>');
   // host-WIDE status markers (not models): surfaced as badges, not fake model rows
   if(j.host_flags&&j.host_flags.unreachable)b.push('<span class="hd-badge hd-badge-bad" title="dyva’s socket probe failed on the last '+(j.host_flags.unreachable.failure_streak||0)+' attempt(s) — host-wide; clears automatically on the next successful request">unreachable</span>');
-  if(j.host_flags&&j.host_flags.honeypot)b.push('<span class="hd-badge hd-badge-bad" title="Flagged host-wide as a honeypot (canned / fake responses)">honeypot</span>');
+  // honeypot host-wide = the explicit sentinel OR ANY model that returned a canned/fake reply
+  // (fail_smoke=1 is the older per-model recording of the same "this host is a honeypot" verdict).
+  var _anyCanned=(j.reputation||[]).some(function(r){return r.fail_smoke});
+  if((j.host_flags&&j.host_flags.honeypot)||_anyCanned)b.push('<span class="hd-badge hd-badge-bad" title="Honeypot — canned / fake responses (host-wide)">honeypot</span>');
   if(b.length)h.push('<div class="hd-badges">'+b.join('')+'</div>');
   function row(k,v){return v?('<div class="hd-row"><span class="hd-k">'+k+'</span><span class="hd-v">'+v+'</span></div>'):''}
   h.push(row('host','<a href="'+escHtml(href)+'" target="_blank" rel="noopener noreferrer">'+escHtml(url)+' ↗</a>'));
@@ -2680,13 +2683,14 @@ function hostDetailHtml(host,j){
     models.slice(0,50).forEach(function(m){
       var r=rep[m]||{};
       var name=escHtml(String(m).replace(/\\/g,'/').split('/').pop());
-      // smoke: smoke_date present => tested; fail_smoke=1 => canned/fake answer
+      // smoke: smoke_date present => tested; fail_smoke=1 => canned/fake answer, which IS a
+      // honeypot (the older per-model way the host-wide honeypot verdict was recorded).
       var rows=[
         ['state', r.state?escHtml(r.state):dim],
         ['ttft', (r.ttft!=null&&r.ttft!=='')?(escHtml(String(r.ttft))+'s'):dim],
         ['tps', (r.tps!=null&&r.tps!=='')?(escHtml(String(r.tps))+' t/s'):dim],
         ['used', usageEmoji(r.success||0,r.failure||0,r.race_won||0,r.race_lost||0)||dim],
-        ['smoke', r.smoke_date?(r.fail_smoke?'canned':'passed'):'<span class="hd-dim">untested</span>'],
+        ['smoke', r.smoke_date?(r.fail_smoke?'<span class="hd-badge-bad" title="canned / fake reply — a honeypot">honeypot</span>':'passed'):'<span class="hd-dim">untested</span>'],
         ['caps', r.caps?escHtml(String(r.caps).split(',').join(' · ')):dim]
       ];
       var trs=rows.map(function(kv){return '<tr><td class="hd-kv-k">'+kv[0]+'</td><td>'+kv[1]+'</td></tr>'}).join('');
@@ -3245,11 +3249,11 @@ function renderHostListFor(){
       +'<tr><td>Good</td><td>'+cell(st.good)+'</td></tr>'
       +'<tr><td>Bad</td><td>'+cell(st.bad)+'</td></tr>'
       +'</table></div><div><table>'
-      +'<tr><td>Failed smoke</td><td>'+cell(st.fail_smoke)+'</td></tr>'
+      +'<tr><td>Failed smoke</td><td>'+cell(st.fail_smoke)+(st.attested?' <span class="stat-pct" title="via gossiper sync from a peer">'+fmtCount(st.attested)+' synced</span>':'')+'</td></tr>'
       +'<tr><td>Untested</td><td>'+cell(st.unknown)+'</td></tr>'
       +'</table></div></div>';
     list.innerHTML='';
-    hosts.forEach(function(o){var h=o.host;var d=document.createElement('div');d.className='model-item'+(o.reachable===false?' host-unreachable':'')+(o.fail_smoke?' host-smoke-fail':'');d.style.cursor='pointer';d.title=(o.fail_smoke?'failed smoke test (honeypot/garbage) — ':o.reachable===false?'unreachable (dead socket) — ':'')+'host details';var n=document.createElement('span');n.className='host-name';n.textContent=h;d.appendChild(n);var ago=checkedAgo(o.checked);if(ago){var t=document.createElement('span');t.className='host-checked';t.textContent=ago;t.title=o.checked;d.appendChild(t)}d.addEventListener('click',function(){if(_selHostRow===d){closeHostDetailCard();return}selectHostRow(d);openHostDetail(h)});list.appendChild(d)});
+    hosts.forEach(function(o){var h=o.host;var d=document.createElement('div');d.className='model-item'+(o.reachable===false?' host-unreachable':'')+(o.fail_smoke?' host-smoke-fail':'');d.style.cursor='pointer';d.title=(o.attested?'honeypot/canned — via gossiper sync (a peer characterized it) — ':o.fail_smoke?'failed smoke test (honeypot/garbage) — ':o.reachable===false?'unreachable (dead socket) — ':'')+'host details';var n=document.createElement('span');n.className='host-name';n.textContent=h;d.appendChild(n);if(o.attested){var sy=document.createElement('span');sy.className='host-checked';sy.textContent='synced';sy.title='honeypot/canned verdict pulled from a peer (gossiper), not measured locally';d.appendChild(sy)}var ago=checkedAgo(o.checked);if(ago){var t=document.createElement('span');t.className='host-checked';t.textContent=ago;t.title=o.checked;d.appendChild(t)}d.addEventListener('click',function(){if(_selHostRow===d){closeHostDetailCard();return}selectHostRow(d);openHostDetail(h)});list.appendChild(d)});
   }).catch(function(){if(_currentModel===model)list.innerHTML='<div style="color:var(--err);font-size:var(--fs-md)">failed to load hosts</div>'});
 }
 // Host-card model-query search: re-run the host list (and the stats, which update together) for

@@ -428,8 +428,19 @@ changes only two things: the load-bearing idea, and the transport.
       `gossiper_state` (per-channel cursor: last_refresh_at + server_hwm).
     * channel = sha1(source url). Hosts are grouped by their pool `source` tag, so a host
       is only ever POSTed to ITS source's channel (the leak boundary, structural).
-    * OUTGOING = our smoke verdicts since last_refresh_at (honeypot = host-wide sentinel,
-      model=''; pass = smoke_date set & fail_smoke=0, per-model). INCOMING -> hosts_attested.
+    * OUTGOING = our smoke verdicts since last_refresh_at. HONEYPOT (host-wide, model='') =
+      the HONEYPOT_KEY sentinel OR ANY `fail_smoke=1` ("smoked:canned") row — a canned/fake
+      reply IS a form of honeypot (the older, per-model way the same "unsafe, don't go back"
+      verdict was recorded before the sentinel existed; kristopolous 2026-10-14), so it's
+      shared + inherited identically, NOT re-verified (contact is the hazard). PASS (per-model)
+      = smoke_date set & fail_smoke=0 AND the host is not unsafe (a canned host is never
+      advertised good even for a model that looked fine). First wiring shared only the 4
+      sentinels; folding in fail_smoke=1 took that to ~1500 honeypot hosts. INCOMING ->
+      hosts_attested.
+    * VISIBILITY: the host-card per-model breakdown (handle ...host_model...) surfaces a peer's
+      honeypot verdict — a host we never measured shows as failed-smoke "synced" (state bad +
+      attested flag) instead of "untested", so a synced verdict is actually visible. host_status
+      is still never written (quarantine); the count carries an `attested` provenance field.
     * RESOLUTION into the router is via the EXISTING loaders, NOT a literal host_resolved
       view (dyva's find_servers reads good/maybe/bad/unreachable sets, richer than the
       prototype's pass/honeypot grain): attested honeypot UNIONs into find_servers' host-wide

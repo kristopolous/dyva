@@ -426,7 +426,11 @@ SERVICE_CONFIG = {
     },
     "ollama": {
         "port": 11434,
-        "fofa_query": ['app="ollama"', 'body="ollama is running"'],
+        # Was ['app="ollama"', 'body="ollama is running"']; the two are the SAME query — 82.8%
+        # Jaccard, >90% each way, per-country result pages byte-identical bar paginated-tail
+        # jitter (20261008 snapshot). The second doubled the FOFA sweep for a ~10% timing-noise
+        # tail, so dropped. app="ollama" is the slightly larger of the two.
+        "fofa_query": 'app="ollama"',
         "shodan_query": '"ollama is running"',
         "zoomeye_query": 'app="ollama"',
         "censys_query": '"ollama is running"',

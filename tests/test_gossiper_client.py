@@ -86,12 +86,28 @@ def test_outgoing_excludes_hosts_outside_the_source_set(db):
     assert {h for h, _m, _v, _ts in out} == {"http://a:11434"}
 
 
-def test_outgoing_skips_failed_smoke(db):
+def _measure_canned(host, model="m", ts="2026-10-13T10:00:00Z"):
+    # fail_smoke=1 "smoked:canned" — a form of honeypot (older per-model recording)
     dyva._get_db().execute(
         "INSERT INTO host_status(host,model,state,smoke_date,fail_smoke,updated_at) "
-        "VALUES(?,?,?,?,1,?)", ("http://c:11434", "m", "bad", "t", "t"))
+        "VALUES(?,?,?,?,1,?)", (host, model, "bad", ts, ts))
     dyva._get_db().commit()
-    assert dyva._gossiper_outgoing({"http://c:11434"}, None) == []
+
+
+def test_outgoing_emits_canned_as_hostwide_honeypot(db):
+    # a canned reply IS a honeypot: shared host-wide, not skipped (user: "it's a form of honeypot")
+    _measure_canned("http://c:11434", "llama3:latest")
+    out = dyva._gossiper_outgoing({"http://c:11434"}, None)
+    assert {(h, m, v) for h, m, v, _ts in out} == {("http://c:11434", "", "honeypot")}
+
+
+def test_outgoing_canned_host_is_never_advertised_pass(db):
+    # same host: one model answered straight, another was canned -> the host is unsafe,
+    # so it is a honeypot host-wide and NO pass row escapes for it.
+    _measure_pass("http://x:11434", "good-model")
+    _measure_canned("http://x:11434", "bad-model")
+    out = dyva._gossiper_outgoing({"http://x:11434"}, None)
+    assert {(h, m, v) for h, m, v, _ts in out} == {("http://x:11434", "", "honeypot")}
 
 
 def test_outgoing_window_excludes_rows_at_or_before_since(db):

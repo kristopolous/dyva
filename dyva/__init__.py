@@ -2907,29 +2907,45 @@ def load_attested_pass():
 
 def _gossiper_outgoing(host_set, since_iso):
     """Our local smoke verdicts for hosts in `host_set`, as (host, model, verdict, ts)
-    rows to POST. honeypot -> (host, '', 'honeypot', ts) host-wide; pass -> per-model.
-    `since_iso` bounds the window to rows written after the last sync (None = send all,
-    the cold-start snapshot). ts = the row's own freshness (updated_at, falling back)."""
+    rows to POST.
+
+    A host is a HONEYPOT (host-wide, model='') if it carries the honeypot sentinel OR
+    ANY fail_smoke=1 ("smoked:canned") row: a canned/fake reply IS a form of honeypot —
+    the older, per-model way the same "unsafe endpoint, don't go back" verdict was
+    recorded before the host-wide sentinel — so it's shared and inherited identically
+    (trusted skip, never re-contacted). A host is a PASS (per-model) only if it answered
+    the smoke probe straight (fail_smoke=0, smoke_date set) AND is not a honeypot — an
+    unsafe host is never advertised good even if some other model on it looked fine.
+
+    `since_iso` windows to rows written after the last sync (None = full cold-start
+    snapshot). ts = the row's own freshness (updated_at, falling back)."""
     db = _get_db()
-    out = []
     win = " AND updated_at > ?" if since_iso else ""
-    # honeypots: the host-wide sentinel row (state='bad', model=HONEYPOT_KEY)
+    # Every unsafe host (sentinel OR any canned row), UNWINDOWED — used to EXCLUDE these
+    # from the pass set regardless of when they were flagged (a host canned last week must
+    # never be advertised good this week because one model's row changed).
+    all_unsafe = {h for (h,) in db.execute(
+        f"SELECT DISTINCT host FROM host_status "
+        f"WHERE ((model=? AND state='bad') OR fail_smoke=1) AND {_LIVE_REAL}",
+        (HONEYPOT_KEY,)).fetchall()}
+    # Honeypots to SEND this sync: the unsafe hosts touched inside the window (freshest ts).
+    hp = {}
     rows = db.execute(
-        f"SELECT DISTINCT host, COALESCE(updated_at, last_fail, smoke_date) FROM host_status "
-        f"WHERE model=? AND state='bad' AND {_LIVE_REAL}{win}",
+        f"SELECT host, COALESCE(updated_at, last_fail, smoke_date) FROM host_status "
+        f"WHERE ((model=? AND state='bad') OR fail_smoke=1) AND {_LIVE_REAL}{win}",
         ((HONEYPOT_KEY, since_iso) if since_iso else (HONEYPOT_KEY,))).fetchall()
     for h, ts in rows:
-        if h in host_set:
-            out.append((h, "", "honeypot", ts or _now_iso()))
-    # passes: answered the canned smoke probe straight (smoke_date set, fail_smoke=0),
-    # excluding the sentinel pseudo-models.
+        if h in host_set and (h not in hp or (ts or "") > (hp[h] or "")):
+            hp[h] = ts or _now_iso()
+    out = [(h, "", "honeypot", ts) for h, ts in hp.items()]
+    # passes: straight answer, excluding ANY unsafe host.
     rows = db.execute(
         f"SELECT host, model, COALESCE(updated_at, smoke_date) FROM host_status "
         f"WHERE smoke_date IS NOT NULL AND fail_smoke=0 AND model NOT IN (?,?) AND {_LIVE_REAL}{win}",
         ((UNREACHABLE_KEY, HONEYPOT_KEY, since_iso) if since_iso
          else (UNREACHABLE_KEY, HONEYPOT_KEY))).fetchall()
     for h, m, ts in rows:
-        if h in host_set:
+        if h in host_set and h not in all_unsafe:
             out.append((h, m, "pass", ts or _now_iso()))
     return out
 
@@ -9205,19 +9221,32 @@ async def handle_model_hosts(request):
             if fs:
                 smoke_fail.add(h)
     unreachable = load_unreachable()   # host-wide dead-socket marks (UNREACHABLE_KEY)
-    hosts = [{"host": srv, "checked": s.get("checked"),
-              "state": states.get(srv, "unknown"),
-              "reachable": srv not in unreachable,
-              "fail_smoke": srv in smoke_fail}
-             for srv, s in srv_models.items()]
+    # Gossiper: a PEER's honeypot verdict (incl. folded "smoked:canned") makes a host we
+    # haven't measured show as failed-smoke-VIA-SYNC rather than untested — the whole point
+    # of syncing it. `attested` keeps the provenance visible; host_status is never written.
+    attested_hp = load_attested_honeypots()
+    hosts = []
+    for srv, s in srv_models.items():
+        st = states.get(srv, "unknown")
+        fs = srv in smoke_fail
+        att = srv in attested_hp
+        if att:
+            fs = True                       # a peer smoked it: honeypot/canned
+            if st == "unknown":
+                st = "bad"                  # not "untested" anymore — a peer characterized it
+        hosts.append({"host": srv, "checked": s.get("checked"), "state": st,
+                      "reachable": srv not in unreachable, "fail_smoke": fs,
+                      "attested": att})
     # Model-level aggregate for the host card's stats strip: counts across the matching hosts
-    # (the displayed list). untested = hosts with no reputation row for a matching model.
+    # (the displayed list). untested = hosts with no reputation row (ours OR a peer's).
     stats = {"total": len(hosts), "good": 0, "bad": 0, "maybe_good": 0,
-             "unknown": 0, "fail_smoke": 0}
+             "unknown": 0, "fail_smoke": 0, "attested": 0}
     for hobj in hosts:
         stats[hobj["state"]] = stats.get(hobj["state"], 0) + 1
         if hobj["fail_smoke"]:
             stats["fail_smoke"] += 1
+        if hobj["attested"]:
+            stats["attested"] += 1
     return web.json_response({"model": q, "hosts": hosts, "stats": stats})
 
 
