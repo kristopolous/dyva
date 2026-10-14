@@ -1,6 +1,6 @@
 <img  alt="7d489945-b1d0-40db-b2d1-9c036a48409e" src="https://github.com/user-attachments/assets/5aacfffc-a4a9-4252-9818-bb0a6905439d" />
 
-**free-ollama** was the first thing written in the dyva project. It introduced model query syntax, honeypot testing, proxying, priorities and multi-sourcing. 
+**free-ollama** was the first thing written in the dyva project. It introduced model query syntax, honeypot testing, proxying, priorities and multi-sourcing. It's all it was for the first three months.
 
 It outputs parsable host lists for easy shell scripting.
 
