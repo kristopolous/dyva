@@ -49,7 +49,7 @@ You can multi-source host lists or bring your own. There's a separate survey too
 That means [dyva](dyva) can sit on top of your own infrastructure as well as strangers from the Internet.
 
 
-There's also a [simple command line](freeollama.md).
+There's also a [simple command line](docs/freeollama.md).
 
 #### Notes
 
