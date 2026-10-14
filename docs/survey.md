@@ -1,5 +1,7 @@
 <img width="1280" height="704" alt="2026-10-14-01h41m04s_seed864719626_upscale the image  the hat should have the letters DYVA_1" src="https://github.com/user-attachments/assets/68f0a425-be23-4fba-9a6f-6cb86abf20b8" />
 
+This is an overview of some of the interviewing survey results including new attack vectors hitherto undocumented (and how Dyva protects against them)
+
 ## What's actually out there?
 
 Some of the surveys reveal hardware specs and it's mostly CPU, about 70%. This makes economical sense: A cheap VPS is about 1/70th the cost of a decent GPU but only about 1/7th the inference speed.
