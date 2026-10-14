@@ -1,4 +1,4 @@
-<img width="1536" height="1024" alt="70153" src="https://github.com/user-attachments/assets/eecf2390-cfd8-4b62-90a9-b82973e02766" />
+<img width="1248" height="832" alt="70155" src="https://github.com/user-attachments/assets/6e745b6a-0994-48d7-b856-32e91909b411" />
 
 **free-ollama** was the first thing written in the dyva project. It introduced model query syntax, testing, proxying, priorities and multi-sourcing. 
 
