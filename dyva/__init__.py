@@ -2363,7 +2363,23 @@ def refresh_cache(source=None, cleanse=True):
         # data from the map's "Locate hosts" button instead, which is discoverable
         # right where the empty map is and runs off the event loop.
         if have:
-            _geoip.enrich_records(records)
+            # Hostname-based hosts (not raw IPs — ~1/5 of the pool, almost all from the
+            # non-graflex feeds) can't be geo-located without first DNS-resolving the
+            # name to an IP. enrich_records does that only with resolve=True, and inline
+            # it is SERIAL — a handful of dead names (2s timeout each) would drag out
+            # every refresh. So warm the resolver cache CONCURRENTLY first (~20s for
+            # ~1.8k names vs minutes serial; cached in-process so later refreshes are
+            # free), then enrich with resolve=True so each name is a cache hit.
+            try:
+                _names = {src for _r in records if isinstance(_r, dict)
+                          for src in (_geoip._host_field(_r),) if src}
+                if _names:
+                    from concurrent.futures import ThreadPoolExecutor as _TPE
+                    with _TPE(max_workers=64) as _ex:
+                        list(_ex.map(lambda s: _geoip.ip_from_server(s, resolve=True), _names))
+            except Exception as _re:
+                log.debug(f"hostname pre-resolve skipped ({_re})")
+            _geoip.enrich_records(records, resolve=True)
     except Exception as _e:
         # Loud, not debug: a silent failure here is exactly how you end up staring at
         # an empty map with no idea it was ever meant to have data.
@@ -2381,6 +2397,29 @@ def refresh_cache(source=None, cleanse=True):
             log.info(f"cleanse: expunged {len(expunged)} fake model entries (" +
                      ", ".join(f"{k}={v}" for k, v in by.most_common()) +
                      f") -> {CLEANSED_FILE}")
+
+    # First-seen stamp: graflex rows carry a `checked` survey date, but the non-graflex
+    # feeds (forrany / happyshua / spider, and any raw config source) ship hosts with NO
+    # date at all — so the first time such a host appears we have no record of when. Stamp
+    # a `first_seen` the FIRST time a host lands in the cache and PRESERVE it across
+    # refreshes (refresh_cache rebuilds `records` fresh from the source tmp files every
+    # run, so without carrying it forward from the previous cache it would reset each
+    # time). Date granularity; keyed by `server`. On the first run after this ships every
+    # host gets today's date as the sentinel floor (we can't know when we truly first saw
+    # the ones already in the pool); from then on it is the real arrival date per host.
+    _today = _now_iso()[:10]
+    _prev_first = {}
+    try:
+        if os.path.exists(_db):
+            with open(_db, encoding="utf-8", errors="replace") as _pf:
+                for _old in json.load(_pf):
+                    if isinstance(_old, dict) and _old.get("first_seen") and _old.get("server"):
+                        _prev_first[_old["server"]] = _old["first_seen"]
+    except Exception as _fe:
+        log.debug(f"first_seen carry-forward skipped ({_fe})")
+    for _r in records:
+        if isinstance(_r, dict) and _r.get("server"):
+            _r["first_seen"] = _prev_first.get(_r["server"]) or _r.get("first_seen") or _today
 
     # Atomic write: a raw open(_db,'w') truncates the LIVE file and streams the
     # dump straight into it, so a concurrent refresh (or a reader mid-write) sees
@@ -2597,6 +2636,16 @@ def _get_db():
                      # size-conditional idea as ctx_limit; cleared when the host later ingests that
                      # big (relaunched with a larger -ub). NULL = unknown.
                      "batch_limit INTEGER",
+                     # Empty-'length' tally: a (host,model) that returned done_reason
+                     # 'length' with ~no output (a 0-char "hit the context window"). It's
+                     # NOT a real overflow — we fail over to a fresh host (see _send_chat).
+                     # Purely OBSERVATIONAL for now: a running count + last-seen timestamp
+                     # so a pattern ("this host does it every time") is visible in the DB
+                     # instead of only scrolling past in the activity feed. It does NOT
+                     # affect routing and is NOT a reputation mark (same soft, additive,
+                     # reversible idiom as ctx_limit). NULL/0 = never seen.
+                     "empty_length_count INTEGER NOT NULL DEFAULT 0",
+                     "empty_length_at TEXT",
                      # User VOTE (👍/👎): a signed, reputation-ORTHOGONAL preference that
                      # orders this (host,model) WITHIN its tier — it NEVER moves the tier.
                      # +1 = 👍 (sort to the front), -1 = 👎 (sort to the back, next request
@@ -3405,6 +3454,26 @@ def mark_ctx_limit(host, model, n_ctx):
         db.commit()
     except Exception as e:
         log.debug(f"mark_ctx_limit failed: {e}")
+
+
+def mark_empty_length(host, model):
+    """Tally a 0-char done_reason='length' drop for (host, resolved-model): bump the
+    count and stamp the time. Observational only — no reputation mark, no routing
+    effect; upserts a neutral 'unknown' row if none exists (same idiom as mark_ctx_limit)
+    so a host with no reputation row is still counted. Lets `SELECT host, model,
+    empty_length_count, empty_length_at FROM host_status WHERE empty_length_count>0
+    ORDER BY empty_length_count DESC` surface whether it clusters on certain hosts."""
+    try:
+        db = _get_db()
+        db.execute(
+            "INSERT INTO host_status(host,model,state,empty_length_count,empty_length_at)"
+            " VALUES(?,?, 'unknown', 1, ?)"
+            " ON CONFLICT(host,model) DO UPDATE SET"
+            " empty_length_count=empty_length_count+1, empty_length_at=excluded.empty_length_at",
+            (host, model, _now_iso()))
+        db.commit()
+    except Exception as e:
+        log.debug(f"mark_empty_length failed: {e}")
 
 
 def clear_ctx_limit(host, model, ingested):
@@ -6225,6 +6294,24 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
     # operator may have reloaded bigger), just after everything that might fit. An unknown
     # ceiling is optimistic (treated as fits), same as how unknown model size is kept.
     _pt = _estimate_prompt_tokens(payload) if payload else 0
+    # A host's ctx_limit is a HARD wall on input + output, so the fit check must use the
+    # window the request will actually consume — NOT the bare prompt. Two things the raw
+    # _pt misses, each of which let a guaranteed-400 host be raced every request:
+    #  - the output budget: a prompt of 49153 fits under a 65536 ceiling, but with 16384
+    #    requested output tokens the total is 65537 — one over — so the host 400s every
+    #    time while _pt (49153) says it fits.
+    #  - the tokenizer gap: our cl100k count undershoots the real Llama/Qwen tokenizer
+    #    (code / CJK / tool JSON), so a prompt the host counts at 70130 we estimate well
+    #    under the ceiling and race into an "exceed context" 400.
+    # Mirror _auto_num_ctx's sizing (padded prompt + reply reserve), but let the reserve
+    # grow to the output the client actually asked for.
+    _reply = NUM_CTX_REPLY
+    if payload:
+        _opts = payload.get("options") or {}
+        for _o in (_opts.get("num_predict"), payload.get("max_tokens")):
+            if isinstance(_o, int) and _o > 0:
+                _reply = max(_reply, _o)
+    _need = int(_pt * NUM_CTX_PAD) + _reply if _pt else 0
     _ctx = _load_ctx_limits() if _pt else {}
     def _fits(host, m):
         # Try the raw listed name AND its canon form: ctx_limit is stored keyed by the RESOLVED
@@ -6233,7 +6320,7 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
         lim = _ctx.get((host, m))
         if lim is None:
             lim = _ctx.get((host, canon_pattern(m)))
-        return lim is None or lim >= _pt
+        return lim is None or lim >= _need
     if _ctx:
         # HARD ceiling: a (host,model) whose recorded ctx_limit is below this prompt physically
         # CANNOT serve it (the window is fixed), so don't race it to a guaranteed "won't fit" 400
@@ -7418,6 +7505,7 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
             await broadcast_activity(host, full, "warming",
                 f"hit the context window at {made} chars (no output) on {host} — "
                 f"failing over to a fresh host", wid=job_wid)
+            mark_empty_length(host, full)   # observational tally — see the column note
             dead.add(host)
         else:  # 'length' with real streamed text
             await broadcast_activity(host, full, "trying",
