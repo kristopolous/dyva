@@ -3,7 +3,8 @@
 Working notes for features that are **designed or half-built but not finished**. Each
 file is a thinking-out-loud document, not a spec or a commitment; several record
 decisions that were later revised in place, so trust the newest line in a file over
-an older one. This README is a survey of what's here and where each idea stands.
+an older one. This directory holds only what's still **outstanding** — things that
+shipped have graduated out of here (into the code and `docs/`).
 
 ## Status at a glance
 
@@ -12,14 +13,25 @@ an older one. This README is a survey of what's here and where each idea stands.
 | [honeypot-detection.txt](honeypot-detection.txt) | Signal A **built**, Signal B parked | detect cloned-honeypot hosts (fingerprint + behavioural) |
 | [honeypot-score.md](honeypot-score.md) | flag **built**, scoring **designed** | escalate honeypot evidence to a whole-machine flag |
 | [canary-detection.md](canary-detection.md) | idea (data-collection only) | find hosts whose connect trips a Cloudflare soft-ban |
-| [gossiper.md](gossiper.md) | **parked** (`-c/--config` done) | dyva↔dyva sync of fresh good-host status |
 | [graflex-sample.md](graflex-sample.md) | planned, **lower priority** | a publishable rotating "sample platter" of hosts |
-| [query-syntax.md](query-syntax.md) | notes | a `;facet` filter grammar unifying the query languages |
-| [host-crossref.md](host-crossref.md) | **built** (`crossref.py`) | find new sources by reverse-looking-up our hosts / honeypot names on GitHub |
 
-Status legend: **built** = in the code now · **designed** = written down, ready to
-build, not built · **parked** = deliberately on hold with a named trigger to revisit
-· **idea** = early thinking, explicitly not being built.
+Status legend: **designed** = written down, ready to build, not built · **parked** =
+deliberately on hold with a named trigger to revisit · **idea** = early thinking,
+explicitly not being built. (Anything that reached **built** has left this directory.)
+
+### Shipped since this index last tracked them
+- **Gossiper** — dyva↔dyva sync of smoke-test verdicts — is built (server + client +
+  batched sync). It lives in the code and in [docs/gossiper.md](../docs/gossiper.md).
+- **Query syntax** — the model-name grammar and the `;`-facet filter language
+  (metric + `key=value` on `host_status`: `;tps>10`, `;state=good`, `;ttft<0.5`) are
+  in `find_servers` and documented in `dyva/README.md`. One remnant is still unbuilt:
+  **enrichment facets in the routing query** — `;country=JP`, `;provider=aws`,
+  `;service=ollama`. Those fields live on the pool record, not `host_status`, so the
+  facet compiler doesn't know them; today they only filter in the map/compare view and
+  via the cloudskipper. Also open from the original north-star: negation
+  (`;country!=JP`), relative durations (`;fresh<7d`), and a `;has=vision` caps facet.
+- **Host cross-reference** — hunting new survey sources by reverse-looking-up our own
+  hosts / honeypot-signature model names on GitHub — is built as `tools/crossref.py`.
 
 ---
 
@@ -72,29 +84,12 @@ canaries are known, the sink is the existing cloudskipper (drop them before conn
 
 ## Theme 2 — distribution & sync (the hard part: sharing without exposing)
 
-dyva's value is inference-time survey data (smoke/honeypot/reputation), which is
-genuinely useful to share — but sharing host data is exactly what could make the
-project loud. These two notes are the careful ways to share *something* without
-shipping the whole host list.
-
 > **Priority note (from the operator):** the sample platter is currently **lower
 > priority**. The project stays in the clear precisely *because it does not distribute
 > hosts* today — that restraint is load-bearing, not an oversight. So anything that
-> publishes hosts (the sample, the gossiper's public instance) is a deliberate,
-> not-yet-needed step, weighed against that posture.
-
-### [gossiper.md](gossiper.md) — parked (`-c/--config` shipped)
-dyva↔dyva sync of *fresh good-host status* so a cold instance doesn't re-pay discovery
-cost. The converged design is deliberately dumb and safe: **pull-on-demand positive
-leads** (`GET /realtime?source=&model=`), **debounced-on-success push** (at most once
-per `(host,model)` per window, positive-only — never push failures), a **most-recent-N
-recency stack** with no TTL (freshness is implicit = N/push-rate), and the **receiver
-owns judgment** (only fills blanks in its own DB, never overwrites what it measured).
-Safe because it shares positives only — a wrong positive self-corrects on your own
-retry; negatives (the poisonable, sticky kind) are never shared. **Parked** because
-hosts are secured within seconds today, so the cold-start pain it solves isn't real;
-trigger to revisit is measuring a cold start with the graflex source removed. The
-`-c/--config` split (run a second instance alongside the default) **shipped**.
+> publishes hosts (the sample platter) is a deliberate, not-yet-needed step, weighed
+> against that posture. (The gossiper, which shares *verdicts* not host lists, shipped —
+> see [docs/gossiper.md](../docs/gossiper.md).)
 
 ### [graflex-sample.md](graflex-sample.md) — planned, lower priority
 A `graflex sample` subcommand that draws a small **stratified, rotating** subset
@@ -104,39 +99,4 @@ so someone can clone the demos and get generation working **without** shipping t
 thousands of hosts and **without** a curated winners list (which would concentrate load
 and accelerate discovery of those machines). Destroys nothing (read-only inputs, one
 new output, not committed to git); re-running rotates exposure. Consumed by dyva via a
-pluggable `--pool <path|url>` — the same slot a gossiper URL would later drop into.
-
----
-
-## Theme 3 — query / UX
-
-### [query-syntax.md](query-syntax.md) — notes
-Where the query grammar could go. Two grammars already exist: the **model-name token**
-in routing (glob, `$` anchor, `>`/`<` size & date predicates, `,` fallback, `/`
-capability) and the **`;`-prefixed meta-tokens** in the map view (`;live`, `;cloud`,
-`;ollama`, `;aws`…). The direction is to make `;facet` a general filter language with
-three shapes — boolean (`;live`), key=value (`;country=JP`), and metric comparison
-(`;TPS>10`) — usable in routing *and* the dashboard. North-star:
-`;country=JP;TPS>10;qwen>2026-02>4gb`. Smallest first step: add key=value + metric
-facets to the existing `;` parser and let `;country=`/`;TPS>` post-filter in
-`find_servers`, mirroring how size/date already do. Keep it forgiving, not a strict DSL.
-
----
-
-## Theme 4 — source discovery
-
-### [host-crossref.md](host-crossref.md) — built (`crossref.py`)
-As the known survey sources dwindle, hunt for new ones by turning our own data into
-bait and searching public code (GitHub via `gh search code`). Two orthogonal
-techniques: (1) our **longest-lived good hosts** searched as `ip:port` — longevity is a
-proxy for "notorious enough that others catalogued it too"; and (2) **honeypot-signature
-model names** (`verif_sys:latest`, `ops-verify:latest`) that pepper the scans and are
-near-zero-noise on the open web, so any file containing one is almost certainly a scan
-dump. Both cluster by repo and rank candidate **new sources** by how many probes each
-matches. Reads `host_status` read-only; rate-limit aware with exponential backoff (no
-429s). See the note for the selection query and design.
-
-## Ideas floated, not yet written up
-
-_(none right now — the host cross-reference idea graduated to
-[host-crossref.md](host-crossref.md) / `crossref.py`.)_
+pluggable `--pool <path|url>` — the same slot the gossiper URL drops into.

@@ -718,8 +718,10 @@ var pictionary = {
       // Round lost: tell the guesser the outcome, plainly, and let it respond. NO prompt
       // to be clever or a good sport — it's an earnest player being told it missed, and
       // that it answers earnestly at all is the whole charm. Keep its in-character role.
-      return { player: 1, think: false, messages: [
-        {role:'system', content:'You are the guesser in a game of Pictionary.'},
+      // give it real room so the reaction isn't cut off mid-sentence — dyva sizes num_ctx
+      // from the (tiny) prompt, so without this a longer reply gets truncated.
+      return { player: 1, think: false, options: { num_ctx: 2048, num_predict: 256 }, max_tokens: 512, messages: [
+        {role:'system', content:'You are the guesser in a game of Pictionary. Keep it to a sentence or two.'},
         {role:'user', content:'The round is over — you did not get it. The answer was “'
           + st.secret.full + '”. Too bad!'}
       ]};
@@ -734,7 +736,9 @@ var pictionary = {
           + 'are on the SAME team and you WANT them to get it. The secret is a SUBJECT doing an ACTIVITY. '
           + 'OBJECT (what to draw): "' + st.secret.thing + '". ACTIVITY (what it is doing): "' + st.secret.activity
           + '". So draw "' + st.secret.full + '". The guesser does NOT know it — do NOT write any of those words '
-          + '(or letters spelling them) in the image. Reply with ONE complete, self-contained <svg> element and '
+          + '(or letters spelling them) in the image. If you include ANY text or labels at all, add them LAST — as '
+          + 'the final elements just before </svg> — because an <svg> paints in order and later shapes cover earlier '
+          + 'ones, so a label placed early gets drawn over. Reply with ONE complete, self-contained <svg> element and '
           + 'NOTHING else — no explanation, no reasoning, no markdown fence, no code block. Begin your reply with '
           + '"<svg" immediately (viewBox; no external images/scripts/fonts) so the drawing streams as you make it. '
           + 'If asked to draw ONLY the object or ONLY the activity, draw just that part.'},
@@ -805,9 +809,13 @@ var pictionary = {
   apply: async function(st, text, player, res){
     st.turns++;
     if(st.phase === 'react'){                            // the guesser's reply to the "too bad" reveal
-      var reaction = String(text||'').replace(/\s+/g, ' ').trim().slice(0, 240);
-      if(reaction) pictionary._say(st, '🤷 ' + reaction, 'reactline');
-      return pictionary._endRound(st, st.endNote || 'round over');   // NOW the round actually ends
+      var reaction = String(text||'').replace(/\s+/g, ' ').trim();
+      if(reaction.length > 400) reaction = reaction.slice(0, 400).replace(/\s+\S*$/, '') + '…';   // trim at a WORD, never mid-word
+      if(reaction) pictionary._say(st, '🤷 ' + reaction, 'reactline');   // -> the reel
+      // ...and into the move log ("back and forth") so the reaction shows there too, not
+      // just on the board — the whole point is to SEE what it says to the reveal.
+      var endNote = (reaction ? '🤷 “' + reaction + '” — ' : '') + (st.endNote || 'round over');
+      return pictionary._endRound(st, endNote);           // NOW the round actually ends
     }
     if(st.turns > 40){ return pictionary._fail(st, 'stalled — it was ' + st.secret.full); }   // safety cap (budget also bounds a round)
     if(st.phase === 'judge'){                            // the impartial judge rates the pending guess

@@ -4643,10 +4643,11 @@ function loadChatById(id){
     afterLoadChat(String(id));
   });
 }
+function _lastModel(){ try{ return localStorage.getItem('dyva_last_model')||''; }catch(e){ return ''; } }
 function afterLoadChat(id){
   assetBackfill(currentChat);
   _applyChatTools();   // restore this chat's saved tool selection
-  document.getElementById('chatModel').value=currentChat.model||'*';
+  document.getElementById('chatModel').value=currentChat.model||_lastModel()||'*';
   updateModelCount();
   renderMessages();
   renderSidebar();
@@ -4681,6 +4682,16 @@ function updateModelCount(){
   },200);
 }
 document.getElementById('chatModel').addEventListener('input',updateModelCount);
+// Remember the last model the user typed. Default the composer to it (else the "*" star),
+// and save it whenever they leave the box — so "go back and type my preferred model" sticks
+// across new chats and page loads. A chat with its OWN saved model still wins (afterLoadChat).
+(function(){
+  var el=document.getElementById('chatModel');
+  if(!el)return;
+  var lm=_lastModel();
+  if(lm&&(!el.value||el.value==='*'))el.value=lm;
+  el.addEventListener('blur',function(){ try{ var v=this.value.trim(); if(v)localStorage.setItem('dyva_last_model',v); }catch(e){} });
+})();
 updateModelCount();
 renderSidebar();
 
