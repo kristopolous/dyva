@@ -120,6 +120,10 @@
   .pict .say.close{color:var(--p3)}
   .pict .say.wrong{color:var(--err)}
   .pict .say.judge{color:var(--p3)}
+  /* round-lost reveal: the answer the model never got, called out in the reel */
+  .pict .say.reveal{color:#fff;font-weight:700;background:rgba(220,80,80,.14);border-left:2px solid var(--err);border-radius:4px;padding:3px 6px;margin:3px 0}
+  /* the guesser's earnest reply to being told it lost */
+  .pict .say.reactline{color:var(--text);font-style:italic}
   .pict .draw{background:#0f1218;border-radius:6px;min-height:160px;display:flex;align-items:center;justify-content:center;overflow:hidden}
   .pict .draw svg{width:100%;height:auto;max-height:320px;display:block}
   .pict .draw .wait{color:#888;font-size:12px;padding:24px}
@@ -605,6 +609,14 @@ var pictionary = {
     pictionary._newRound(st);
     return {note: note + ' — next round (' + st.round + '/' + PICT_ROUNDS + ')'};
   },
+  // Round LOST — nobody solved it. Reveal the answer in the reel, then hand it to the
+  // GUESSER one more time (phase 'react') to respond to the "too bad" — its reaction to
+  // learning it blew it is the funny part. The actual round-end waits until after that.
+  _fail: function(st, note){
+    pictionary._say(st, '🙈 too bad — the answer was “' + st.secret.full + '”', 'reveal');
+    st.phase = 'react'; st.endNote = note;
+    return {note: note + ' — revealing; letting the guesser react'};
+  },
   idle: function(el){
     // Before Play: DON'T reveal a random secret (picking one here is what made the
     // puzzle appear to "change" every time an input was edited and Play re-rolled it).
@@ -702,6 +714,16 @@ var pictionary = {
     st._stopAsk = false; return 'unknown tool: ' + name;
   },
   turn: function(st){
+    if(st.phase === 'react'){
+      // Round lost: tell the guesser the outcome, plainly, and let it respond. NO prompt
+      // to be clever or a good sport — it's an earnest player being told it missed, and
+      // that it answers earnestly at all is the whole charm. Keep its in-character role.
+      return { player: 1, think: false, messages: [
+        {role:'system', content:'You are the guesser in a game of Pictionary.'},
+        {role:'user', content:'The round is over — you did not get it. The answer was “'
+          + st.secret.full + '”. Too bad!'}
+      ]};
+    }
     if(st.phase === 'draw'){
       // A full <svg> is a LONG output; dyva sizes num_ctx from the (tiny) prompt, so
       // without this the drawing overruns the window and the stream cuts before
@@ -782,7 +804,12 @@ var pictionary = {
   },
   apply: async function(st, text, player, res){
     st.turns++;
-    if(st.turns > 40){ return pictionary._endRound(st, 'stalled — it was ' + st.secret.full); }   // safety cap (budget also bounds a round)
+    if(st.phase === 'react'){                            // the guesser's reply to the "too bad" reveal
+      var reaction = String(text||'').replace(/\s+/g, ' ').trim().slice(0, 240);
+      if(reaction) pictionary._say(st, '🤷 ' + reaction, 'reactline');
+      return pictionary._endRound(st, st.endNote || 'round over');   // NOW the round actually ends
+    }
+    if(st.turns > 40){ return pictionary._fail(st, 'stalled — it was ' + st.secret.full); }   // safety cap (budget also bounds a round)
     if(st.phase === 'judge'){                            // the impartial judge rates the pending guess
       var jt = String(text||'').toLowerCase();
       var rate = function(part){ var m = jt.match(new RegExp(part + '\\s*[:\\-]?\\s*(right|close|wrong)')); return m ? m[1] : ''; };
@@ -797,7 +824,7 @@ var pictionary = {
       if(obj === 'right' && act === 'right'){ return pictionary._award(st); }   // both nailed → win
       st.budget -= PICT_GUESS_COST;                       // a wrong guess costs 2
       pictionary._say(st, '👩‍⚖️ ✗ ' + st.verdict + ' (−' + PICT_GUESS_COST + ')', 'judge');
-      if(st.budget <= 0){ return pictionary._endRound(st, 'out of points — it was ' + st.secret.full); }
+      if(st.budget <= 0){ return pictionary._fail(st, "out of points — it was " + st.secret.full); }
       // If exactly one part is WRONG (the other right/close), force the artist to draw
       // that missing part in ISOLATION — the guesser has the rest, just needs this.
       var oWrong = (obj === 'wrong'), aWrong = (act === 'wrong');
@@ -818,7 +845,7 @@ var pictionary = {
       st.budget -= PICT_QUESTION_COST;                    // a yes/no question costs 1
       pictionary._say(st, '🤷 ' + st.pendingQuestion + ' → 🎨 ' + yn + ' (−' + PICT_QUESTION_COST + ')', 'hint');
       st.pendingQuestion = '';
-      if(st.budget <= 0){ return pictionary._endRound(st, 'out of points — it was ' + st.secret.full); }
+      if(st.budget <= 0){ return pictionary._fail(st, "out of points — it was " + st.secret.full); }
       st.phase = 'guess';
       return {note: 'artist answered "' + yn + '" — ' + st.budget + ' pts left'};
     }

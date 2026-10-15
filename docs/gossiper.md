@@ -86,6 +86,21 @@ Response (JSON):
              each {id, host, model, smoke, client_ts, src_ip, server_ts} ]}
 ```
 
+**Batched form (what the client actually uses).** A dyva has one channel per source, so
+syncing them one POST at a time is N round trips. The batch form collapses them into one —
+each channel still keeps its own cursor:
+
+```
+POST   <gossiper_url>
+  body: {"batch": {"<sha1>": {"since": <int>, "rows": [...]}, ...}}
+  ->    {"ok": true, "batch": {"<sha1>": {ok, now, rows}, ...}}
+```
+
+The server loops the channels, ingesting and returning each one's delta independently; a
+non-sha1 key is skipped, not a whole-batch failure. The single-source form above is kept
+for back-compat. If the whole POST fails, the client leaves *every* cursor and retries the
+batch next refresh.
+
 - **The cursor is the server's autoincrement row `id`**, not a wall-clock time. It's
   monotonic, immune to clock skew, and avoids the "repeats in waves" a windowed
   `LIMIT` store would produce. `now` is the max id **actually returned** (never the

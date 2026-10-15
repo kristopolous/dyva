@@ -3017,12 +3017,40 @@ def _gossiper_exchange(channel, since_hwm, out_rows):
     return data if isinstance(data, dict) else None
 
 
+def _gossiper_exchange_batch(batch):
+    """ONE POST that syncs EVERY source channel at once — collapses N per-source round
+    trips into one. `batch` = {channel: {"since": <int>, "rows": [...]}}; returns the
+    server's {channel: {"now": <int>, "rows": [...]}} map, or None on any failure (the
+    caller then leaves every cursor so the whole batch retries next refresh). Same
+    trailing-slash rule as the single-source form."""
+    base = (GOSSIPER_URL or "").strip()
+    if not base:
+        return None
+    if not base.endswith("/") and "?" not in base and not base.endswith(".php"):
+        base += "/"
+    try:
+        resp = requests.post(base, json={"batch": batch}, timeout=30)
+    except Exception as ex:
+        log.warning(f"gossiper batch: POST failed: {ex}")
+        return None
+    if resp.status_code != 200:
+        log.warning(f"gossiper batch: HTTP {resp.status_code}")
+        return None
+    try:
+        data = resp.json()
+    except Exception as ex:
+        log.warning(f"gossiper batch: bad JSON: {ex}")
+        return None
+    return data.get("batch") if isinstance(data, dict) and isinstance(data.get("batch"), dict) else None
+
+
 def gossiper_sync():
     """Piggybacked on /refresh (off the event loop — it does blocking network I/O):
-    for each enabled source, exchange smoke-verdict deltas with its gossiper channel.
-    Gated by GOSSIPER_ENABLED; wholly best-effort (a dead gossiper never breaks a
-    refresh). Groups the freshly-reloaded pool by each host's `source` tag so a
-    private-source host is only ever posted to its own channel (the leak boundary)."""
+    exchange smoke-verdict deltas with the gossiper for EVERY enabled source in ONE
+    batched POST (per-source round trips were the cost; the channels still each keep
+    their own cursor). Gated by GOSSIPER_ENABLED; wholly best-effort (a dead gossiper
+    never breaks a refresh). Groups the freshly-reloaded pool by each host's `source`
+    tag so a private-source host is only ever posted to its own channel (leak boundary)."""
     if not GOSSIPER_ENABLED or not (GOSSIPER_URL or "").strip():
         return
     try:
@@ -3033,24 +3061,34 @@ def gossiper_sync():
             if src and srv:
                 by_src.setdefault(src, set()).add(srv)
         now = _now_iso()
+        batch, meta = {}, {}      # channel -> {since,rows} ; channel -> (name, hwm)
         for name, url in urls.items():
             host_set = by_src.get(name)
             if not host_set:
                 continue
             channel = _gossiper_channel(url)
-            last_refresh_at, hwm = _gossiper_cursor(channel)
+            _last_refresh_at, hwm = _gossiper_cursor(channel)
             out = [{"host": h, "model": m, "smoke": v, "ts": ts}
-                   for h, m, v, ts in _gossiper_outgoing(host_set, last_refresh_at)]
-            data = _gossiper_exchange(channel, hwm, out)
-            if data is None:
-                continue   # leave the cursor untouched; retry next refresh
-            got = _gossiper_apply(data.get("rows") or [], channel)
-            new_hwm = data.get("now")
+                   for h, m, v, ts in _gossiper_outgoing(host_set, _last_refresh_at)]
+            batch[channel] = {"since": hwm, "rows": out}
+            meta[channel] = (name, hwm)
+        if not batch:
+            return
+        result = _gossiper_exchange_batch(batch)
+        if result is None:
+            return                # leave EVERY cursor untouched; the whole batch retries next refresh
+        for channel, (name, hwm) in meta.items():
+            part = result.get(channel)
+            if not isinstance(part, dict):
+                continue          # server didn't answer for this channel; keep its cursor
+            got = _gossiper_apply(part.get("rows") or [], channel)
+            new_hwm = part.get("now")
             if not isinstance(new_hwm, int):
                 new_hwm = hwm
             _gossiper_set_cursor(channel, now, new_hwm)
-            if out or got:
-                log.info(f"gossiper {name}[{channel[:8]}]: sent {len(out)}, got {got}, "
+            sent = len(batch[channel]["rows"])
+            if sent or got:
+                log.info(f"gossiper {name}[{channel[:8]}]: sent {sent}, got {got}, "
                          f"hwm {hwm}->{new_hwm}")
     except Exception as ex:
         log.warning(f"gossiper sync skipped: {ex}")
@@ -6284,7 +6322,7 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
         # on that let it skip the test forever on the strength of its own canned reply.
         # Once a host really passes, smoke_date is stamped and it's never screened again.
         if not _host_screened(host):
-            sok, sdetail = await _quick_probe(session, host, full, model, grade=False)
+            sok, sdetail = await _quick_probe(session, host, full, model, grade=False, wid=wid)
             if sok is False:
                 return skip("failed smoke test: " + (sdetail or "not a real model"))
             if sok is None:
@@ -6307,7 +6345,7 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
         # host-wide (same as a honeypot), so it's dropped for every future request too.
         if "tools" in (caps or []) and not _host_tools_screened(host):
             tok, tdetail = await _quick_probe(session, host, full, model,
-                                              tools=SPIDER_TRAP_BAIT, grade=False, trap_check=True)
+                                              tools=SPIDER_TRAP_BAIT, grade=False, trap_check=True, wid=wid)
             if tok is False:
                 return skip("failed tool smoke: " + (tdetail or "spider-trap"))
             if tok is None:
@@ -7684,7 +7722,7 @@ async def _run_info_test(session, model_in, tools=None):
     return found or None
 
 
-async def _quick_probe(session, host, full, model_in, tools=None, grade=True, trap_check=False):
+async def _quick_probe(session, host, full, model_in, tools=None, grade=True, trap_check=False, wid=None):
     # `grade` splits the two roles this serves. As the `:test` harness it is the
     # operator deliberately grading the fleet, so it writes verdicts. As the race's
     # pre-payload GATE it must convey nothing beyond its own result: a 20-token probe
@@ -7699,7 +7737,11 @@ async def _quick_probe(session, host, full, model_in, tools=None, grade=True, tr
     — connected but too slow to answer, so the host is left UNMARKED and re-testable
     (a slow/cold host is often fast once warm). The shared primitive behind `:test`
     (first pass wins) and `:test-all` (probe every candidate)."""
-    wid = asyncio.current_task().get_name()
+    # As the race's pre-payload gate, run UNDER the race attempt's job wid (passed in) so the
+    # smoke/trap line groups with the attempt in the feed — not a phantom per-host worker that
+    # made every unscreened host show up twice (a "trying" and a separate "quick test").
+    # As the standalone :test harness (no wid passed), fall back to this task's own name.
+    wid = wid or asyncio.current_task().get_name()
     # trap_check: the SPIDER-TRAP screen. Same colour question (needs no tool), but the prompt
     # explicitly says not to call tools and the caller passes the bait tools — a host that calls
     # one anyway is weaponizing our tools, and is condemned host-wide below.

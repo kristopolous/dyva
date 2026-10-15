@@ -10,6 +10,10 @@
 //       - POST ingests `rows` (GET ingests nothing); both return the delta.
 //     -> {"ok":true, "now":<cursor to persist>, "rows":[ rows for this source with id>since ]}
 //
+//   BATCH (POST): sync MANY channels in ONE round trip —
+//     body {"batch": {"<sha1>": {"since":<int>, "rows":[...]}, ...}}
+//     -> {"ok":true, "batch": {"<sha1>": {ok,now,rows}, ...}}   (a non-sha1 channel is skipped)
+//
 //   `source` = sha1 of the source URL. It is the ISOLATION key: a client only ever sees or
 //   writes rows for a source it holds the URL of (hence can hash). A non-sha1 `source` is a
 //   400. This is why sync exposure never exceeds source exposure (see the doc).
@@ -40,11 +44,60 @@ function fail(int $code, string $msg): void {
     exit;
 }
 
-$source = isset($_GET['source']) ? (string) $_GET['source'] : '';
-if (!preg_match('/^[0-9a-f]{40}$/i', $source)) {
-    fail(400, 'source must be a sha1 hex (the isolation key)');
+// Ingest one channel's posted rows, then return its delta (rows with id > since). The
+// cursor `now` = the max id ACTUALLY returned (not the table max), so a concurrent insert
+// is picked up next sync instead of skipped. Shared by the single-source and batch paths.
+function exchange(PDO $db, string $source, int $since, array $rows, string $ip): array {
+    if ($rows) {
+        $ins = $db->prepare(
+            'INSERT INTO gossip (source, host, model, smoke, client_ts, src_ip)
+             VALUES (?, ?, ?, ?, ?, ?)'
+        );
+        $db->beginTransaction();
+        foreach ($rows as $r) {
+            if (!is_array($r) || empty($r['host'])) {
+                continue;   // host is required; skip junk rather than fail the batch
+            }
+            $ins->execute([
+                $source,
+                (string) $r['host'],
+                isset($r['model']) ? (string) $r['model'] : null,
+                isset($r['smoke']) ? (string) $r['smoke'] : null,
+                isset($r['ts'])    ? (string) $r['ts']    : null,
+                $ip,
+            ]);
+        }
+        $db->commit();
+    }
+    $sel = $db->prepare(
+        'SELECT id, host, model, smoke, client_ts, src_ip, server_ts
+         FROM gossip WHERE source = ? AND id > ? ORDER BY id ASC'
+    );
+    $sel->execute([$source, $since]);
+    $out = $sel->fetchAll(PDO::FETCH_ASSOC);
+    $now = $since;
+    foreach ($out as &$r) {
+        $r['id'] = (int) $r['id'];
+        if ($r['id'] > $now) {
+            $now = $r['id'];
+        }
+    }
+    unset($r);
+    return ['ok' => true, 'now' => $now, 'rows' => $out];
 }
-$since = isset($_GET['since']) ? (int) $_GET['since'] : 0;
+
+// Read the POST body first — the BATCH shape lives there, not in the query string.
+$body = [];
+if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
+    $raw = file_get_contents('php://input', false, null, 0, $MAX_BODY + 1);
+    if ($raw !== false && strlen($raw) > $MAX_BODY) {
+        fail(413, 'payload too large');
+    }
+    $decoded = json_decode((string) $raw, true);
+    if (is_array($decoded)) {
+        $body = $decoded;
+    }
+}
 
 try {
     $db = new PDO('sqlite:' . $DB);
@@ -74,58 +127,35 @@ if (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
     $ip = trim(explode(',', $_SERVER['HTTP_X_FORWARDED_FOR'])[0]);
 }
 
-if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'POST') {
-    $raw = file_get_contents('php://input', false, null, 0, $MAX_BODY + 1);
-    if ($raw !== false && strlen($raw) > $MAX_BODY) {
-        fail(413, 'payload too large');
-    }
-    $body = json_decode((string) $raw, true);
-    if (is_array($body)) {
-        if (isset($body['since'])) {
-            $since = (int) $body['since'];
+// BATCH: one request syncs MANY channels, to save round trips.
+//   {"batch": {"<sha1>": {"since": <int>, "rows": [...]}, ...}}
+//   -> {"ok": true, "batch": {"<sha1>": {ok,now,rows}, ...}}
+// A non-sha1 channel is skipped (not a whole-batch failure) — the same isolation rule.
+if (isset($body['batch']) && is_array($body['batch'])) {
+    $res = [];
+    foreach ($body['batch'] as $source => $spec) {
+        if (!preg_match('/^[0-9a-f]{40}$/i', (string) $source)) {
+            continue;
         }
-        $rows = (isset($body['rows']) && is_array($body['rows'])) ? $body['rows'] : [];
-        if ($rows) {
-            $ins = $db->prepare(
-                'INSERT INTO gossip (source, host, model, smoke, client_ts, src_ip)
-                 VALUES (?, ?, ?, ?, ?, ?)'
-            );
-            $db->beginTransaction();
-            foreach ($rows as $r) {
-                if (!is_array($r) || empty($r['host'])) {
-                    continue;   // host is required; skip junk rather than fail the batch
-                }
-                $ins->execute([
-                    $source,
-                    (string) $r['host'],
-                    isset($r['model']) ? (string) $r['model'] : null,
-                    isset($r['smoke']) ? (string) $r['smoke'] : null,
-                    isset($r['ts'])    ? (string) $r['ts']    : null,
-                    $ip,
-                ]);
-            }
-            $db->commit();
+        $spec  = is_array($spec) ? $spec : [];
+        $since = isset($spec['since']) ? (int) $spec['since'] : 0;
+        $rows  = (isset($spec['rows']) && is_array($spec['rows'])) ? $spec['rows'] : [];
+        try {
+            $res[(string) $source] = exchange($db, (string) $source, $since, $rows, $ip);
+        } catch (Throwable $e) {
+            $res[(string) $source] = ['ok' => false, 'error' => 'exchange failed'];
         }
     }
+    echo json_encode(['ok' => true, 'batch' => $res]);
+    exit;
 }
 
-// Delta back: every row for THIS source newer than the client's cursor.
-$sel = $db->prepare(
-    'SELECT id, host, model, smoke, client_ts, src_ip, server_ts
-     FROM gossip WHERE source = ? AND id > ? ORDER BY id ASC'
-);
-$sel->execute([$source, $since]);
-$out = $sel->fetchAll(PDO::FETCH_ASSOC);
-
-// Cursor to persist / send next time = max id ACTUALLY returned (not the table max), so a
-// concurrent insert can never be skipped.
-$now = $since;
-foreach ($out as &$r) {
-    $r['id'] = (int) $r['id'];
-    if ($r['id'] > $now) {
-        $now = $r['id'];
-    }
+// Single-source (back-compat): ?source=<sha1>&since=<int>
+$source = isset($_GET['source']) ? (string) $_GET['source'] : '';
+if (!preg_match('/^[0-9a-f]{40}$/i', $source)) {
+    fail(400, 'source must be a sha1 hex (the isolation key)');
 }
-unset($r);
-
-echo json_encode(['ok' => true, 'now' => $now, 'rows' => $out]);
+$since = isset($body['since']) ? (int) $body['since']
+       : (isset($_GET['since']) ? (int) $_GET['since'] : 0);
+$rows = (isset($body['rows']) && is_array($body['rows'])) ? $body['rows'] : [];
+echo json_encode(exchange($db, $source, $since, $rows, $ip));

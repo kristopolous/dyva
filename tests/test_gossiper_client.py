@@ -217,34 +217,58 @@ def test_sync_roundtrip_sends_delta_applies_peer_and_advances_cursor(db, monkeyp
     recs = [{"server": "http://mine:11434", "source": "spider", "models": ["qwen3.8:27b"]}]
     monkeypatch.setattr(dyva, "load_servers", lambda: recs)
 
+    chan = dyva._gossiper_channel(dyva._source_urls()["spider"])
     sent = {}
 
     class FakeResp:
         status_code = 200
 
         def json(self):
-            # echo: ingest nothing, hand back ONE peer honeypot for a different host
-            return {"ok": True, "now": 7,
+            # ONE batched reply, keyed by channel: a peer honeypot for a different host
+            return {"ok": True, "batch": {chan: {"ok": True, "now": 7,
                     "rows": [{"host": "http://peer-trap:11434", "model": "", "smoke": "honeypot",
-                              "client_ts": "2026-10-13T10:00:00Z", "src_ip": "9.9.9.9"}]}
+                              "client_ts": "2026-10-13T10:00:00Z", "src_ip": "9.9.9.9"}]}}}
 
     def fake_post(url, params=None, json=None, timeout=None):
-        sent["params"] = params
         sent["body"] = json
         return FakeResp()
 
     monkeypatch.setattr(dyva.requests, "post", fake_post)
     dyva.gossiper_sync()
 
-    # we POSTed our own pass to the spider channel...
-    assert sent["params"]["source"] == dyva._gossiper_channel(dyva._source_urls()["spider"])
+    # ONE batched POST: body.batch keyed by channel, carrying our pass for the spider channel
+    assert set(sent["body"]["batch"].keys()) == {chan}
     assert any(r["smoke"] == "pass" and r["host"] == "http://mine:11434"
-               for r in sent["body"]["rows"])
-    # ...applied the peer's honeypot...
+               for r in sent["body"]["batch"][chan]["rows"])
+    # ...applied the peer's honeypot, and advanced that channel's cursor to the server's `now`.
     assert dyva.load_attested_honeypots() == {"http://peer-trap:11434"}
-    # ...and advanced that channel's cursor to the server's `now`.
-    chan = dyva._gossiper_channel(dyva._source_urls()["spider"])
     assert dyva._gossiper_cursor(chan)[1] == 7
+
+
+def test_sync_batches_all_sources_into_ONE_post(db, monkeypatch):
+    monkeypatch.setattr(dyva, "GOSSIPER_ENABLED", True)
+    monkeypatch.setattr(dyva, "GOSSIPER_URL", "https://example/dyva/gossiper/")
+    recs = [{"server": "http://h1:11434", "source": "spider", "models": ["m"]},
+            {"server": "http://h2:11434", "source": "forrany", "models": ["m"]}]
+    monkeypatch.setattr(dyva, "load_servers", lambda: recs)
+    calls = []
+
+    class R:
+        status_code = 200
+
+        def json(self):
+            return {"ok": True, "batch": {}}
+
+    def fake_post(url, params=None, json=None, timeout=None):
+        calls.append(json)
+        return R()
+
+    monkeypatch.setattr(dyva.requests, "post", fake_post)
+    dyva.gossiper_sync()
+    assert len(calls) == 1          # ONE round trip for ALL sources (the whole point)
+    assert set(calls[0]["batch"].keys()) == {
+        dyva._gossiper_channel(dyva._source_urls()["spider"]),
+        dyva._gossiper_channel(dyva._source_urls()["forrany"])}
 
 
 def test_sync_leaves_cursor_on_transport_failure(db, monkeypatch):

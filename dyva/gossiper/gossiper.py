@@ -11,6 +11,10 @@ CONTRACT
       - POST ingests `rows`; GET ingests nothing. Both return the delta.
     -> {"ok": true, "now": <cursor to persist>, "rows": [ this source's rows with id>since ]}
 
+  BATCH (POST): sync MANY channels in ONE round trip (the client has one channel per source):
+    body {"batch": {"<sha1>": {"since": <int>, "rows": [...]}, ...}}
+    -> {"ok": true, "batch": {"<sha1>": {ok,now,rows}, ...}}   (a non-sha1 channel is skipped)
+
   `source` = sha1 of the source URL — the ISOLATION key (a client only sees/writes rows for a
   source whose URL it holds, hence can hash; a non-sha1 source is a 400). The delta cursor is
   the autoincrement `id` (monotonic, skew-free, no "repeats in waves" a windowed LIMIT causes);
@@ -109,11 +113,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def _serve(self):
         q = parse_qs(urlparse(self.path).query)
-        source = (q.get("source", [""])[0] or "").strip()
-        if not SHA1_RE.match(source):
-            return self._reply(400, {"ok": False, "error": "source must be a sha1 hex"})
-        since = _to_int(q.get("since", ["0"])[0])
-        rows = []
+        body = {}
         if self.command == "POST":
             n = _to_int(self.headers.get("Content-Length"))
             if n > MAX_BODY:
@@ -123,14 +123,33 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.loads(raw or b"{}")
             except Exception:
                 return self._reply(400, {"ok": False, "error": "bad JSON body"})
-            if isinstance(body, dict):
-                if "since" in body:
-                    since = _to_int(body["since"])
-                rows = body.get("rows") or []
-                if not isinstance(rows, list):
-                    rows = []
+            if not isinstance(body, dict):
+                body = {}
+        src_ip = self._client_ip()
+        # BATCH: one request syncs MANY channels at once, to save round trips.
+        #   {"batch": {"<sha1>": {"since": <int>, "rows": [...]}, ...}}
+        #   -> {"ok": true, "batch": {"<sha1>": {ok,now,rows}, ...}}
+        # A non-sha1 channel is skipped (not a whole-batch failure), same isolation rule.
+        if isinstance(body.get("batch"), dict):
+            out = {}
+            for source, spec in body["batch"].items():
+                if not SHA1_RE.match(str(source or "")):
+                    continue
+                spec = spec if isinstance(spec, dict) else {}
+                rows = spec.get("rows") if isinstance(spec.get("rows"), list) else []
+                try:
+                    out[source] = exchange(source, _to_int(spec.get("since", 0)), rows, src_ip)
+                except Exception as e:
+                    out[source] = {"ok": False, "error": type(e).__name__}
+            return self._reply(200, {"ok": True, "batch": out})
+        # single-source (back-compat): ?source=<sha1>&since=<int>
+        source = (q.get("source", [""])[0] or "").strip()
+        if not SHA1_RE.match(source):
+            return self._reply(400, {"ok": False, "error": "source must be a sha1 hex"})
+        since = _to_int(body["since"]) if "since" in body else _to_int(q.get("since", ["0"])[0])
+        rows = body.get("rows") if isinstance(body.get("rows"), list) else []
         try:
-            res = exchange(source, since, rows, self._client_ip())
+            res = exchange(source, since, rows, src_ip)
         except Exception as e:
             return self._reply(500, {"ok": False, "error": type(e).__name__})
         self._reply(200, res)
