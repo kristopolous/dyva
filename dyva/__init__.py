@@ -7393,8 +7393,17 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
         #              had streamed most of the answer (e.g. a nearly-complete drawing
         #              in tool-call args) that's a cutoff, not a dead host — retry for a
         #              complete answer WITHOUT dinging it.
-        #  'length'    the answer hit the context window (done_reason 'length'): the
-        #              host is FINE, it just needs a bigger window — keep it eligible.
+        #  'length'    the answer hit the context window (done_reason 'length'): if
+        #              it streamed real text first, the host is FINE and just needs a
+        #              bigger window — keep it eligible. But 'length' with ~no output
+        #              is NOT a real overflow (a genuine overflow emits text before it
+        #              runs out of room) — it's a host that won't serve this prompt.
+        #              Growing the window and re-racing just lets the same fast host
+        #              win again and return 0 chars again, burning the whole continue
+        #              budget on one broken host (seen: 6 continues, 0 chars each, ~6
+        #              min). Drop it from THIS request's pool and fail over — no
+        #              reputation ding (a one-off prompt that overran its window is a
+        #              plausible benign cause; the blast radius is just this request).
         if status == "truncated" and made <= 40:
             await broadcast_activity(host, full, "failed",
                 f"truncated without end token: {host} dropped mid-stream after "
@@ -7405,7 +7414,12 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
             await broadcast_activity(host, full, "warming",
                 f"stream ended without a done token on {host} after {made} chars — "
                 f"retrying for a complete answer (not penalised)", wid=job_wid)
-        else:  # 'length'
+        elif made <= 40:  # 'length' with no real output — see note above
+            await broadcast_activity(host, full, "warming",
+                f"hit the context window at {made} chars (no output) on {host} — "
+                f"failing over to a fresh host", wid=job_wid)
+            dead.add(host)
+        else:  # 'length' with real streamed text
             await broadcast_activity(host, full, "trying",
                 f"answer hit the context window on {host} at {made} chars — "
                 f"continuing with a larger window", wid=job_wid)
