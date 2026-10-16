@@ -14,6 +14,7 @@ shipped have graduated out of here (into the code and `docs/`).
 | [honeypot-score.md](honeypot-score.md) | flag **built**, scoring **designed** | escalate honeypot evidence to a whole-machine flag |
 | [canary-detection.md](canary-detection.md) | idea (data-collection only) | find hosts whose connect trips a Cloudflare soft-ban |
 | [graflex-sample.md](graflex-sample.md) | planned, **lower priority** | a publishable rotating "sample platter" of hosts |
+| [stats-storage.md](stats-storage.md) | brainstorm, undecided | scale the Stats view (serial JSONL scan is slow) — rollup vs SQLite |
 
 Status legend: **designed** = written down, ready to build, not built · **parked** =
 deliberately on hold with a named trigger to revisit · **idea** = early thinking,

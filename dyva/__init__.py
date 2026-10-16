@@ -5061,14 +5061,20 @@ def record_verdict(host, key, outcome, sticky_key=None):
         # host-wide, so it isn't re-probed as "unknown" for every other key...
         mark_unreachable(host)
         add_bad(host, key, "conn", reason=outcome.detail)  # ...plus the per-key mark
+        clear_last(host)                                   # and stop leading with it (any model)
     elif v == V_TIMEOUT:
         # Alive but didn't deliver (read timeout / stream stall). SOFT demote — good -> maybe_good,
         # never -> bad: a slow/stalling host is sometimes-good, not offline. Keeps it out of the
         # winner circle (so heavy requests prefer proven hosts) while leaving it usable for cheap
         # ones and re-testable.
         add_soft_fail(host, key, "timeout", reason=outcome.detail)
+        clear_last(host, key)   # a stall/timeout must drop the sticky LEAD too — it's checked
+                                # ahead of the tier, so the demotion alone wouldn't stop the host
+                                # getting the exclusive hedge lead (and stalling ~TIMEOUT s) again
     elif v in (V_UNSUITABLE, V_FAILED):   # a real fault — this key shows who failed it
         add_bad(host, key, _failure_kind(v, outcome.detail), reason=outcome.detail)
+        clear_last(host, key)   # likewise: the sticky outranks the bad tier, so clear it or the
+                                # failed host keeps being tried first
     # V_SKIP records nothing on purpose
 
 
@@ -6182,15 +6188,25 @@ async def _send_chat(session, host, full, payload, endpoint, do_stream, timeout=
         _nctx = (p.get("options") or {}).get("num_ctx")
         log.info(f"[{rid}] req {host}{ep} model={full} stream={do_stream}"
                  + (f" num_ctx={_nctx}" if _nctx else ""))
+        def _mk_to(pp):
+            # Phased timeout: a short sock_connect so a dead host fails fast in the
+            # CONNECT phase, while a live-but-slow host gets the full budget to answer.
+            # This is what lets the caller tell "no connection" from "too slow".
+            budget = timeout or _slow_timeout(pp)
+            if do_stream:
+                # STREAMING: never set `total` — that's a whole-request deadline, so a
+                # long but perfectly healthy stream (tokens still flowing) gets torn down
+                # mid-answer the instant the timer elapses -> "stream ended without a done
+                # token" -> re-race -> cut again (the constant-stall loop). Use sock_read
+                # (idle-between-reads) instead: it fires only on genuine silence, so an
+                # answer that keeps producing runs to completion. WORKER_MAX still caps a
+                # true runaway, and the in-stream watchdog still catches stalls.
+                return aiohttp.ClientTimeout(sock_connect=CONNECT_TIMEOUT, sock_read=budget)
+            # Non-streaming: the whole response must land in the budget, so `total` is right.
+            return aiohttp.ClientTimeout(total=budget, sock_connect=CONNECT_TIMEOUT)
         _t0 = time.time()
         try:
-            # Phased timeout: a short sock_connect so a dead host fails fast in the
-            # CONNECT phase, while a live-but-slow host gets the full TIMEOUT to
-            # answer. This is what lets the caller tell "no connection" from "too
-            # slow" (see the except handler on the send site).
-            resp = await _post_follow(session,
-                f"{host}{ep}", json=p,
-                timeout=aiohttp.ClientTimeout(total=timeout or _slow_timeout(p), sock_connect=CONNECT_TIMEOUT))
+            resp = await _post_follow(session, f"{host}{ep}", json=p, timeout=_mk_to(p))
         except Exception as e:
             log.info(f"[{rid}] err {host}{ep} {(' '.join(str(e).split())[:160] or type(e).__name__)} "
                      f"after {time.time()-_t0:.1f}s")
@@ -6210,9 +6226,7 @@ async def _send_chat(session, host, full, payload, endpoint, do_stream, timeout=
             log.info(f"[{rid}] {host}{ep} 400 with think:true — retrying without think")
             _t0 = time.time()
             try:
-                resp = await _post_follow(session,
-                    f"{host}{ep}", json=p,
-                    timeout=aiohttp.ClientTimeout(total=timeout or _slow_timeout(p), sock_connect=CONNECT_TIMEOUT))
+                resp = await _post_follow(session, f"{host}{ep}", json=p, timeout=_mk_to(p))
             except Exception as e:
                 log.info(f"[{rid}] err {host}{ep} {(' '.join(str(e).split())[:160] or type(e).__name__)} "
                          f"after {time.time()-_t0:.1f}s")
@@ -6230,9 +6244,7 @@ async def _send_chat(session, host, full, payload, endpoint, do_stream, timeout=
             log.info(f"[{rid}] {host}{ep} 400 with prefill — retrying as aside continuation")
             _t0 = time.time()
             try:
-                resp = await _post_follow(session,
-                    f"{host}{ep}", json=p,
-                    timeout=aiohttp.ClientTimeout(total=timeout or _slow_timeout(p), sock_connect=CONNECT_TIMEOUT))
+                resp = await _post_follow(session, f"{host}{ep}", json=p, timeout=_mk_to(p))
             except Exception as e:
                 log.info(f"[{rid}] err {host}{ep} {(' '.join(str(e).split())[:160] or type(e).__name__)} "
                          f"after {time.time()-_t0:.1f}s")
@@ -8320,8 +8332,9 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                     if not complete:
                         # Streamed some tokens then went silent past TIMEOUT (or
                         # dropped) before the host signalled done — the same conclusion
-                        # the streaming paths reach: the host stalled. Ding it and fail
-                        # over to another server instead of returning a truncated answer.
+                        # the streaming paths reach: the host stalled. SOFT demote and
+                        # fail over; the sticky is cleared in record_verdict so it stops
+                        # being tried FIRST next time.
                         record_verdict(host, full, timed_out("stream stalled"))
                         errors.append(f"{host}: stream stalled")
                         await broadcast_activity(host, model, "failed",
@@ -14491,7 +14504,10 @@ async def _run_chat_job(session, jid):
                             # a real failure so reputation reflects it.
                             # Stored reason is a STABLE code (no interpolated timeout,
                             # no em-dash) so last_fail_reason groups cleanly; the feed
-                            # line below carries the readable text.
+                            # line below carries the readable text. SOFT demote
+                            # (maybe_good) — a stall is sometimes-good, not dead; the real
+                            # fix is that record_verdict now clears the sticky so it stops
+                            # being tried FIRST every request.
                             record_verdict(host, full, timed_out("stream stalled"))
                             errors.append(f"{host}: stream stalled — no tokens for {TIMEOUT}s")
                             servers = [s for s in servers if s[1] != host]

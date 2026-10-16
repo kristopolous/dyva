@@ -4645,8 +4645,14 @@ function loadChatById(id){
   // appends stay unified); otherwise fetch its full content from the server.
   var g=gens[String(id)];
   if(g&&g.chat){currentChat=g.chat;afterLoadChat(String(id));return;}
+  // Switching pulls the full conversation from the server; on a slow link that
+  // round-trip is the dead air that made switching "feel broken". Show the loading
+  // snackbar until it lands, and leave a brief error toast if it fails (so a hung /
+  // failed switch is visible instead of silent).
+  showSnack('Loading conversation…',true);
   fetchChat(id,function(c){
-    if(!c)return;
+    hideSnack();
+    if(!c){showSnack('Could not load that conversation',false);setTimeout(hideSnack,3000);return;}
     currentChat={id:c.id,createdAt:c.createdAt,title:c.title,model:c.model||'*',tools:c.tools||null,system:c.system||'',lastPayload:c.lastPayload,assets:(c.assets||[]).slice(),messages:(c.messages||[]).slice(),documents:(c.documents||[]).map(function(d){return {id:d.id,title:d.title,type:d.type,language:d.language,content:d.content,updated:d.updated,versions:(d.versions||[]).slice()}})};
     afterLoadChat(String(id));
   });
