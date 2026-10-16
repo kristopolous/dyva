@@ -950,6 +950,8 @@ details.toolbox>summary{cursor:pointer;color:var(--text-dim);font-size:var(--fs-
 .selfhost a{color:var(--accent);text-decoration:none}
 .selfhost a:hover{text-decoration:underline}
 .selfhost code{font-family:var(--font-mono);color:var(--text-2)}
+.selfhost-video{margin-top:var(--sp-4);max-width:480px;border-radius:var(--r-md);overflow:hidden;border:1px solid var(--border)}
+.selfhost-video video{display:block;width:100%;height:auto;background:#000}
 .login-row input[type=password]{flex:1;max-width:280px;background:var(--bg-inset);border:1px solid var(--border-strong);border-radius:var(--r-md);color:var(--text);padding:var(--sp-3);font-size:var(--fs-lg)}
 .setting-help{color:var(--text-dim);font-size:var(--fs-xs);margin-top:var(--sp-1);line-height:var(--line-body)}
 .setting-help code{background:var(--bg-inset);padding:.05em .3em;border-radius:var(--r-sm);font-size:var(--fs-2xs)}
@@ -1775,6 +1777,7 @@ body.dragging-image .hist-item{cursor:grabbing}
 <li><a href="https://pypi.org/project/dyva/" target="_blank" rel="noopener noreferrer">pypi.org/project/dyva</a></li>
 <li><code>uvx dyva</code></li>
 </ul>
+<div class="selfhost-video"><video src="https://9ol.es/dyva/output.webm" controls playsinline preload="metadata"></video></div>
 </div>
 </div>
 <div id="settingsBody">
@@ -2439,6 +2442,11 @@ function _sizeBucketOf(mid){
   return e[e.length-1]+'B+';
 }
 var _KINDS=[
+  // Decision models (the /v1/systemone family: clef/clef-flash, laya, nimble, tev1,
+  // jev, kev) — bounded codename match so it won't catch look-alikes, and FIRST so
+  // e.g. `jev-27b-vl` groups as Decision rather than Vision. probe_zz_* trap names
+  // don't match (tev/jev require a digit or delimiter right after).
+  ['Decision',/(?:^|[-_.:/\\])(?:clef|laya|nimble|kev|tev\d|jev)(?:[-_.:/]|\d|$)/],
   ['Embedding',/embed|bge|gte|nomic|minilm|mxbai|e5[-_]/],
   ['Vision',/vision|llava|moondream|(?:^|[-_:/])vl(?:[-_:.]|$)/],
   ['Code',/cod(?:e|er|ing)|starcoder|codestral/],

@@ -1755,6 +1755,25 @@ def _usage_of(obj):
     return p, c
 
 
+def _decision_acct(data, intoks):
+    """Accounting payload for a /v1/systemone (decision) response. Gated on whether
+    counts can actually be EXTRACTED (_usage_of), NOT on a `usage` key being present:
+    a decision host that returns a usage dict with keys we don't recognise would
+    otherwise be passed through, yield (None, None) in account_tokens, and silently
+    no-op (the "Stats number never moves" bug). When the host's counts aren't readable
+    we substitute OUR input estimate (`intoks`, already computed to size num_batch)
+    plus a rough answer-token count — so a successful decision ALWAYS yields a row a
+    stat can be written from. Returns a dict _usage_of can always read."""
+    p, c = _usage_of(data)
+    if p is not None or c is not None:
+        return data                      # host gave usable counts; keep eval timing too
+    try:
+        out = _count_tokens(json.dumps((data or {}).get("answers") or data, ensure_ascii=False))
+    except (TypeError, ValueError):
+        out = 0
+    return {"usage": {"prompt_tokens": intoks or 0, "completion_tokens": out}}
+
+
 def _prompt_truncated(prompt, num_ctx):
     """True ONLY when the prompt actually filled the window (prompt_eval_count
     reached num_ctx) — Ollama then dropped the head, so the answer was built on a
@@ -10831,6 +10850,7 @@ async def handle_systemone(request):
         servers = [t for t in servers if _bl.get(t[1]) is None or _bl[t[1]] >= _intoks] or servers
 
     session = request.app["session"]
+    client_err = []   # a host's 400 validation message, surfaced if the whole race fails
 
     async def attempt(item, wid, done):
         # One host's shot at the decision — contact, send, read, judge; the SAME
@@ -10857,6 +10877,15 @@ async def handle_systemone(request):
             return unreachable_host(type(e).__name__)
         if code == 503:                       # alive but busy — park and retry, no penalty
             return retry_later("busy (HTTP 503)")
+        if code == 400:
+            # A 400 is the Jev API rejecting the REQUEST (bad question schema, missing
+            # state, etc.) — the host is fine, so DON'T penalise it (the old `failed()`
+            # marked it bad, and since every host rejects the same body identically, one
+            # malformed request walked the whole pool marking every decision host bad).
+            # Stash the host's message so the client gets the real validation error
+            # instead of a generic 502, and SKIP (records nothing).
+            client_err.append(" ".join(text.split())[:300])
+            return skip("bad request (HTTP 400)")
         if code != 200:
             # Learn a raw-llama.cpp host's ubatch ceiling from the oversized-input 500 so the
             # next decision request this big skips it (our num_batch can't raise a baked -ub).
@@ -10879,6 +10908,11 @@ async def handle_systemone(request):
         # It handled this input size — if a smaller ubatch ceiling was on record it was stale
         # (host relaunched with a bigger -ub), so clear it.
         clear_batch_limit(host, full, _intoks)
+        # Token accounting, same as the chat/generate paths (→ Stats up/down/tps + the
+        # worker card). num_ctx is None (we size num_batch, not a context window — no
+        # truncation to assert). Only the winner reaches here. See _decision_acct for
+        # why it never silently no-ops.
+        await account_tokens(wid, host, full, _decision_acct(data, _intoks), None)
         await broadcast_activity(host, model, "connected",
             f"success: {host} for {model}", duration=time.time() - t0, wid=wid, rmodel=full)
         return accepted(data, extra=full)
@@ -10889,6 +10923,11 @@ async def handle_systemone(request):
             key_of=lambda it: it[2][0],       # reputation keyed by the RESOLVED model, like chat
             banker_key=model, hedge_delay=HEDGE_DELAY)
     if result is None:
+        # A host-reported 400 means the request body was bad (same for every host) —
+        # return it as a 400 with the real message, not a generic 502 "all failed".
+        if client_err:
+            return web.json_response(
+                err_obj(f"bad request: {client_err[0]}", "invalid_request"), status=400)
         return web.json_response(
             err_obj(f"all hosts failed for '{model}' ({', '.join(f'{k}={v}' for k, v in tally.items()) or 'none tried'})"),
             status=502)
