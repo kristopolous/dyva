@@ -5856,9 +5856,13 @@ def openai_to_ollama(data, model):
             {"function": {"name": (t.get("function") or {}).get("name"),
                           "arguments": _tool_args_obj((t.get("function") or {}).get("arguments"))}}
             for t in msg["tool_calls"]]
+    # /v1/chat/completions carries the text in message.content; /v1/completions (which
+    # /api/generate maps to) carries it in choices[].text. Read BOTH so a completions
+    # response isn't silently emptied (the "/api/generate returns blank" bug on
+    # OpenAI-dialect hosts — the native-ollama path passed through fine, hiding it).
     out = {"model": data.get("model") or model, "created_at": _now_iso(),
            "message": {"role": msg.get("role") or "assistant",
-                       "content": msg.get("content") or ""},
+                       "content": msg.get("content") or ch.get("text") or ""},
            "done": True, "done_reason": ch.get("finish_reason") or "stop"}
     if msg.get("tool_calls"):
         out["message"]["tool_calls"] = msg["tool_calls"]
@@ -5893,7 +5897,11 @@ def openai_stream_to_ollama(line, model):
     ch = ((obj.get("choices") or [{}])[0]) or {}
     delta = dict(ch.get("delta") or ch.get("message") or {})
     fin = ch.get("finish_reason")
-    msg = {"role": delta.get("role") or "assistant", "content": delta.get("content") or ""}
+    # chat-completions streams text in delta.content; a /v1/completions stream (what
+    # /api/generate uses) streams it in choices[].text — read both or a completions
+    # stream forwards empty content.
+    msg = {"role": delta.get("role") or "assistant",
+           "content": delta.get("content") or ch.get("text") or ""}
     # Carry an OpenAI reasoning delta through as Ollama's `thinking` field, so the
     # thinking streams live AND lands in the job buffer — otherwise it's dropped, and
     # a tab that reloads mid-think replays a buffer with no thinking in it.
@@ -7680,6 +7688,23 @@ def _info_wants_test_all(payload):
     return _content_contains(payload, DYVA_INFO_TAG + ":test-all")
 
 
+def _info_wants_hosts(payload):
+    return _content_contains(payload, DYVA_INFO_TAG + ":hosts")
+
+
+def _info_hosts(model_in, req_caps):
+    """Every candidate (host, model) the model-query would route to, in try order —
+    the ordered output of find_servers for the same query string a normal request
+    carries (model name + `;`-facets like `;state=good;tps>20`). Returns a list of
+    {host, model, tier} dicts; the response renders one bare host per line so it pipes
+    straight to a file."""
+    out = []
+    for prio, host, ms in find_servers(model_in, req_caps):
+        if ms:
+            out.append({"host": _norm_host(host), "model": ms[0], "tier": prio})
+    return out
+
+
 def _norm_host(h):
     return re.sub(r"^https?://", "", h or "")
 
@@ -7712,21 +7737,54 @@ def _would_use(model_in, req_caps, exclude=None):
     return None
 
 
-def _info_response(model_in, info, do_stream=False, openai_format=False):
-    if not do_stream:
-        return web.json_response(info)
+def _info_response(model_in, info, do_stream=False, openai_format=False, generate=False, text=None):
+    # `generate=True` (the /api/generate endpoint) needs GENERATE shape (`response`),
+    # not chat shape (`message`) — same reason the real generation path translates. The
+    # ollama CLI's one-shot `ollama run MODEL "__dyva_info__"` hits /api/generate, so
+    # without this it rendered blank even after the chat path was fixed. Build the
+    # chat-shaped dict as usual, then _ollama_chat_to_generate() it when generate.
     now = time.strftime("%Y-%m-%dT%H:%M:%S.") + f"{int(time.time() * 1000) % 1000:03d}Z"
-    payload = json.dumps(info)
+    # `text` overrides the content payload with a pre-formatted string (e.g. the
+    # newline-joined host list for :hosts, so it pipes to a file as bare lines); the
+    # structured `info` still rides along on `dyva_info` for programmatic readers.
+    payload = text if text is not None else json.dumps(info)
+    _gen = (lambda d: _ollama_chat_to_generate(d)) if (generate and not openai_format) else (lambda d: d)
+    if not do_stream:
+        # A non-streamed `__dyva_info__` reply MUST still be a valid chat response —
+        # the ollama protocol defaults `stream` to TRUE, so a client that omits it
+        # (the ollama CLI does) lands here, and the bare `info` dict we used to return
+        # has no `message`/`choices`, so the client unmarshalled an EMPTY response and
+        # rendered nothing (the "__dyva_info__ prints blank in `ollama run`" bug). Wrap
+        # the info JSON in `message.content` (ollama) / `choices[].message.content`
+        # (OpenAI) like the streaming path already does, and keep the structured `info`
+        # on a top-level `dyva_info` as the machine-readable escape hatch.
+        if openai_format:
+            return web.json_response({
+                "id": "chatcmpl-dyva-info", "object": "chat.completion",
+                "created": int(time.time()), "model": model_in,
+                "choices": [{"index": 0, "finish_reason": "stop",
+                             "message": {"role": "assistant", "content": payload}}],
+                "dyva_info": info,
+            })
+        return web.json_response(_gen({
+            "model": model_in, "created_at": now,
+            "message": {"role": "assistant", "content": payload},
+            "done": True, "done_reason": "stop",
+            "total_duration": 0, "load_duration": 0,
+            "prompt_eval_count": 0, "prompt_eval_duration": 0,
+            "eval_count": 0, "eval_duration": 0,
+            "dyva_info": info,
+        }))
     if openai_format:
         text = (sse_str(sse_chunk(model_in, {"role": "assistant", "content": payload})) +
                 sse_str(sse_chunk(model_in, {}, done=True)))
         return web.Response(text=text, content_type="text/event-stream")
-    first = {
+    first = _gen({
         "model": model_in, "created_at": now,
         "message": {"role": "assistant", "content": payload},
         "done": False,
-    }
-    last = {
+    })
+    last = _gen({
         "model": model_in, "created_at": now,
         "message": {"role": "assistant", "content": ""},
         "done": True, "done_reason": "stop",
@@ -7734,19 +7792,20 @@ def _info_response(model_in, info, do_stream=False, openai_format=False):
         "prompt_eval_count": 0, "prompt_eval_duration": 0,
         "eval_count": 0, "eval_duration": 0,
         "dyva_info": info,
-    }
+    })
     return web.Response(
         text=json.dumps(first) + "\n" + json.dumps(last) + "\n",
         content_type="application/x-ndjson")
 
 
-def _info_ndjson(model_in, info):
+def _info_ndjson(model_in, info, text=None):
     """The same two-line Ollama NDJSON `_info_response` streams, as a plain
     string — so an info turn (`__dyva_info__`) can be dropped straight into a
-    job buffer as a pre-completed 'generation' the dashboard renders as usual."""
+    job buffer as a pre-completed 'generation' the dashboard renders as usual.
+    `text` overrides the content payload (e.g. the newline-joined :hosts list)."""
     now = time.strftime("%Y-%m-%dT%H:%M:%S.") + f"{int(time.time() * 1000) % 1000:03d}Z"
     first = {"model": model_in, "created_at": now,
-             "message": {"role": "assistant", "content": json.dumps(info)},
+             "message": {"role": "assistant", "content": text if text is not None else json.dumps(info)},
              "done": False}
     last = {"model": model_in, "created_at": now,
             "message": {"role": "assistant", "content": ""},
@@ -8132,6 +8191,10 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
             if info is None:
                 return web.json_response(err_obj(f"no server for '{model_in}' passed the quick test", "model_not_found"), status=404)
             return _info_response(model_list[0], info, do_stream=do_stream, openai_format=openai_format)
+        if _info_wants_hosts(opayload):
+            cand = _info_hosts(model_list[0], req_caps)
+            return _info_response(model_list[0], cand, do_stream=do_stream, openai_format=openai_format,
+                                  text="\n".join(c["host"] for c in cand))
         exclude = None
         if _info_wants_next(opayload):
             prev = get_last(model_list[0])
@@ -8276,6 +8339,72 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
         await _unregister_worker(job_wid)
 
 
+def _ollama_chat_to_generate(obj):
+    """Translate one Ollama CHAT-shaped object ({"message":{content,thinking,...}}) into
+    GENERATE shape ({"response":..., "thinking":...}). dyva's streaming pipeline is
+    chat-shaped internally (one machinery serves both endpoints), but /api/generate
+    clients — notably the ollama CLI's one-shot `ollama run MODEL "prompt"` — read the
+    `response` string, not `message`, so a chat-shaped reply renders BLANK. Objects
+    already in generate shape (native-ollama passthrough has no `message` key) are
+    returned unchanged, so this is a safe no-op on that path."""
+    if not isinstance(obj, dict) or "message" not in obj:
+        return obj
+    out = dict(obj)
+    m = out.pop("message") or {}
+    out["response"] = m.get("content") or ""
+    if m.get("thinking"):
+        out["thinking"] = m["thinking"]
+    # tool_calls have no slot in the /api/generate schema (tools are a /api/chat
+    # feature), so they're dropped rather than emitted as a field generate won't read.
+    return out
+
+
+def _generate_line(line):
+    """One NDJSON line (bytes) from the chat pipeline -> generate-shaped bytes. Passes
+    through blank/keepalive and anything that isn't a JSON object unchanged."""
+    s = line.strip()
+    if not s:
+        return line
+    try:
+        obj = json.loads(s)
+    except Exception:
+        return line
+    return json.dumps(_ollama_chat_to_generate(obj)).encode()
+
+
+class _GenerateShapeResponse:
+    """A thin proxy over a StreamResponse that rewrites each NDJSON line the chat
+    pipeline writes into /api/generate shape — so _pump_stream stays endpoint-agnostic
+    and the generate translation lives only here. Headers/prepare delegate to the real
+    response (which aiohttp finalises); the pipeline writes whole lines, but partial
+    writes are buffered to line boundaries for safety, and the caller flushes any tail
+    before returning the real response."""
+    def __init__(self, real):
+        self._real = real
+        self._buf = b""
+
+    @property
+    def headers(self):
+        return self._real.headers
+
+    async def prepare(self, request):
+        return await self._real.prepare(request)
+
+    async def write(self, b):
+        self._buf += b
+        out = b""
+        while b"\n" in self._buf:
+            line, self._buf = self._buf.split(b"\n", 1)
+            out += _generate_line(line) + b"\n"
+        if out:
+            await self._real.write(out)
+
+    async def flush_tail(self):
+        if self._buf:
+            await self._real.write(_generate_line(self._buf))
+            self._buf = b""
+
+
 async def _proxy_generate(request, session):
     try:
         body = await request.json()
@@ -8300,12 +8429,16 @@ async def _proxy_generate(request, session):
             if do_stream:
                 return await _stream_info_test_all(request, session, model, body.get("tools"), False)
             summary = await _run_info_test_all(session, model, tools=body.get("tools"))
-            return _info_response(model, summary, do_stream=False)
+            return _info_response(model, summary, do_stream=False, generate=True)
         if _info_wants_test(body):
             info = await _run_info_test(session, model, tools=body.get("tools"))
             if info is None:
                 return web.json_response(err_obj(f"no server for '{model}' passed the quick test", "model_not_found"), status=404)
-            return _info_response(model, info, do_stream=do_stream)
+            return _info_response(model, info, do_stream=do_stream, generate=True)
+        if _info_wants_hosts(body):
+            cand = _info_hosts(model, req_caps)
+            return _info_response(model, cand, do_stream=do_stream, generate=True,
+                                  text="\n".join(c["host"] for c in cand))
         exclude = None
         if _info_wants_next(body):
             prev = get_last(model)
@@ -8314,7 +8447,7 @@ async def _proxy_generate(request, session):
         info = _would_use(model, req_caps, exclude=exclude)
         if info is None:
             return web.json_response(err_obj(f"no available servers for '{model}'", "model_not_found"), status=404)
-        return _info_response(model, info, do_stream=do_stream)
+        return _info_response(model, info, do_stream=do_stream, generate=True)
 
     job_wid = await _register_worker(model, len(find_servers(model, req_caps)), lambda: None,
                                      kind="text", title=_client_title(request))
@@ -8334,9 +8467,15 @@ async def _proxy_generate(request, session):
                 _, host, full, resp, first_line, first, _oai = result
                 mark_worker_found(job_wid, host, full)
                 stream_resp = web.StreamResponse()
-                await _forward_stream(request, stream_resp, resp, first_line, host, full,
+                # The chat pipeline emits {"message":{...}} chunks; /api/generate clients
+                # need {"response":...} — rewrite at the boundary so _pump_stream is
+                # unchanged. (A native-ollama upstream already streams generate shape; the
+                # proxy's per-line translate is a no-op on those.)
+                gen_out = _GenerateShapeResponse(stream_resp)
+                await _forward_stream(request, gen_out, resp, first_line, host, full,
                                       openai_format=False, upstream_openai=_oai,
                                       wid=job_wid, num_ctx=_effective_num_ctx(body))
+                await gen_out.flush_tail()
                 return stream_resp
             msg = "worker manually stopped" if stopped else "all servers failed"
             if errors:
@@ -8347,7 +8486,9 @@ async def _proxy_generate(request, session):
         if result:
             _, host, full, data = result
             mark_worker_found(job_wid, host, full)
-            return web.json_response(data)
+            # Chat-shaped internally -> /api/generate shape for the client (no-op if the
+            # upstream was native ollama and already returned `response`).
+            return web.json_response(_ollama_chat_to_generate(data))
 
         msg = "worker manually stopped" if stopped else "all servers failed"
         if errors:
@@ -11023,12 +11164,19 @@ async def handle_chat_job_submit(request):
             asyncio.get_event_loop().create_task(_sweep())
             return web.json_response({"id": jid, "status": JOB_PENDING,
                                      "polling_url": f"/api/chat/jobs/{jid}"})
+        info_text = None
         if _info_wants_test(body):
             info = await _run_info_test(session, model0, tools=body.get("tools"))
             if info is None:
                 return web.json_response(err_obj(
                     f"no server for '{model}' passed the quick test",
                     "model_not_found"), status=404)
+        elif _info_wants_hosts(body):
+            req_caps = needs_caps(body.get("messages", []))
+            if body.get("tools"):
+                req_caps = sorted(set(req_caps) | {"tools"})
+            info = _info_hosts(model0, req_caps)
+            info_text = "\n".join(c["host"] for c in info)
         else:
             exclude = None
             if _info_wants_next(body):
@@ -11044,7 +11192,7 @@ async def handle_chat_job_submit(request):
                     f"no available servers for '{model}'",
                     "model_not_found"), status=404)
         jid = await _job_new("text", body, model=model)
-        await _job_append(jid, _info_ndjson(model0, info))
+        await _job_append(jid, _info_ndjson(model0, info, text=info_text))
         await _job_set(jid, status=JOB_COMPLETED, phase=None)
         return web.json_response({"id": jid, "status": JOB_COMPLETED,
                                  "polling_url": f"/api/chat/jobs/{jid}"})
