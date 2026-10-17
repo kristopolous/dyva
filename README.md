@@ -21,7 +21,7 @@ Dyva supports unified workflows for stable diffusion, minimax h3, z-image, ltx 2
 uvx dyva
 ```
 
-It is a feature-rich system with chat that includes image generation, web search, sub agent, documents, video generation, tts, stats, and even graphically tweaking the routing algorithm.
+Along with being so ollama-compatible the ollama client doesn't know the difference, dyva has a feature-rich front-end with chat that includes image generation, web search, sub agent, documents, host drilldown and exploration, video generation, tts, stats, geomaps, and even graphically tweaking the routing algorithm.
 
 Memory footprint is under 1GB:
 <div align="center">
