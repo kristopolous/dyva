@@ -3618,6 +3618,15 @@ def _load_votes():
         return {}
 
 
+# A 👎 means, literally, "do not go back to this host" — not "demote it", not "mark it
+# bad/honeypot", just: don't consider it. It is SESSION-scoped and NON-persistent (in
+# memory, cleared on restart) on purpose — a down is "not right now", not a forever ban,
+# and there are ~10k hosts of nuance between the sticky top-slot and the bad tier. Keyed
+# by scheme-stripped host (the vote machinery missed because it matched on exact
+# host+model strings); find_servers drops any host in here outright. 👍 removes it.
+_session_skip_hosts = set()
+
+
 def mark_honeypot(host, reason=None):
     """Condemn a whole MACHINE as a honeypot: it answered the smoke probe with a
     known-garbage response, which is machine-level, so exclude it for EVERY model.
@@ -4620,6 +4629,10 @@ def _find_servers_raw(sub, caps=None):
         if any(re.search(r"[:-]cloud", m) for m in ms) and not re.search(r"[:-]cloud", sub):
             continue
         host = s.get("server", "")
+        # User 👎 this session: "do not go back to this host." Hard-drop it — not a
+        # last-resort tier, just gone — until the process restarts or a 👍 clears it.
+        if _norm_host(host) in _session_skip_hosts:
+            continue
         # Drop (host, model) pairs that failed STRUCTURALLY (old-ollama "unknown
         # renderer", missing/corrupt blob, model-not-found): they never work, so
         # they must not be candidates at all — not a bad-tier last resort re-raced
@@ -10309,14 +10322,17 @@ async def handle_flag_worker(request):
     model = (w.get("rmodel") if w else None) or request.query.get("model")
     if not host or not model:
         return web.json_response({"error": "no host/model to flag"}, status=404)
-    # Deprioritize, don't condemn: a slow-but-working host flagged with force_bad healed
-    # straight back to the front on its next success. The vote is reputation-orthogonal
-    # (it sorts within the tier, never moves it), so it sticks until the user votes 👍.
-    set_vote(host, model, -1)
-    log.warning(f"worker deprioritized (👎): host={host} model={model} wid={wid}")
+    # "Do not go back to this host." Session-scoped, non-persistent, host-wide: add it to
+    # the in-memory skip set (find_servers hard-drops it) and unpin any sticky pointing at
+    # it so nothing resurrects it. NOT a reputation mark — no bad/honeypot, nothing
+    # persisted; a restart or a 👍 clears it. (The old path set a -1 vote that the sticky
+    # top-slot simply outranked, so the host came right back — the exact bug this fixes.)
+    _session_skip_hosts.add(_norm_host(host))
+    clear_last(host)
+    log.warning(f"worker skipped this session (👎): host={host} model={model} wid={wid}")
     await broadcast_activity(host, model, "flagged",
-        f"deprioritized: {model} @ {_norm_host(host)}")
-    return web.json_response({"deprioritized": True, "host": host, "model": model})
+        f"won't route here this session (👎): {_norm_host(host)}")
+    return web.json_response({"skipped": True, "deprioritized": True, "host": host, "model": model})
 
 
 async def handle_favor_worker(request):
@@ -10351,6 +10367,7 @@ async def handle_favor_worker(request):
     # boost just buys a re-measurement. (Earlier this was set_vote, a within-tier nudge that could
     # never lift a maybe_good host past the good tier, so it was useless for exactly this case.)
     favor_host(host, model)
+    _session_skip_hosts.discard(_norm_host(host))   # 👍 undoes a session 👎 skip
     log.warning(f"worker favored (👍): host={host} model={model} wid={wid}")
     await broadcast_activity(host, model, "connected",
         f"favored (good): {model} @ {_norm_host(host)}")
