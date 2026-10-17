@@ -2213,6 +2213,17 @@ function _tokU(n){
   while(k>=_TOK_ROLL&&i<u.length-1){k/=1000;i++;}
   return (i===0?K_FMT.format(k):k.toFixed(1))+u[i];
 }
+// Plain COUNT (reqs, etc.) on the same collapse policy as tokens: under 10,000 show the
+// full grouped number ("9,999"); at or past 10,000 roll to K/M/B/T with one decimal
+// ("55,110" -> "55.1K", "115,721" -> "115.7K", "1,234,567" -> "1.2M") so the column
+// stays short. Uppercase K to distinguish a request COUNT from the token 'k'.
+function _numU(n){
+  n=n||0;
+  if(n<_TOK_ROLL)return NUM_FMT.format(n);
+  var u=['','K','M','B','T'],i=0;
+  while(n>=1000&&i<u.length-1){n/=1000;i++;}
+  return n.toFixed(1)+u[i];
+}
 function fmtCount(n){var v=Number(n);return isFinite(v)?NUM_FMT.format(v):String(n)}
 // The tab labels are icons now, so the count carries the meaning: how many
 // models in that pane match the current filter. The words live in title=.
@@ -8851,7 +8862,7 @@ function _statRows(rows,label,showLast){
       +'<span class="sr-bar"><i style="width:'+(100*tot/max).toFixed(1)+'%"></i></span>'
       +'<span class="sr-tok">'+_tokU(tot)+'</span>'
       +'<span class="sr-tps">'+(x.tps?NUM_FMT.format(Math.round(x.tps)):'')+'</span>'
-      +'<span class="sr-req">'+NUM_FMT.format(x.reqs||0)+'</span>'+last+'</div>';
+      +'<span class="sr-req">'+_numU(x.reqs||0)+'</span>'+last+'</div>';
   }).join('');
 }
 var _statsGran='day';   // usage-chart granularity: hour / day / week
@@ -9012,7 +9023,7 @@ function _tickUptime(){
 function renderStats(d){
   var t=(d&&d.totals)||{};
   var tot=document.getElementById('statsTotals');
-  if(tot)tot.textContent=_tokU((t.up||0)+(t.down||0))+' tokens · '+NUM_FMT.format(t.reqs||0)+' reqs'+((d&&d.q)?' · "'+d.q+'"':'');
+  if(tot)tot.textContent=_tokU((t.up||0)+(t.down||0))+' tokens · '+_numU(t.reqs||0)+' reqs'+((d&&d.q)?' · "'+d.q+'"':'');
   _statsData=d||{};
   _renderStatsChart();   // usage bars at the active granularity (hour / day / week)
   _renderStatsTable();   // one table, driven by the active tab (model / family / host)

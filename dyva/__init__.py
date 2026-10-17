@@ -241,6 +241,13 @@ LAST_FILE = os.path.join(CACHE_DIR, "last-success.json")
 # {date(utime), host, model, down, up, tps} per accounted request. Tiny lines,
 # append-forever (aggregated by day at read time in handle_stats).
 STATS_FILE = os.path.join(CACHE_DIR, "stats.jsonl")
+# The Stats view reads from here (indexed SQL aggregation) instead of scanning the whole
+# jsonl on every load — the serial scan got slow as the log grew. stats.jsonl is still
+# written alongside (dual-write): it's the non-destructive archive (trivial to rotate/zip)
+# and the fallback if we ever revert. The db is a pure read cache: delete it and it
+# rebuilds from the jsonl on next access.
+STATS_DB = os.path.join(CACHE_DIR, "stats.db")
+_stats_db = None
 KNOWN_FILE = os.path.join(CACHE_DIR, "known-hosts.json")
 # Append-only provenance log of dyva's OWN runtime probes — "what WE tested a host
 # for" (the vision balloon, etc.), distinct from the endpoint's /api/tags
@@ -516,7 +523,7 @@ def _apply_cache_dir(path):
     CLASSIFIER_FILE / NODE_CLASSIFIER_FILE are package-relative, not cache-derived,
     so they're intentionally left alone."""
     global CACHE_DIR, CACHE_FILE, NOTWORKING_FILE, BAD_FILE, GOOD_FILE, STATUS_DB
-    global LAST_FILE, STATS_FILE, KNOWN_FILE, PROBE_FILE, IMG_DIR, AUDIO_DIR, IMG_HISTORY_FILE, THUMB_DIR
+    global LAST_FILE, STATS_FILE, STATS_DB, KNOWN_FILE, PROBE_FILE, IMG_DIR, AUDIO_DIR, IMG_HISTORY_FILE, THUMB_DIR
     global CHATS_FILE, CHATS_DB, JOBS_DB, SETTINGS_FILE, VIDEO_JOBS_FILE
     global VIDEO_JOBS_DIR, CLEANSED_FILE, SURVEY_FILE, MUSIC_JOBS_FILE, MUSIC_JOBS_DIR
     CACHE_DIR = os.path.abspath(os.path.expanduser(path))
@@ -527,6 +534,7 @@ def _apply_cache_dir(path):
     STATUS_DB = os.path.join(CACHE_DIR, "host-status.db")
     LAST_FILE = os.path.join(CACHE_DIR, "last-success.json")
     STATS_FILE = os.path.join(CACHE_DIR, "stats.jsonl")
+    STATS_DB = os.path.join(CACHE_DIR, "stats.db")
     KNOWN_FILE = os.path.join(CACHE_DIR, "known-hosts.json")
     PROBE_FILE = os.path.join(CACHE_DIR, "host-probe.json")
     IMG_DIR = os.path.join(CACHE_DIR, "images")
@@ -1700,6 +1708,11 @@ async def broadcast_activity(host, model, status, message, duration=None, wid=No
     line with that id rather than prepending a new one, so a request that fans
     out over many hosts shows a single line that resolves in place instead of a
     trying/failed pair per host."""
+    # No em/en-dashes in the feed — normalise to a plain hyphen (operator preference;
+    # one place so every line, present and future, is covered).
+    if message and ("—" in message or "–" in message):
+        message = message.replace(" — ", " - ").replace(" – ", " - ") \
+                         .replace("—", "-").replace("–", "-")
     entry = {'host': host, 'model': model, 'status': status, 'message': message, 'time': time.time()}
     # The worker id was accepted but never recorded, so every line in the feed and in
     # activity-*.jsonl was unattributable — you could not tell which lines belonged to
@@ -1815,7 +1828,17 @@ async def account_tokens(wid, host, model, obj, num_ctx):
     visible instead of silent."""
     p, c = _usage_of(obj)
     if p is None and c is None:
-        return
+        # The host reported no usable token counts — common on OpenAI-dialect STREAMS
+        # (vLLM / LM Studio / SGLang that don't emit a usage chunk, or emit it out of
+        # band so the drain misses it). Without a fallback the whole request vanishes
+        # from Stats — the "stats stopped recording" case when traffic lands on such a
+        # host. Fall back to OUR prompt-token estimate (stashed on the worker at request
+        # time): input is the dominant cost and worth recording; completion is left 0
+        # rather than guessed. If we don't even have that, there's genuinely nothing.
+        p = (_workers.get(wid) or {}).get("prompt_est")
+        if not p:
+            return
+        c = 0
     # We only CONSTRAIN the window on the Ollama-native dialect (we send options.num_ctx
     # and the server head-truncates to it). On the OpenAI dialect we send NO num_ctx —
     # the host uses its own, often larger, window — so comparing the prompt to our auto
@@ -5128,24 +5151,184 @@ def _write_worker_job(rec):
         pass
 
 
+def _get_stats_db():
+    """The Stats read cache (SQLite). Schema is tiny and every column is something we
+    GROUP BY / SUM / filter on (ts, host, model, up, down, tps), so no JSON blob is
+    needed — there is no un-queried field to stash. Indexed on ts/model/host so the
+    daily/model/host aggregation in handle_stats is an indexed GROUP BY, not a whole-file
+    scan. First open backfills from the legacy stats.jsonl once."""
+    global _stats_db
+    if _stats_db is None:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        _stats_db = sqlite3.connect(STATS_DB, check_same_thread=False)
+        _stats_db.execute("PRAGMA journal_mode=WAL")
+        _stats_db.execute("PRAGMA synchronous=NORMAL")
+        _stats_db.execute("PRAGMA busy_timeout=5000")
+        _stats_db.execute(
+            "CREATE TABLE IF NOT EXISTS stats("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, "
+            "host TEXT, model TEXT, up INTEGER, down INTEGER, tps REAL, title TEXT)")
+        for _ix in ("CREATE INDEX IF NOT EXISTS ix_stats_ts ON stats(ts)",
+                    "CREATE INDEX IF NOT EXISTS ix_stats_model ON stats(model)",
+                    "CREATE INDEX IF NOT EXISTS ix_stats_host ON stats(host)"):
+            _stats_db.execute(_ix)
+        _stats_db.commit()
+        _import_stats_jsonl(_stats_db)
+    return _stats_db
+
+
+def _import_stats_jsonl(db):
+    """One-time backfill: if the table is empty and the legacy jsonl exists, load it.
+    Guarded on empty, so it never double-imports; new rows (dual-written) are untouched."""
+    try:
+        if db.execute("SELECT 1 FROM stats LIMIT 1").fetchone():
+            return
+        if not os.path.exists(STATS_FILE):
+            return
+        rows = []
+        with open(STATS_FILE, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except ValueError:
+                    continue
+                rows.append((int(r.get("date") or 0), _norm_host(r.get("host") or ""),
+                             r.get("model") or "", int(r.get("up") or 0), int(r.get("down") or 0),
+                             r.get("tps"), r.get("title")))
+        db.executemany(
+            "INSERT INTO stats(ts,host,model,up,down,tps,title) VALUES(?,?,?,?,?,?,?)", rows)
+        db.commit()
+        log.info(f"stats.db: backfilled {len(rows)} rows from stats.jsonl")
+    except Exception as e:
+        log.warning(f"stats.db backfill failed: {e}")
+
+
 def _write_stat(host, model, up, down, tps, title=None):
-    """Append one compact per-request usage line to STATS_FILE for the Stats view:
-    {date(utime), host, model, down, up, tps} plus `title` (the calling app's X-Title)
-    when it sent one — recorded now so the breakdown is available later; nothing reads
-    it yet. Omitted when absent so the line stays tiny. Append-only (~90 bytes);
-    aggregated by day at read time. Best-effort, never raises."""
+    """Record one per-request usage row for the Stats view. DUAL-WRITE: append to the
+    legacy stats.jsonl (archive/fallback) AND insert into stats.db (the read cache the
+    page aggregates from). {ts, host, model, up, down, tps, title}. Best-effort, never
+    raises."""
     if not model:
         return
+    nh = _norm_host(host)
+    ts = int(time.time())
+    rtps = round(float(tps), 2) if tps is not None else None
+    # Open (and backfill) the db BEFORE appending the jsonl line — otherwise the
+    # first-open backfill would import the line we're about to write AND the explicit
+    # insert would add it again, double-counting that one row.
+    db = None
     try:
-        rec = {"date": int(time.time()), "host": _norm_host(host), "model": model,
-               "down": down, "up": up,
-               "tps": round(float(tps), 2) if tps is not None else None}
+        db = _get_stats_db()
+    except Exception as e:
+        log.debug(f"stats.db open failed: {e}")
+    try:
+        rec = {"date": ts, "host": nh, "model": model, "down": down, "up": up, "tps": rtps}
         if title:
             rec["title"] = title
         with open(STATS_FILE, "a") as f:
             f.write(json.dumps(rec) + "\n")
     except Exception:
         pass
+    if db is not None:
+        try:
+            db.execute("INSERT INTO stats(ts,host,model,up,down,tps,title) VALUES(?,?,?,?,?,?,?)",
+                       (ts, nh, model, int(up or 0), int(down or 0), rtps, title or None))
+            db.commit()
+        except Exception as e:
+            log.debug(f"stats.db write failed: {e}")
+
+
+def _stats_where(db, q):
+    """Build the q-filter WHERE clause. To preserve match_model's EXACT forgiving
+    substring/glob semantics (which LIKE can't replicate), resolve q against the
+    DISTINCT model and host values in Python, then filter rows to those sets. A row
+    matches if its model OR its host matches q."""
+    if not q:
+        return "", []
+    dm = [r[0] for r in db.execute("SELECT DISTINCT model FROM stats WHERE model IS NOT NULL")]
+    dh = [r[0] for r in db.execute("SELECT DISTINCT host FROM stats WHERE host IS NOT NULL")]
+    mm = [m for m in dm if match_model(m or "", q)]
+    mh = [h for h in dh if match_model(h or "", q)]
+    cl, ps = [], []
+    if mm:
+        cl.append("model IN (%s)" % ",".join("?" * len(mm))); ps += mm
+    if mh:
+        cl.append("host IN (%s)" % ",".join("?" * len(mh))); ps += mh
+    if not cl:
+        return "WHERE 0", []        # q set but nothing matches -> empty result
+    return "WHERE (" + " OR ".join(cl) + ")", ps
+
+
+def _stats_aggregate(q=""):
+    """The Stats payload, aggregated in SQL. Same shape handle_stats always returned:
+    per-day / per-week(Monday) / per-hour(168h) token buckets with a {family:tokens}
+    stack, plus per-model and per-host rows and grand totals. Indexed GROUP BY instead
+    of a whole-jsonl scan."""
+    import datetime as _dt
+    db = _get_stats_db()
+    where, params = _stats_where(db, q)
+    hour_cutoff = int(time.time() - 168 * 3600)
+    days, weeks, hours, models, hosts = {}, {}, {}, {}, {}
+
+    def _bucket(store, key, up, down, reqs, fam, toks):
+        b = store.setdefault(key, {"day": key, "up": 0, "down": 0, "reqs": 0, "fam": {}})
+        b["up"] += up; b["down"] += down; b["reqs"] += reqs
+        b["fam"][fam] = b["fam"].get(fam, 0) + toks
+
+    # days + weeks (+ their family stacks): per (UTC-day, model)
+    for d, model, up, down, reqs in db.execute(
+            f"SELECT strftime('%Y-%m-%d', ts, 'unixepoch') AS d, model, "
+            f"SUM(up), SUM(down), COUNT(*) FROM stats {where} GROUP BY d, model", params):
+        up = up or 0; down = down or 0; reqs = reqs or 0
+        fam = _family_of(model or "?"); toks = up + down
+        _bucket(days, d, up, down, reqs, fam, toks)
+        try:
+            dd = _dt.date.fromisoformat(d)
+            wk = (dd - _dt.timedelta(days=dd.weekday())).isoformat()
+        except ValueError:
+            wk = d
+        _bucket(weeks, wk, up, down, reqs, fam, toks)
+
+    # hours: last 168h, per (UTC-hour, model)
+    hwhere = (where + " AND ts>=?") if where else "WHERE ts>=?"
+    for h, model, up, down, reqs in db.execute(
+            f"SELECT strftime('%Y-%m-%d %H', ts, 'unixepoch') AS h, model, "
+            f"SUM(up), SUM(down), COUNT(*) FROM stats {hwhere} GROUP BY h, model",
+            params + [hour_cutoff]):
+        up = up or 0; down = down or 0; reqs = reqs or 0
+        _bucket(hours, h, up, down, reqs, _family_of(model or "?"), up + down)
+
+    # per-model and per-host rows (tps = mean of the non-null readings; last = most
+    # recent time this pair actually emitted tokens)
+    for bucket, col in ((models, "model"), (hosts, "host")):
+        for name, up, down, reqs, tsum, tn, last in db.execute(
+                f"SELECT {col}, SUM(up), SUM(down), COUNT(*), SUM(tps), "
+                f"SUM(CASE WHEN tps IS NOT NULL THEN 1 ELSE 0 END), "
+                f"MAX(CASE WHEN down>0 THEN ts ELSE 0 END) FROM stats {where} GROUP BY {col}",
+                params):
+            bucket[name or "?"] = {"up": up or 0, "down": down or 0, "reqs": reqs or 0,
+                                   "tps": round(tsum / tn, 1) if tn else None,
+                                   "last": (last or None)}
+
+    trow = db.execute(f"SELECT SUM(up), SUM(down), COUNT(*) FROM stats {where}", params).fetchone()
+
+    def _rows(bucket):
+        out = [{"name": k, "up": b["up"], "down": b["down"], "reqs": b["reqs"],
+                "tps": b["tps"], "last": b["last"]} for k, b in bucket.items()]
+        out.sort(key=lambda x: x["up"] + x["down"], reverse=True)
+        return out
+
+    return {
+        "days": [days[k] for k in sorted(days)],
+        "weeks": [weeks[k] for k in sorted(weeks)],
+        "hours": [hours[k] for k in sorted(hours)],
+        "models": _rows(models),
+        "hosts": _rows(hosts),
+        "totals": {"up": (trow[0] or 0), "down": (trow[1] or 0), "reqs": (trow[2] or 0)},
+    }
 
 
 async def _race_hosts(entries, attempt, key, job_wid=None, workers=None, host_of=None,
@@ -6918,6 +7101,10 @@ def _stash_want_ctx(wid, payload):
         w = _workers.get(wid)
         if w is not None:
             w["want_ctx"] = (payload.get("options") or {}).get("num_ctx") or _auto_num_ctx(payload)
+            # Our own prompt-token estimate, stashed now so account_tokens can record a
+            # Stats row even when the host reports no `usage` (OpenAI-dialect streams that
+            # don't emit usage — the "stats stopped recording" case on vLLM).
+            w["prompt_est"] = _estimate_prompt_tokens(payload)
 
 
 def _race_stretch(payload):
@@ -8673,85 +8860,23 @@ async def handle_stats(request):
       '200':
         description: Aggregated usage
     """
-    import datetime as _dt
-    # ?q= filters the sweep. Applied to every bucket (days, models, hosts) so the whole
-    # view agrees — a chart that ignored the filter while the lists honoured it would
-    # be worse than no filter. Matched with match_model, the same forgiving
-    # substring/glob rule the routing queries use, against the model OR the host, so
-    # "qwen" and "51.68" both do what you'd expect.
+    # ?q= filters every bucket (days, models, hosts) so the whole view agrees, matched
+    # with match_model (the forgiving substring/glob rule the routing queries use)
+    # against the model OR the host. Aggregated in SQL from stats.db (indexed GROUP BY),
+    # not a whole-jsonl scan — see _stats_aggregate.
     q = (request.query.get("q") or "").strip()
-    # Three time granularities off the SAME per-request records (no new storage): hour,
-    # day, week (Monday-aligned). Each bucket's label lives in "day" so the chart renders
-    # them uniformly. Hours are capped to the last 168h so a long history can't bloat the
-    # payload; days/weeks are naturally small. The client windows to 168h / 30d / 26w.
-    hour_cutoff = time.time() - 168 * 3600
-    days, weeks, hours, models, hosts = {}, {}, {}, {}, {}
-    tot_up = tot_down = tot_reqs = 0
+    # Inline (not an executor): the indexed SQL aggregation is fast, and the stats.db
+    # connection is shared with _write_stat on this same event-loop thread — handing it
+    # to a worker thread would risk concurrent use of one sqlite connection.
     try:
-        with open(STATS_FILE, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    r = json.loads(line)
-                except ValueError:
-                    continue
-                if q and not (match_model(r.get("model") or "", q)
-                              or match_model(r.get("host") or "", q)):
-                    continue
-                up = r.get("up") or 0
-                down = r.get("down") or 0
-                tps = r.get("tps")
-                rdate = r.get("date") or 0
-                try:
-                    dt = _dt.datetime.fromtimestamp(rdate, _dt.timezone.utc)
-                except (ValueError, OSError, OverflowError):
-                    continue
-                # Per-bucket family breakdown feeds the stacked bars: the chart can't
-                # reconstruct a stack from a bucket total, so each bucket carries a
-                # {family: tokens} map (up+down combined — the bars stack total tokens).
-                fam = _family_of(r.get("model") or "?")
-                toks = up + down
-                day = dt.strftime("%Y-%m-%d")
-                d = days.setdefault(day, {"day": day, "up": 0, "down": 0, "reqs": 0, "fam": {}})
-                d["up"] += up; d["down"] += down; d["reqs"] += 1; d["fam"][fam] = d["fam"].get(fam, 0) + toks
-                wk = (dt - _dt.timedelta(days=dt.weekday())).strftime("%Y-%m-%d")   # Monday of this week
-                w = weeks.setdefault(wk, {"day": wk, "up": 0, "down": 0, "reqs": 0, "fam": {}})
-                w["up"] += up; w["down"] += down; w["reqs"] += 1; w["fam"][fam] = w["fam"].get(fam, 0) + toks
-                if rdate >= hour_cutoff:
-                    hk = dt.strftime("%Y-%m-%d %H")
-                    h = hours.setdefault(hk, {"day": hk, "up": 0, "down": 0, "reqs": 0, "fam": {}})
-                    h["up"] += up; h["down"] += down; h["reqs"] += 1; h["fam"][fam] = h["fam"].get(fam, 0) + toks
-                for bucket, bkey in ((models, r.get("model") or "?"), (hosts, r.get("host") or "?")):
-                    b = bucket.setdefault(bkey, {"up": 0, "down": 0, "reqs": 0, "_tps": 0.0, "_tn": 0, "_last": 0.0})
-                    b["up"] += up; b["down"] += down; b["reqs"] += 1
-                    if tps is not None:
-                        b["_tps"] += tps; b["_tn"] += 1
-                    if down > 0 and rdate > b["_last"]:
-                        b["_last"] = rdate   # last time this host/model actually EMITTED tokens
-                tot_up += up; tot_down += down; tot_reqs += 1
-    except OSError:
-        pass
-
-    def _rows(bucket):
-        out = [{"name": k, "up": b["up"], "down": b["down"], "reqs": b["reqs"],
-                "tps": round(b["_tps"] / b["_tn"], 1) if b["_tn"] else None,
-                "last": (b.get("_last") or None)}
-               for k, b in bucket.items()]
-        out.sort(key=lambda x: x["up"] + x["down"], reverse=True)
-        return out
-
-    return web.json_response({
-        "days": [days[k] for k in sorted(days)],
-        "weeks": [weeks[k] for k in sorted(weeks)],
-        "hours": [hours[k] for k in sorted(hours)],
-        "models": _rows(models),
-        "hosts": _rows(hosts),
-        "totals": {"up": tot_up, "down": tot_down, "reqs": tot_reqs},
-        "started": START_TS,   # server process start (epoch secs) -> the stats header's live uptime
-        "q": q,              # echoed so the client can show what's actually applied
-    })
+        payload = _stats_aggregate(q)
+    except Exception as e:
+        log.warning(f"stats aggregate failed: {e}")
+        payload = {"days": [], "weeks": [], "hours": [], "models": [], "hosts": [],
+                   "totals": {"up": 0, "down": 0, "reqs": 0}}
+    payload["started"] = START_TS   # server process start -> the header's live uptime
+    payload["q"] = q
+    return web.json_response(payload)
 
 
 def _pop_breakdown(key_field="source"):
