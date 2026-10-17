@@ -28,7 +28,7 @@ Memory footprint is under 1GB:
 </div>
 
 ## Querying for models
-The massive varieties of models and installations are unified through a simple model query syntax.
+The massive varieties of models and installations are unified through a model query syntax which allows any tool to leverage any subslice of the pool by specifying as the model to use. 
 
 This is designed so you can slice and dice the pool in any application. Place it AS the model.
 
