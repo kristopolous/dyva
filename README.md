@@ -12,6 +12,8 @@
 
 Capable of text generation, embeddings, decision models, vision, tool calling, image generation and editing, video generatoin, TTS, and music generation in a unified interface with state of the art, real-time tunable router providing sub 1s latency. 
 
+Dyva supports unified workflows for stable diffusion, minimax h3, z-image, ltx 2.2, 2.3, 2.5, qwen-image, loras, iris, flux.1, 2 and 3, including the klein variations, and much more. You can just chat with the agent and have it do it for you.
+
 [See a demo](https://9ol.es/11434) or run it yourself with a few keystrokes on Linux, Windows, Mac, and even Android. 
 
 
