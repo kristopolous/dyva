@@ -9,7 +9,8 @@
     {"family": "hunyuan-video", "model": "(?i)hunyuan.*video", "encoder": "(?i)llava_llama3", "encoder2": "(?i)clip_l", "vae": "(?i)hunyuan.*video.*vae", "clip_type": "hunyuan_video", "kind": "video", "builder": "NEEDS-GRAPH", "source": "docs.comfy.org/tutorials/video/hunyuan/hunyuan-video"},
     {"family": "flux3-klein", "model": "(?i)flux[-_. ]?3.*klein", "encoder": "(?i)qwen3[-_. ]?vl[-_. ]?4b|qwen3vl_4b", "vae": "(?i)flux2-vae", "clip_type": null, "kind": "image", "builder": "NEEDS-GRAPH: FLUX.3 image klein. Encoder = Qwen3-VL-4B (qwen3vl_4b*.safetensors) - NOT the plain Qwen3-4B that flux2-klein uses, and NOT the 8B. VAE = flux2-vae (shared with FLUX.2). Diffusion flux3-image-klein-{bf16,int8-convrot,nvfp4}.safetensors; distilled = 16 steps no guidance, base = 50 steps CFG 3.5. REQUIRES a Qwen3.5-9B prompt upsampler (qwen3.5_9b_flux3_prompt_upsampler*.safetensors) that the edit-family builder does NOT yet wire - complete that + verify the exact ComfyUI nodes/clip_type against a live host before trusting a render. Listed BEFORE flux2-klein so its bare '|klein' alternative can't swallow a FLUX.3 model.", "source": "huggingface.co/black-forest-labs/flux-3-image-klein-comfy"},
     {"family": "flux2-dev", "model": "(?i)flux[-_. ]?2(?!.*klein)", "encoder": "(?i)mistral.*flux2|flux2.*mistral|mistral", "vae": "(?i)flux2-vae", "clip_type": null, "kind": "image", "builder": "edit-family", "source": "docs.comfy.org/tutorials/flux/flux-2-klein"},
-    {"family": "flux2-klein", "model": "(?i)flux[-_. ]?2.*klein|klein", "encoder": "(?i)qwen_3_(4b|8b)|qwen[-_. ]?3", "vae": "(?i)flux2-vae", "clip_type": null, "kind": "image", "builder": "edit-family", "source": "docs.comfy.org/tutorials/flux/flux-2-klein"},
+    {"family": "flux2-klein-9b", "model": "(?i)klein.*9b|9b.*klein", "encoder": "(?i)qwen_3_8b|qwen[-_. ]?3[-_. ]?8b", "vae": "(?i)flux2-vae", "clip_type": null, "kind": "image", "builder": "edit-family", "source": "docs.comfy.org/tutorials/flux/flux-2-klein", "_note": "9B klein pairs with Qwen3-8B (4096-dim), not the 4B. Listed BEFORE flux2-klein so a 9b model can't take the 4B encoder and crash KSampler."},
+    {"family": "flux2-klein", "model": "(?i)flux[-_. ]?2.*klein|klein", "encoder": "(?i)qwen_3_4b|qwen[-_. ]?3[-_. ]?4b", "vae": "(?i)flux2-vae", "clip_type": null, "kind": "image", "builder": "edit-family", "source": "docs.comfy.org/tutorials/flux/flux-2-klein"},
     {"family": "z-image", "model": "(?i)z[-_. ]?image", "encoder": "(?i)qwen_3_4b|qwen[-_. ]?3", "vae": "(?i)^ae\\.safetensors|flux.*vae", "clip_type": null, "kind": "image", "builder": "edit-family", "source": "docs.comfy.org/tutorials/image/z-image/z-image-turbo"},
     {"family": "magi-2", "model": "(?i)magi[-_. ]?2", "encoder": "(?i)qwen3[._-]?5|qwen_3_5", "vae": "(?i)wan2\\.?2.?vae", "vae_audio": "(?i)stable.?audio", "clip_type": null, "kind": "video", "builder": "PROVISIONAL: no ComfyUI-native nodes yet (SandAI preview); activate when object_info shows its nodes. Reuses Wan2.2 VAE + Qwen3.5-27B encoder.", "source": "github.com/SandAI-org/MAGI-2-preview"}
   ],
@@ -427,6 +428,23 @@
       "note": "Z-Image (Tongyi). Encode-style via TextEncodeZImageOmni; the image slots are optional, so with zero references it is text-to-image. Per the official Comfy-Org template (image_z_image_turbo.json) the three files are diffusion_models/z_image_turbo_bf16.safetensors, text_encoders/qwen_3_4b.safetensors, and vae/ae.safetensors — so clip is qwen_3_4b (NOT Qwen2.5-VL, which was an earlier wrong inference) loaded as type 'qwen_image', and the VAE is the plain ae.safetensors autoencoder (NOT Qwen-Image's). clip/vae fallbacks are kept for hosts that name the files differently."
     },
     {
+      "name": "Flux2Klein9B",
+      "style": "reference",
+      "patterns": [
+        "^ReferenceLatent$"
+      ],
+      "scale": "FluxKontextImageScale",
+      "guidance_node": "FluxGuidance",
+      "guidance": 2.5,
+      "model": "(?i)klein.*9b|9b.*klein",
+      "clip": "(?i)qwen_3_8b|qwen[-_. ]?3[-_. ]?8b",
+      "vae": "(?i)flux[-_.]?2[-_.]?vae",
+      "clip_type": "flux2",
+      "cfg": 1.0,
+      "steps": 20,
+      "note": "FLUX.2 klein 9B pairs with the Qwen3-8B encoder (qwen_3_8b*.safetensors, 4096-dim) — NOT the Qwen3-4B that the 4B klein uses. Feeding the 4B (2560-dim) crashes KSampler with 'mat1 and mat2 shapes cannot be multiplied (512x7680 and 12288x4096)' (7680=2560*3 from the 4B we sent vs 12288=4096*3 the 9B DiT expects); and a 9B host that carries only qwen3-8b was previously rejected as 'no edit model' because the bare Flux2Klein family below demands the 4B file. Listed BEFORE Flux2Klein so '9b' klein matches here first. Verified against docs.comfy.org FLUX.2 klein tutorial and Comfy-Org/vae-text-encorder-for-flux-klein-9b."
+    },
+    {
       "name": "Flux2Klein",
       "style": "reference",
       "patterns": [
@@ -441,7 +459,7 @@
       "clip_type": "flux2",
       "cfg": 1.0,
       "steps": 20,
-      "note": "FLUX.2 klein uses Qwen3-4B specifically — not Mistral, and NOT the 8B. The flux2 CLIPLoader for klein instantiates a 2560-dim Qwen3-4B, so loading an 8B encoder (4096-dim) size-mismatches at render ('embed_tokens.weight 4096 vs 2560'); the clip pattern requires the 4B file, so a host that only has qwen3-8b is skipped rather than crashed. Verified against the FLUX.2 klein model cards and ComfyUI's klein tutorial."
+      "note": "FLUX.2 klein (4B) uses Qwen3-4B specifically — not Mistral, and NOT the 8B. The flux2 CLIPLoader for the 4B klein instantiates a 2560-dim Qwen3-4B, so loading an 8B encoder (4096-dim) size-mismatches at render ('embed_tokens.weight 4096 vs 2560'); the clip pattern requires the 4B file, so a host that only has qwen3-8b is skipped rather than crashed. The 9B klein is handled by Flux2Klein9B above. Verified against the FLUX.2 klein model cards and ComfyUI's klein tutorial."
     },
     {
       "name": "Flux2",
