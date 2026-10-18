@@ -313,6 +313,10 @@ body.chat{height:100vh;height:100dvh}
 .mb-g{background:#43b56a}
 .mb-r{background:#a73d5d}
 .mb-u{background:var(--border-strong)}
+/* Light mode: the dark-theme green/wine read muddy on a light page — lift them to
+   lighter, still-muted tints that stay clearly green (working) / rose (failing). */
+:root[data-theme="light"] .mb-g{background:#57c384}
+:root[data-theme="light"] .mb-r{background:#dd6c8e}
 /* External-use panel shown in an empty chat */
 .chat-empty{font-size:var(--fs-sm);line-height:1.5}
 .chat-empty h3{margin:0 0 .4em;font-size:var(--fs-md)}
@@ -3268,7 +3272,7 @@ function renderHostListFor(){
       +'<tr><td>Good</td><td>'+cell(st.good)+'</td></tr>'
       +'<tr><td>Bad</td><td>'+cell(st.bad)+'</td></tr>'
       +'</table></div><div><table>'
-      +'<tr><td>Failed smoke</td><td>'+cell(st.fail_smoke)+(st.attested?' <span class="stat-pct" title="via gossiper sync from a peer">'+fmtCount(st.attested)+' synced</span>':'')+'</td></tr>'
+      +'<tr><td title="failed the smoke test (honeypot/garbage)">Smoked</td><td>'+cell(st.fail_smoke)+(st.attested?' <span class="stat-pct" title="via gossiper sync from a peer">'+fmtCount(st.attested)+' synced</span>':'')+'</td></tr>'
       +'<tr><td>Untested</td><td>'+cell(st.unknown)+'</td></tr>'
       +'</table></div></div>';
     list.innerHTML='';
