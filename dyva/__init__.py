@@ -18421,6 +18421,48 @@ def _host_models(host):
     return []
 
 
+def _task_stack_1line(t):
+    """A compact one-liner for a task's current frame: where it is RIGHT NOW. When the
+    loop stalls, the innermost frame of each running task is the thing hogging it."""
+    try:
+        name = t.get_coro().__qualname__
+    except Exception:
+        name = repr(t)
+    try:
+        st = t.get_stack(limit=1)
+        if st:
+            f = st[0]
+            return f"{name}  @ {f.f_code.co_filename.split('/')[-1]}:{f.f_lineno} {f.f_code.co_name}()"
+    except Exception:
+        pass
+    return name
+
+
+async def _loop_lag_watchdog(thresh=2.0, period=0.5):
+    """Catch event-loop stalls. Measure how much longer a `period`-second sleep actually
+    took than it should have: that overshoot is time the single loop thread spent NOT
+    scheduling us — i.e. blocked in some synchronous callback. On a stall past `thresh`,
+    log the innermost frame of every other running task, so the culprit names itself
+    instead of us guessing. Cheap: one wakeup per `period`, work only when it's bad."""
+    loop = asyncio.get_event_loop()
+    while True:
+        t0 = loop.time()
+        try:
+            await asyncio.sleep(period)
+        except asyncio.CancelledError:
+            return
+        lag = loop.time() - t0 - period
+        if lag > thresh:
+            try:
+                me = asyncio.current_task()
+                others = [t for t in asyncio.all_tasks() if t is not me and not t.done()]
+                dump = "\n  ".join(_task_stack_1line(t) for t in others[:10])
+                log.warning(f"EVENT LOOP STALLED {lag:.1f}s (blocked, not idle). "
+                            f"{len(others)} tasks running:\n  {dump}")
+            except Exception as e:
+                log.warning(f"EVENT LOOP STALLED {lag:.1f}s (stack dump failed: {e})")
+
+
 def make_app():
     app = web.Application(client_max_size=128 * 1024 * 1024)
 
@@ -18437,10 +18479,25 @@ def make_app():
             # and times out (mass "TimeoutError" while the hosts are reachable by
             # hand). App-level concurrency (the semaphore + hedged race) bounds the
             # real fan-out, so the connector must not be the bottleneck.
-            connector=aiohttp.TCPConnector(ssl=INSECURE_SSL, keepalive_timeout=120, limit=0),
+            # DNS: ~2k of the pool's hosts are hostnames (not IPs), many on slow or
+            # dead authoritative nameservers (150-670ms, NXDOMAINs the worst). The
+            # default ThreadedResolver does getaddrinfo on the small (~cpu+4) executor
+            # pool, so a fan-out of slow lookups saturates those threads and STALLS the
+            # whole event loop — the "DNS makes dyva laggy" symptom. AsyncResolver
+            # (c-ares/aiodns) resolves fully async: thousands of slow lookups in flight
+            # cost ~0 threads and never block the loop. ttl_dns_cache=300 stops us
+            # re-resolving the same names every 10s (the default).
+            connector=aiohttp.TCPConnector(
+                ssl=INSECURE_SSL, keepalive_timeout=120, limit=0,
+                resolver=aiohttp.AsyncResolver(),
+                use_dns_cache=True, ttl_dns_cache=300),
             timeout=aiohttp.ClientTimeout(total=None),
         )
         app["semaphore"] = asyncio.Semaphore(WORKER_COUNT)
+        # Name whatever freezes the loop (the "dyva is laggy / 42s page load" hunt):
+        # logs a stack when a sleep overshoots, i.e. the loop was blocked. on_shutdown
+        # cancels all tasks, so this is torn down with everything else.
+        app["_lag_watchdog"] = asyncio.create_task(_loop_lag_watchdog())
 
     async def on_shutdown(app):
         # End the SSE activity streams.
