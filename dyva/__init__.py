@@ -1512,6 +1512,16 @@ def _set_worker_phase(wid, phase):
         w["phase"] = phase
 
 
+def _arm_worker_stop(wid, fn):
+    """Point a worker's Stop button at `fn`. Host selection installs its own stop
+    (the _race_hosts cancel); once a host is committed and the render begins, the
+    media handlers re-arm Stop here onto the render's cancel so clicking it during
+    the render (not just during selection) actually stops it."""
+    w = _workers.get(wid)
+    if w:
+        w["stop"] = fn
+
+
 _PHASE_KIND = {"editing": "edit", "speaking": "speech", "composing": "music",
                "rendering": "image"}
 
@@ -12843,6 +12853,14 @@ class ComfyBusy(ComfyError):
     inference path or an ollama 'loading model'. Not a failure, not a bad host."""
 
 
+class ComfyCancelled(Exception):
+    """The operator hit Stop on a render that was already committed to a host. Not a
+    ComfyError on purpose: the host did nothing wrong, so it must NOT be caught by the
+    handlers' `except ComfyError` legs (which record a bad verdict and fail over to the
+    next host). It unwinds the render loop to the worker's cleanup instead, and the host
+    gets a /interrupt so its GPU is freed rather than finishing a render nobody wants."""
+
+
 # ComfyUI's structural refusals, as they appear in a /prompt rejection body.
 _COMFY_STRUCTURAL = re.compile(r"prompt_outputs_failed_validation|missing_node_type"
                                r"|required_input_missing|return_type_mismatch")
@@ -13005,12 +13023,43 @@ async def comfy_queue_state(session, host, prompt_id):
 
 
 async def comfy_collect(session, host, prompt_id, kinds, timeout=180,
-                        poll=2, view_timeout=60, on_status=None, queue_stall=0):
+                        poll=2, view_timeout=60, on_status=None, queue_stall=0,
+                        cancel=None):
+    """Collect a render, and guarantee the host is told to stop if we bail.
+
+    A render runs one of two ways: as a plain await after the host race (edit),
+    cancelled via the `cancel` Event; or inside a race attempt task (txt2img and
+    friends), cancelled when _race_hosts cancels the task on Stop/skip. The Event
+    path interrupts the host itself. This wrapper covers the task-cancellation
+    path: on CancelledError we fire a detached /interrupt (we must not await in a
+    cancelled frame; the shared session outlives this task) so the host doesn't
+    keep rendering an image nobody will collect, then re-raise so cancellation
+    still propagates normally."""
+    try:
+        return await _comfy_collect_inner(
+            session, host, prompt_id, kinds, timeout=timeout, poll=poll,
+            view_timeout=view_timeout, on_status=on_status,
+            queue_stall=queue_stall, cancel=cancel)
+    except asyncio.CancelledError:
+        asyncio.ensure_future(comfy_interrupt(session, host, prompt_id))
+        raise
+
+
+async def _comfy_collect_inner(session, host, prompt_id, kinds, timeout=180,
+                        poll=2, view_timeout=60, on_status=None, queue_stall=0,
+                        cancel=None):
     """Wait out a job the host already accepted; return (bytes, filename).
 
     Deliberately not part of the race: by here the host is chosen and marked,
     so a slow or broken render is reported to the caller without re-litigating
     host selection.
+
+    `cancel` is an asyncio.Event armed onto the worker's Stop button for the
+    render phase (host selection has its own stop in _race_hosts). When it fires
+    we interrupt the host — /interrupt + queue delete, so its GPU is freed — and
+    raise ComfyCancelled so the caller unwinds to its cleanup rather than failing
+    the host over to the next one. The poll wait is the Event's wait, so a stop
+    lands within a fraction of a second instead of after the full poll interval.
     """
     label = kinds[0]
     deadline = time.time() + timeout
@@ -13024,7 +13073,17 @@ async def comfy_collect(session, host, prompt_id, kinds, timeout=180,
     best_pos = None       # lowest queue position we've seen
     pos_since = time.time()   # when it last improved
     while time.time() < deadline:
-        await asyncio.sleep(poll)
+        if cancel is not None:
+            # Wait the poll interval OR until Stop is hit, whichever comes first.
+            try:
+                await asyncio.wait_for(cancel.wait(), timeout=poll)
+            except asyncio.TimeoutError:
+                pass          # normal poll tick — no stop
+            if cancel.is_set():
+                await comfy_interrupt(session, host, prompt_id)
+                raise ComfyCancelled("stopped")
+        else:
+            await asyncio.sleep(poll)
         try:
             r = await session.get(
                 _host_url(host, f"/history/{prompt_id}"),
@@ -13549,6 +13608,30 @@ async def comfy_forget(session, host, prompt_id):
         log.debug(f"comfy {host}: history delete failed: {e}")
 
 
+async def comfy_interrupt(session, host, prompt_id=None):
+    """Stop a render we no longer want on the host — the operator hit Stop.
+
+    /interrupt kills whatever is *executing* right now; a /queue delete drops our
+    prompt if it is still *pending* (interrupt doesn't touch the pending queue). We
+    don't know which state it's in, so do both. Best-effort: a host that refuses, or
+    that we can't reach, is not a failure of the stop — the operator still wanted out,
+    and the local side (polling, worker card) is torn down regardless."""
+    try:
+        r = await session.post(_host_url(host, "/interrupt"),
+                               timeout=aiohttp.ClientTimeout(total=10))
+        await r.release()
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+        log.debug(f"comfy {host}: interrupt failed: {e}")
+    if prompt_id:
+        try:
+            r = await session.post(_host_url(host, "/queue"),
+                                   json={"delete": [prompt_id]},
+                                   timeout=aiohttp.ClientTimeout(total=10))
+            await r.release()
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+            log.debug(f"comfy {host}: queue delete failed: {e}")
+
+
 async def comfy_object_info(session, host):
     """Fetch (and briefly cache) a ComfyUI host's full /object_info.
 
@@ -13965,9 +14048,10 @@ def _tts_render_budget(text):
     return min(900, 60 + chunks * TTS_SECONDS_PER_CHUNK)
 
 
-async def _tts_collect(session, host, prompt_id, timeout=180):
+async def _tts_collect(session, host, prompt_id, timeout=180, cancel=None):
     return await comfy_collect(session, host, prompt_id, COMFY_AUDIO,
-                               timeout=timeout, poll=2, view_timeout=60)
+                               timeout=timeout, poll=2, view_timeout=60,
+                               cancel=cancel)
 
 
 def _find_tts_hosts(target_host=None, model_filter=None):
@@ -16411,9 +16495,19 @@ async def handle_tts_speech(request):
         tried_hosts.add(host)
         mark_worker_found(job_wid, host, node)
         _set_worker_phase(job_wid, "speaking")
+        # Host selection is over; re-arm Stop onto THIS render so a click now
+        # drops it (and interrupts the host) instead of hitting the spent race stop.
+        cancel = asyncio.Event()
+        _arm_worker_stop(job_wid, cancel.set)
         try:
             raw, filename = await _tts_collect(
-                session, host, prompt_id, timeout=_tts_render_budget(input_text))
+                session, host, prompt_id, timeout=_tts_render_budget(input_text),
+                cancel=cancel)
+        except ComfyCancelled:
+            stopped = True
+            await broadcast_activity(host, tkey, "stopped",
+                f"stopped: {host} for {label}", wid=job_wid)
+            break
         except (ComfyError, asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
             outcome = render_verdict(e)
             record_verdict(host, tkey, outcome)
@@ -17603,11 +17697,22 @@ async def handle_image_edit(request):
         # same worker, now rendering: name the resolved model, flip the phase
         mark_worker_found(job_wid, host, model_used)
         _set_worker_phase(job_wid, "editing")
+        # Host selection is over; re-arm Stop onto THIS render so a click now
+        # interrupts the host instead of hitting the spent _race_hosts stop.
+        cancel = asyncio.Event()
+        _arm_worker_stop(job_wid, cancel.set)
         try:
             raw, _fn = await comfy_collect(session, host, prompt_id, COMFY_IMAGES,
                                            timeout=EDIT_RENDER_TIMEOUT,
                                            poll=2, view_timeout=90,
-                                           queue_stall=QUEUE_STALL)
+                                           queue_stall=QUEUE_STALL, cancel=cancel)
+        except ComfyCancelled:
+            # Operator stopped it; the host was already /interrupt-ed in collect.
+            # Not a host fault — no verdict — so fall straight to cleanup.
+            stopped = True
+            await broadcast_activity(host, ekey, "stopped",
+                f"stopped: {host} for {label}", wid=job_wid)
+            break
         except (ComfyError, asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
             outcome = render_verdict(e)
             record_verdict(host, ekey, outcome)
