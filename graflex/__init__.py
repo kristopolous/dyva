@@ -2991,7 +2991,27 @@ async def _check_all(service, name=None, check_timeout=60, check_new=False, chec
         # reach it. Discovery normally also leaves a host row, so this is usually just `host`.
         pool_hosts = _hoststore.all_hosts(_store(), service)
         if not pool_hosts:
-            log.warning(f"check: no {service or '?'} hosts in the store - run fetch first")
+            # Say exactly what was looked for, where, what's actually there, and how to
+            # fix it — a bare "no ? hosts" left you guessing the service, the store and
+            # the next command.
+            db_path = os.path.join(CACHE_DIR, "graflex.db")
+            mode = ("the entire stored pool, incl. known-good (check-all)" if check_all
+                    else "this session's newly-fetched hosts (check-new)" if check_new
+                    else "the stored pool minus working/hard-errored (check-everything)")
+            present = _hoststore.services(_store())
+            have = (", ".join(f"{s} ({len(_hoststore.all_hosts(_store(), s))})"
+                              for s in present)
+                    if present else "(empty — nothing has been fetched into it yet)")
+            svc = service or "<service>"
+            log.warning(
+                "check: nothing to probe — the store has no hosts for this service.\n"
+                f"  service     : {service or '(none given — pass -s <service>)'}\n"
+                f"  looking for : {mode}"
+                + (f", name={name}" if name else "")
+                + (f", site={site}" if site else "") + "\n"
+                f"  store        : {db_path}\n"
+                f"  store has    : {have}\n"
+                f"  fix          : populate it first, e.g.  graflex -a fetch -s {svc}")
             return
         hosts = [{"service": service, "host": h} for h in pool_hosts]
         if check_all:
@@ -3118,15 +3138,26 @@ async def _check_hosts(hosts, service, working_file, notworking_file, check_time
                     result["method"] = method
                 else:
                     result.pop("method", None)
-                _store_record(service, entry["host"], "working", result)
-                note = ""
                 if service == "comfyui" and not result["models"]:
-                    # "0 models" is ambiguous on its own: no index at all reads
-                    # very differently from an index that listed nothing usable
-                    note = (" (index listed no model files)" if result.get("model_tree")
-                            else " (no /models index; /models/checkpoints was empty)")
-                log.info(f"+ {entry['host']}: {len(result['models'])} models{note}")
-                ok = True
+                    # Probes as live ComfyUI but serves ZERO model files across every
+                    # category — it cannot generate anything, so it must never be
+                    # promoted to the pool. Record as notworking with a distinct,
+                    # reversible reason instead of "working". Mirrors the honeypot gate
+                    # above: probed OK, but unusable. The FULL probe payload is kept
+                    # (models, version, vram, model_tree, geo) so the flagged set stays
+                    # auditable — if we're ever wrong about these, this is the pool to
+                    # prove it with. Reversible by design: a later check that finds
+                    # models writes a newer "working" row and the export reduce flips it
+                    # back by `checked` recency. (Verified not a probe artifact: legacy
+                    # /models and /api/experiment/models agree on 0, with no auth gate.)
+                    result["reason"] = "no-models"
+                    result["result"] = "no-models"
+                    _store_record(service, entry["host"], "notworking", result)
+                    log.info(f"~ {entry['host']}: comfyui, 0 model files -> no-models (not promoted)")
+                else:
+                    _store_record(service, entry["host"], "working", result)
+                    log.info(f"+ {entry['host']}: {len(result['models'])} models")
+                    ok = True
             else:
                 reason = result.get("error", str(result)) if isinstance(result, dict) else str(result)
                 result_type = "error" if (reason.startswith("HTTP ") or reason.startswith("show HTTP ") or reason.startswith("bad JSON") or "no real" in reason or "empty show" in reason or "auth required" in reason) else "unreachable"

@@ -252,7 +252,7 @@ ENDL
 
   # hunter.how section
   hunter)
-    for service in ollama llamacpp comfyui lmstudio; do
+    for service in ollama llamacpp comfyui lmstudio localai; do
       "$CMD" hunter-"$service" "${SUB_ARGS[@]}" 
     done
     exit 0
@@ -320,7 +320,7 @@ ENDL
 
   # shodan section
   shodan)
-    for service in localai ollama llamacpp; do
+    for service in comfyui localai ollama llamacpp; do
       "$CMD" shodan-"$service" "${SUB_ARGS[@]}" 
     done
     exit 0
@@ -345,6 +345,12 @@ ENDL
     COUNTRIES="US,AU,JP,IN,CA" #,SG,IL,DE,BR,HK,ZA,CH,TH,IT"
     ;;
 
+  shodan-comfyui)
+    SERVICE=comfyui
+    SITE=shodan
+    PORTS="9200,8983,9200,5060,8089,5601,28017,8188,8080,80,443"
+    COUNTRIES="US,AU,JP,IN,CA" #,SG,IL,DE,BR,HK,ZA,CH,TH,IT"
+    ;;
 
   *)
     echo "Usage: $0" $(grep -P '\s+[\-\w]+[)]$' "$0" | sort | tr -d ')\n') >&2
