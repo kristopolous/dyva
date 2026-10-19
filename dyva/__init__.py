@@ -3659,6 +3659,13 @@ def _load_votes():
 # host+model strings); find_servers drops any host in here outright. 👍 removes it.
 _session_skip_hosts = set()
 
+# The mirror image of the skip set: hosts the operator 👍'd this session. find_servers
+# floats any host in here to TIER_PREFER — above EVERY tier, even the warm sticky — so a
+# preferred host is raced first. Session-scoped and non-persistent (same as the skip set):
+# a restart clears it, and a 👎 removes the host from here (the two sets are mutually
+# exclusive — favoring discards a skip, skipping discards a favor).
+_session_prefer_hosts = set()
+
 
 def mark_honeypot(host, reason=None):
     """Condemn a whole MACHINE as a honeypot: it answered the smoke probe with a
@@ -4412,7 +4419,7 @@ def _known_capable(host, model, caps):
 # is exactly what lets the frontier and losers race among themselves and actually WIN
 # (get characterized) instead of a fast sticky preempting them forever.
 TIER_EXPLORE_NEW, TIER_EXPLORE_LOSER = -6, -5
-TIER_LAST, TIER_GOOD, TIER_MAYBE, TIER_UNKNOWN, TIER_BAD = -3, -2, -1, 0, 1
+TIER_PREFER, TIER_LAST, TIER_GOOD, TIER_MAYBE, TIER_UNKNOWN, TIER_BAD = -4, -3, -2, -1, 0, 1
 
 
 def host_tier(is_last, in_good, in_maybe, in_bad, unreachable=False):
@@ -4768,6 +4775,11 @@ def _find_servers_raw(sub, caps=None):
             # Within the normal UNKNOWN tier, most-recently-checked first; other tiers
             # keep their order via a constant secondary key (stable sort).
             crank = _checked_rank(s) if prio == TIER_UNKNOWN else 0
+        # Manual 👍 this session floats the host above EVERY tier (even the warm sticky).
+        # Applied last, so it is the final word — overriding the explore cascade and any
+        # down-vote demotion (a 👎'd host isn't in this set anyway; the two are exclusive).
+        if _norm_host(host) in _session_prefer_hosts:
+            prio = TIER_PREFER
         matched.append((cap_known, prio, crank, host, ms))
     # REPUTATION FIRST, capability a within-tier hint. Sorting by cap_known BEFORE tier let an
     # imperfect capability FLAG (a survey/classifier guess, unreliable for the many engines that
@@ -10463,6 +10475,7 @@ async def handle_flag_worker(request):
     # persisted; a restart or a 👍 clears it. (The old path set a -1 vote that the sticky
     # top-slot simply outranked, so the host came right back — the exact bug this fixes.)
     _session_skip_hosts.add(_norm_host(host))
+    _session_prefer_hosts.discard(_norm_host(host))   # 👎 undoes a session 👍 preference
     clear_last(host)
     log.warning(f"worker skipped this session (👎): host={host} model={model} wid={wid}")
     await broadcast_activity(host, model, "flagged",
@@ -10502,11 +10515,17 @@ async def handle_favor_worker(request):
     # boost just buys a re-measurement. (Earlier this was set_vote, a within-tier nudge that could
     # never lift a maybe_good host past the good tier, so it was useless for exactly this case.)
     favor_host(host, model)
+    # Mirror of 👎: float this host to the TOP of the race this session (TIER_PREFER,
+    # above every tier incl. the sticky), and clear any 👎 skip on it. Session-scoped and
+    # non-persistent — a restart or a 👎 clears it. (favor_host above still gives the
+    # one-time reputation re-measurement; the preferred set is what makes 👍 actually put
+    # the host first, which it never did before.)
+    _session_prefer_hosts.add(_norm_host(host))
     _session_skip_hosts.discard(_norm_host(host))   # 👍 undoes a session 👎 skip
     log.warning(f"worker favored (👍): host={host} model={model} wid={wid}")
     await broadcast_activity(host, model, "connected",
-        f"favored (good): {model} @ {_norm_host(host)}")
-    return web.json_response({"favored": True, "host": host, "model": model})
+        f"preferred — routed first this session (👍): {_norm_host(host)}")
+    return web.json_response({"favored": True, "preferred": True, "host": host, "model": model})
 
 
 async def handle_api_tags(request):
