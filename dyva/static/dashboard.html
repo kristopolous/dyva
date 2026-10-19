@@ -777,10 +777,10 @@ button.stop:hover{background:var(--btn-danger-hover)}
 .mpick-wrap{position:relative}
 .mpick-pop{display:none;position:absolute;left:0;right:0;top:calc(100% + 4px);background:var(--surface);border:1px solid var(--border-strong);border-radius:var(--r-lg);box-shadow:var(--shadow-pop);padding:var(--sp-2);z-index:140;max-height:min(46vh,280px);overflow-y:auto;overscroll-behavior:contain}
 .mpick-pop.open{display:block}
-.mpick-opt{display:flex;align-items:baseline;gap:var(--sp-3);padding:.5em .6em;border-radius:var(--r-md);cursor:pointer}
+.mpick-opt{display:flex;flex-direction:column;gap:2px;padding:.45em .6em;border-radius:var(--r-md);cursor:pointer}
 .mpick-opt:hover,.mpick-opt.on{background:var(--accent-bg)}
-.mpick-name{font-family:var(--font-mono);font-size:var(--fs-sm);flex:1 1 auto;min-width:0;overflow-wrap:anywhere}
-.mpick-hint{flex:0 0 auto;font-size:var(--fs-2xs);color:var(--text-dim);white-space:nowrap}
+.mpick-name{font-family:var(--font-mono);font-size:var(--fs-sm);min-width:0;overflow-wrap:anywhere}
+.mpick-hint{font-size:var(--fs-2xs);color:var(--text-dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .mpick-more{padding:.4em .6em;font-size:var(--fs-2xs);color:var(--text-faint)}
 .slash-pop{position:absolute;left:0;right:0;bottom:calc(100% + 8px);background:var(--surface);border:1px solid var(--border-strong);border-radius:var(--r-lg);box-shadow:var(--shadow-pop);padding:var(--sp-2);z-index:130;max-height:min(48vh,300px);overflow-y:auto}
 .slash-pop-title{display:flex;justify-content:space-between;gap:var(--sp-3);font-size:var(--fs-2xs);text-transform:uppercase;letter-spacing:var(--eyebrow-tracking);color:var(--text-muted);padding:2px var(--sp-2) var(--sp-2)}
@@ -1062,26 +1062,6 @@ details.toolbox>summary{cursor:pointer;color:var(--text-dim);font-size:var(--fs-
 .chat-advance{flex-shrink:0;background:var(--accent-bg);color:var(--accent);border:1px solid var(--border-strong);border-left:none;border-radius:0 var(--r-md) var(--r-md) 0;min-height:var(--ctl-h);display:flex;align-items:center;gap:.4em;font-size:var(--fs-md);font-family:var(--font-mono);line-height:1;padding:.5rem .8em}
 .chat-advance.empty{color:var(--text-dim);background:var(--bg-inset)}
 #chatModelCount{min-width:1.6em;text-align:center;justify-content:center}
-/* Edit mode wants a different balance from generate: the model name is the
-   long field and the sampler/negative prompt are gone, so the two rows read
-      [ edit model 2/3 ][ seed 1/3 ]
-      [ width 1/3 ][ height 1/3 ][ match source 1/3 ]
-   The fields live in two containers, so flatten those with display:contents
-   and lay everything out on one six-column grid, ordering explicitly. */
-body.img-edit .img-main{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));column-gap:var(--sp-4);row-gap:var(--sp-3);align-items:start}
-body.img-edit .img-main > *{grid-column:1/-1;order:6}
-body.img-edit .img-params,
-body.img-edit .img-dims{display:contents}
-body.img-edit .img-main > .mode-toggle{order:0;justify-self:start}
-body.img-edit .img-params > .field.edit-only{grid-column:span 4;order:1}
-body.img-edit .img-dims > .field:nth-child(3){grid-column:span 2;order:2}
-body.img-edit .img-dims > .field:nth-child(1){grid-column:span 2;order:3}
-body.img-edit .img-dims > .field:nth-child(2){grid-column:span 2;order:4}
-body.img-edit .img-dims > .inline-check{grid-column:span 2;order:5;align-self:center;margin:0}
-body.img-edit .img-main > #editRefField{order:7}
-body.img-edit .img-main > .img-advanced{order:8}
-body.img-edit .img-main > #imgGenerate{order:9;justify-self:start}
-body.img-edit .img-main > #imgResult{order:10}
 /* the log scrolls, not the whole popup */
 #activityList{flex:1 1 auto;min-height:0;overflow-y:auto}
 /* tool toggle sharing the model-selector row */
@@ -1194,6 +1174,34 @@ input[type=range]{width:100%;accent-color:var(--accent);cursor:pointer}
 #imgResult .status{color:var(--text-dim);font-size:var(--fs-md)}
 #imgResult .error{color:var(--err);font-size:var(--fs-md)}
 #media{max-width:none}
+/* Studio layout, shared by all four media panes: the controls sit in a fixed-
+   width card on the left (prompt first, knobs under it) and the output + recent
+   gallery take the rest of the width. Below 900px it stacks. The card must not clip
+   (no overflow/sticky): the model pickers drop long lists out of it. */
+.studio{display:grid;grid-template-columns:minmax(300px,380px) minmax(0,1fr);gap:var(--sp-6);align-items:start}
+.studio-ctl{background:var(--surface);border:1px solid var(--border);border-radius:var(--r-lg);padding:var(--sp-5)}
+.studio-ctl .media-row{margin-bottom:var(--sp-2)}
+.studio-ctl .img-params{grid-template-columns:1fr;gap:0;margin-bottom:var(--sp-2)}
+.studio-ctl .img-dims{gap:var(--sp-3);margin-bottom:var(--sp-3)}
+.studio-ctl .mode-toggle{display:flex}
+.studio-ctl .mode-btn{flex:1}
+.studio-sep{height:1px;background:var(--border);margin:var(--sp-4) calc(-1*var(--sp-5)) var(--sp-4)}
+.prompt-main label{font-size:var(--fs-md);color:var(--text-2)}
+.prompt-main textarea{font-size:var(--fs-lg);line-height:1.45}
+.studio-go{width:100%;margin-top:var(--sp-2)}
+/* the picker's options are long filenames; give the popup a little more room
+   than the card, spilling over the output column */
+@media(min-width:901px){.studio-ctl .mpick-pop{right:auto;width:max(100%,min(520px,calc(100vw - 64px)));max-height:min(60vh,460px)}}
+.studio-out{min-width:0}
+.studio-out>.media-result,.studio-out>#imgResult{margin-top:0}
+.studio-out>.media-result:not(:empty),.studio-out>#imgResult:not(:empty){margin-bottom:var(--sp-5)}
+.studio-out>#imgResult img{margin-top:0;max-height:70vh}
+.studio-out .img-side-title{font-size:var(--fs-md);padding-bottom:var(--sp-3);border-bottom:1px solid var(--border);margin-bottom:var(--sp-4)}
+.studio-out .media-gallery{margin-top:0}
+.studio-out .mini-search{flex:0 1 240px;width:auto}
+/* an empty output column reads as broken; say what will show up there */
+.studio-out #imgHistory:empty::after,.studio-out .media-gallery:empty::after{content:'Nothing here yet \2014 what you generate shows up here.';grid-column:1/-1;display:flex;align-items:center;justify-content:center;min-height:220px;border:1px dashed var(--border);border-radius:var(--r-lg);color:var(--text-faint);font-size:var(--fs-md)}
+@media(max-width:900px){.studio{grid-template-columns:minmax(0,1fr)}}
 .img-layout{display:flex;flex-wrap:wrap;gap:28px;align-items:flex-start}
 .img-main{flex:1 1 460px;min-width:0;max-width:640px}
 .mode-toggle{display:inline-flex;gap:2px;padding:2px;margin-bottom:var(--sp-4);background:var(--bg-sunken);border:1px solid var(--border);border-radius:var(--r-md)}
@@ -1499,15 +1507,32 @@ body.dragging-image .hist-item{cursor:grabbing}
 <button class="htab" data-mediapane="video">Video</button>
 </div>
 <div class="media-pane" id="mediapane-image">
-<div class="img-layout">
-<div class="img-main">
+<div class="studio">
+<div class="studio-ctl">
 <div class="mode-toggle" id="imgMode" role="tablist">
   <button type="button" class="mode-btn active" data-mode="generate" role="tab">Generate</button>
   <button type="button" class="mode-btn" data-mode="edit" role="tab">Edit</button>
 </div>
+<div class="field prompt-main">
+<label for="posPrompt">Prompt</label>
+<textarea id="posPrompt" rows="4" placeholder="a cyberpunk city at night, neon lights..."></textarea>
+</div>
+<div class="field generate-only">
+<label for="negPrompt">Negative prompt</label>
+<textarea id="negPrompt" rows="2" placeholder="blurry, low quality, watermark"></textarea>
+</div>
+<div class="field edit-only" id="editRefField">
+<label for="editFiles">Reference images</label>
+<div id="editDrop" class="drop">
+  <input id="editFiles" type="file" accept="image/*" multiple hidden>
+  <span class="drop-hint">drop images here, or click to choose</span>
+  <div id="editThumbs" class="drop-thumbs"></div>
+</div>
+</div>
+<div class="studio-sep"></div>
 <div class="img-params">
 <div class="field generate-only">
-<div class="lbl-row"><label for="sdModel">Image model</label><label class="nsfw-toggle" for="imgNsfw" title="Show NSFW-leaning image models in the list. Off by default."><input type="checkbox" id="imgNsfw"> use NSFW models</label></div>
+<div class="lbl-row"><label for="sdModel">Image model</label><label class="nsfw-toggle" for="imgNsfw" title="Show NSFW-leaning image models in the list. Off by default."><input type="checkbox" id="imgNsfw"> NSFW</label></div>
 <input id="sdModel" type="text" list="sdModels" placeholder="type or select an image model..." autocomplete="off">
 <datalist id="sdModels"></datalist>
 </div>
@@ -1549,14 +1574,6 @@ body.dragging-image .hist-item{cursor:grabbing}
 </div>
 <label class="inline-check edit-only" for="editMatchSource"><input type="checkbox" id="editMatchSource" checked><span>Match source shape <small id="editSrcDims"></small></span></label>
 </div>
-<div class="field">
-<label for="posPrompt">Positive prompt</label>
-<textarea id="posPrompt" rows="3" placeholder="a cyberpunk city at night, neon lights..."></textarea>
-</div>
-<div class="field generate-only">
-<label for="negPrompt">Negative prompt</label>
-<textarea id="negPrompt" rows="2" placeholder="blurry, low quality, watermark"></textarea>
-</div>
 <details class="img-advanced" id="imgAdvanced">
 <summary>Advanced</summary>
 <div class="slider-row">
@@ -1575,19 +1592,11 @@ body.dragging-image .hist-item{cursor:grabbing}
 <span class="val" id="imgBatchVal"></span>
 </div>
 </details>
-<div class="field edit-only" id="editRefField">
-<label for="editFiles">Reference images</label>
-<div id="editDrop" class="drop">
-  <input id="editFiles" type="file" accept="image/*" multiple hidden>
-  <span class="drop-hint">drop images here, or click to choose</span>
-  <div id="editThumbs" class="drop-thumbs"></div>
+<button id="imgGenerate" class="studio-go">Generate</button>
 </div>
-</div>
-<button id="imgGenerate">Generate</button>
+<div class="studio-out">
 <div id="imgResult"></div>
-</div>
-<div class="img-side">
- <div class="img-side-title">Recent <input id="imgSearch" class="mini-search" type="text" placeholder="filter model / prompt…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" name="imgRecentFilter"></div>
+<div class="img-side-title">Recent <input id="imgSearch" class="mini-search" type="text" placeholder="filter model / prompt…" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" name="imgRecentFilter"></div>
 <div id="imgHistory"></div>
 <div id="imgPager" class="img-pager" style="display:none">
   <button type="button" id="imgPrev" class="pager-btn" title="Newer">&#8249;</button>
@@ -1599,12 +1608,22 @@ body.dragging-image .hist-item{cursor:grabbing}
 </div>
 
 <div class="media-pane" id="mediapane-music" style="display:none">
-<div class="media-form">
-<div class="media-row media-row-3">
+<div class="studio">
+<div class="studio-ctl">
+<div class="field prompt-main">
+<label for="musStyle">Style</label>
+<textarea id="musStyle" rows="3" placeholder="dream pop, 90 bpm, female vocal, reverbed guitars, warm analog production"></textarea>
+</div>
+<div class="field">
+<label for="musLyrics">Lyrics <small class="setting-help">optional — [Verse] / [Chorus] tags work</small></label>
+<textarea id="musLyrics" rows="7" placeholder="[Verse]&#10;rain on the gutter, paper boat going nowhere&#10;&#10;[Chorus]&#10;..."></textarea>
+</div>
+<div class="studio-sep"></div>
 <div class="field">
 <label for="musModel">Model <small class="setting-help">optional</small></label>
 <input id="musModel" type="text" placeholder="any music-capable host" autocomplete="off">
 </div>
+<div class="media-row media-row-2">
 <div class="field">
 <label for="musDuration">Length (s)</label>
 <input id="musDuration" type="number" min="5" max="300" value="120">
@@ -1614,24 +1633,25 @@ body.dragging-image .hist-item{cursor:grabbing}
 <input id="musSeed" type="number" value="-1" title="-1 = random">
 </div>
 </div>
-<div class="field">
-<label for="musStyle">Style</label>
-<textarea id="musStyle" rows="2" placeholder="dream pop, 90 bpm, female vocal, reverbed guitars, warm analog production"></textarea>
+<button id="musGenerate" class="studio-go">Generate</button>
 </div>
-<div class="field">
-<label for="musLyrics">Lyrics <small class="setting-help">optional — [Verse] / [Chorus] section tags are understood</small></label>
-<textarea id="musLyrics" rows="6" placeholder="[Verse]&#10;rain on the gutter, paper boat going nowhere&#10;&#10;[Chorus]&#10;..."></textarea>
-</div>
-<button id="musGenerate">Generate</button>
+<div class="studio-out">
 <div id="musResult" class="media-result"></div>
 <div class="media-note" id="musicNote"></div>
 <div id="musicModels" class="media-models"></div>
 </div>
 </div>
+</div>
 
 <div class="media-pane" id="mediapane-speech">
-<div class="media-form">
-<div class="media-row media-row-3" style="grid-template-columns:1fr 1fr">
+<div class="studio">
+<div class="studio-ctl">
+<div class="field prompt-main">
+<label for="ttsText">Text</label>
+<textarea id="ttsText" rows="6" placeholder="Say something worth hearing."></textarea>
+</div>
+<div class="studio-sep"></div>
+<div class="media-row media-row-2">
 <div class="field">
 <label for="ttsVoice">Voice</label>
 <input id="ttsVoice" type="text" list="ttsVoices" placeholder="host default" autocomplete="off">
@@ -1642,24 +1662,38 @@ body.dragging-image .hist-item{cursor:grabbing}
 <input id="ttsModel" type="text" placeholder="any TTS host" autocomplete="off">
 </div>
 </div>
-<div class="field">
-<label for="ttsText">Text</label>
-<textarea id="ttsText" rows="4" placeholder="Say something worth hearing."></textarea>
+<button id="ttsGenerate" class="studio-go">Speak</button>
 </div>
-<button id="ttsGenerate">Speak</button>
+<div class="studio-out">
 <div id="ttsResult" class="media-result"></div>
-  <div id="ttsGallery" class="media-gallery"></div>
+<div class="img-side-title">Recent</div>
+<div id="ttsGallery" class="media-gallery"></div>
+</div>
 </div>
 </div>
 
 <div class="media-pane" id="mediapane-video" style="display:none">
-<div class="media-form">
-<div class="media-row media-row-3">
+<div class="studio">
+<div class="studio-ctl">
+<div class="field prompt-main">
+<label for="vidPrompt">Prompt</label>
+<textarea id="vidPrompt" rows="4" placeholder="a paper boat drifting down a rain gutter, slow motion"></textarea>
+</div>
+<div class="field">
+<label for="vidStartFile">Start image <small class="setting-help">optional</small></label>
+<div id="vidDrop" class="drop">
+  <input id="vidStartFile" type="file" accept="image/*" hidden>
+  <span class="drop-hint">drop an image, or click</span>
+  <div id="vidThumb" class="drop-thumbs"></div>
+</div>
+</div>
+<div class="studio-sep"></div>
 <div class="field">
 <label for="vidModel">Model <small class="setting-help">optional</small></label>
 <input id="vidModel" type="text" list="vidModels" placeholder="loading models&hellip;" autocomplete="off">
 <datalist id="vidModels"></datalist>
 </div>
+<div class="media-row media-row-2">
 <div class="field">
 <label for="vidAspect">Aspect</label>
 <select id="vidAspect">
@@ -1677,8 +1711,6 @@ body.dragging-image .hist-item{cursor:grabbing}
 </select>
 </div>
 </div>
-<div class="vid-io">
-<div class="vid-io-left">
 <div class="media-row media-row-2">
 <div class="field">
 <label for="vidFrames">Frames</label>
@@ -1689,24 +1721,13 @@ body.dragging-image .hist-item{cursor:grabbing}
 <input id="vidSteps" type="number" min="1" max="60" step="1" placeholder="20">
 </div>
 </div>
-<div class="field">
-<label for="vidPrompt">Prompt</label>
-<textarea id="vidPrompt" rows="3" placeholder="a paper boat drifting down a rain gutter, slow motion"></textarea>
+<button id="vidGenerate" class="studio-go">Generate</button>
 </div>
-</div>
-<div class="field vid-io-right">
-<label for="vidStartFile">Start image <small class="setting-help">optional</small></label>
-<div id="vidDrop" class="drop">
-  <input id="vidStartFile" type="file" accept="image/*" hidden>
-  <span class="drop-hint">drop an image, or click</span>
-  <div id="vidThumb" class="drop-thumbs"></div>
-</div>
-</div>
-</div>
-<button id="vidGenerate">Generate</button>
+<div class="studio-out">
 <div id="vidResult" class="media-result"></div>
-<div class="img-side-title" style="margin-top:var(--sp-5)">Recent</div>
+<div class="img-side-title">Recent</div>
 <div id="vidGallery" class="media-gallery"></div>
+</div>
 </div>
 </div>
 </div>
