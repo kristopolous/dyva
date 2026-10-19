@@ -32,7 +32,7 @@ esac
 
 case "$SERVICE" in
   all)
-    for i in ds4 vllm lmstudio fooocus llama.cpp ollama shodan comfyui a1111 gradio; do
+    for i in ds4 strata vllm lmstudio fooocus llama.cpp ollama shodan comfyui a1111 gradio; do
       $CMD $i "${SUB_ARGS[@]}"
       last_res="$?"
       echo ">>   "$last_res
@@ -149,6 +149,10 @@ ENDL
 )
     ;;
     
+  strata)
+    PORTS="8080,8081"
+    ;;
+
   comfyui)
     QUERY='title="ComfyUI"'
     PORTS="9200,8983,9200,5060,8089,5601,28017,8188,8080,80,443"

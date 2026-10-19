@@ -485,6 +485,18 @@ SERVICE_CONFIG = {
         "hunter_query": 'web.title="localai"',
         "check_path": "/v1/models",
     },
+    "strata": {
+        # Strata: an OpenAI-dialect inference server (web UI page title "Strata").
+        # /v1/models returns the standard {"object":"list","data":[...]} shape, landing
+        # in the OpenAI-dialect else branch of _check_host (data[].id), like vllm/localai.
+        # Runs on varied high ports (seen 8001, 8989); the default here is only a
+        # fallback — FOFA results carry each host's real port. MOST instances are
+        # API-key-gated: /v1/models 401s with {"error":{"type":"authentication_error"}},
+        # which check buckets as notworking. The open ones (no key) serve normally.
+        "port": 8001,
+        "fofa_query": 'title="strata" && fid="QgtTUGXb22z2rR2CCvnARw=="',
+        "check_path": "/v1/models",
+    },
 }
 
 # Named searches aren't services: they have a FOFA query but no probe/check
