@@ -3419,7 +3419,15 @@ def add_bad(host, model, kind="other", reason=None):
     reason = (" ".join(str(reason).split())[:500] or None) if reason else None
     db = _get_db()
     cur = _state_of(host, model)
-    if cur is None or cur == "unknown":
+    if reason and _STRUCTURAL_FAIL_RE.search(reason):
+        # STRUCTURAL/permanent failure (auth-gated 401/403, missing model, unloadable build):
+        # it will NEVER work for us, so condemn it to 'bad' from ANY prior state — including
+        # 'good'. load_incompatible() hard-excludes only state='bad', so the good->maybe_good
+        # leniency below was parking a once-good host at maybe_good forever on a permanent 401,
+        # leaving it a candidate that got re-probed EVERY request. (Leniency is for transient
+        # blips, which structural signatures are deliberately conservative about matching.)
+        new_state = "bad"
+    elif cur is None or cur == "unknown":
         # No verdict yet, OR an explicit 'unknown' row (mark_smoke creates one before the caller
         # decides a tier) — a failure makes it bad. Without the 'unknown' case, a host smoke-probed
         # first (so a row already exists) could NEVER reach 'bad', so load_incompatible() never saw
