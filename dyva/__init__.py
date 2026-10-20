@@ -332,6 +332,16 @@ TIMEOUT_MAX = 180
 # runtime (worker_max / worker_max_failover).
 WORKER_MAX = 1800
 WORKER_MAX_FAILOVER = False
+# A streamed response that drops mid-generation is normally continued on another host
+# by carrying the partial work forward. That splice is sound for PROSE but not for a
+# TOOL CALL: a function call is atomic — one host can't emit half its arguments and
+# have another finish them, so re-racing re-emits the whole call on top of the bytes
+# already streamed (duplication) or the continuation aside turns it into chat ("sure,
+# let me continue"). So by default a dropped tool turn ends the stream honestly (the
+# client sees a truncation) instead of splicing. TOOL_RESUME ("YOLO") opts back in to
+# the carry-forward, for the one case worth the gamble — a long/expensive tool output
+# where salvaging beats a full redo; it is far from 100%. Settable at runtime.
+TOOL_RESUME = False
 # A host that answers with a cold-start signal ("loading model") or a busy signal
 # (503 / full queue) is ALIVE and committing to serve us — it just isn't ready this
 # instant. That is the whole availability-beats-speed premise: we do not drop it, we
@@ -641,7 +651,7 @@ def model_modalities(model):
 def load_settings():
     """Apply persisted runtime settings (workers/timeout/min_count/local) over
     the CLI defaults, so changes made in the dashboard survive restarts."""
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED
     if not os.path.exists(SETTINGS_FILE):
         return
     try:
@@ -668,6 +678,8 @@ def load_settings():
         WORKER_MAX = s["worker_max"]
     if isinstance(s.get("worker_max_failover"), bool):
         WORKER_MAX_FAILOVER = s["worker_max_failover"]
+    if isinstance(s.get("tool_resume"), bool):
+        TOOL_RESUME = s["tool_resume"]
     if isinstance(s.get("race_watchdog"), (int, float)) and s["race_watchdog"] >= 0:
         RACE_WATCHDOG = s["race_watchdog"]
     if isinstance(s.get("fanout"), (int, float)) and s["fanout"] > 0:
@@ -707,7 +719,7 @@ def save_settings(extra=None):
         data = {}
     data.update({"workers": WORKER_COUNT, "timeout": TIMEOUT,
                  "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS,
-                 "worker_max": WORKER_MAX, "worker_max_failover": WORKER_MAX_FAILOVER, "race_watchdog": RACE_WATCHDOG,
+                 "worker_max": WORKER_MAX, "worker_max_failover": WORKER_MAX_FAILOVER, "tool_resume": TOOL_RESUME, "race_watchdog": RACE_WATCHDOG,
                  "min_count": MIN_COUNT, "local": _LOCAL, "explore": EXPLORE_MODE,
                  "admin_pw": ADMIN_PW, "model_list": MODEL_LIST, "model_list_on": MODEL_LIST_ON,
                  "cloudskip": sorted(CLOUD_SKIP), "base_path": BASE_PATH,
@@ -7589,6 +7601,20 @@ def _continuation_payload(payload, partial_text):
     return out
 
 
+def _resume_dropped_stream(tool_arg_chars, tool_resume=None):
+    """At a mid-stream drop, may dyva keep trying to COMPLETE the turn on another host?
+
+    Prose (and anything with no tool call in flight — `tool_arg_chars` == 0) splices
+    cleanly, so yes. A tool call is atomic: once its argument bytes have streamed to the
+    client, carrying it forward re-emits the whole call on top of them (duplication) or
+    the aside reframes it as chat — so NO by default. The TOOL_RESUME opt-in says keep
+    trying anyway (a long/expensive tool output worth the gamble, far from 100%).
+    True -> fail over and try to finish; False -> end the stream as an honest truncation."""
+    if tool_resume is None:
+        tool_resume = TOOL_RESUME
+    return tool_arg_chars <= 0 or bool(tool_resume)
+
+
 async def _race_sse_keepalive(request, session, model, servers, payload, req_caps, job_wid):
     """Race for a host while keeping a streaming SSE client's connection warm.
 
@@ -7784,6 +7810,18 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
                 f"answer hit the context window on {host} at {made} chars — "
                 f"continuing with a larger window", wid=job_wid)
         continues += 1
+        # A tool call was mid-flight when the stream dropped. A function call is atomic,
+        # so by default don't splice it onto another host (which duplicates the call or
+        # reframes it as chat) — end the stream honestly with a truncation terminal
+        # (finish_reason 'length', which the client renders as "truncated") instead.
+        # TOOL_RESUME opts back into the carry-forward for a long tool output worth the gamble.
+        if not _resume_dropped_stream(partial[1]):
+            await broadcast_activity(host, full, "failed",
+                f"tool call truncated on {host} after {made} chars — not resuming "
+                f"(set tool_resume to retry)", wid=job_wid)
+            with contextlib.suppress(Exception):
+                await _write_terminal_done(response, full, openai_format)
+            break
         remaining = [s for s in servers if s[1] not in dead]
         has_progress = bool(partial[0].strip() or partial[1] > 0)
         # Re-race the remaining pool while under the cap. Two distinct cases, previously
@@ -9848,7 +9886,7 @@ async def handle_settings_get(request):
         return web.json_response({"admin": False, "admin_pw_set": True}, status=403)
     return web.json_response({"workers": WORKER_COUNT, "timeout": TIMEOUT,
                               "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS,
-                              "worker_max": WORKER_MAX, "worker_max_failover": WORKER_MAX_FAILOVER, "race_watchdog": RACE_WATCHDOG,
+                              "worker_max": WORKER_MAX, "worker_max_failover": WORKER_MAX_FAILOVER, "tool_resume": TOOL_RESUME, "race_watchdog": RACE_WATCHDOG,
                               "min_count": MIN_COUNT, "local": _LOCAL,
                               "explore": EXPLORE_MODE,
                               "cloudskip": sorted(CLOUD_SKIP),
@@ -9869,7 +9907,7 @@ async def handle_settings_post(request):
       '200':
         description: Updated settings
     """
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED
     resp = await _check_local(request) or _check_admin(request)
     if resp:
         return resp
@@ -9905,6 +9943,8 @@ async def handle_settings_post(request):
         WORKER_MAX = min(body["worker_max"], 30 * 86400)   # 0 disables; ceiling 30 days
     if isinstance(body.get("worker_max_failover"), bool):
         WORKER_MAX_FAILOVER = body["worker_max_failover"]
+    if isinstance(body.get("tool_resume"), bool):
+        TOOL_RESUME = body["tool_resume"]
     if isinstance(body.get("race_watchdog"), (int, float)) and body["race_watchdog"] >= 0:
         RACE_WATCHDOG = min(int(body["race_watchdog"]), 3600)   # 0 = off; seconds between logs
     if isinstance(body.get("fanout"), (int, float)) and body["fanout"] > 0:
@@ -9948,7 +9988,7 @@ async def handle_settings_post(request):
         await asyncio.get_event_loop().run_in_executor(None, refresh_cache)
     return web.json_response({"workers": WORKER_COUNT, "timeout": TIMEOUT,
                               "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS,
-                              "worker_max": WORKER_MAX, "worker_max_failover": WORKER_MAX_FAILOVER, "race_watchdog": RACE_WATCHDOG,
+                              "worker_max": WORKER_MAX, "worker_max_failover": WORKER_MAX_FAILOVER, "tool_resume": TOOL_RESUME, "race_watchdog": RACE_WATCHDOG,
                               "min_count": MIN_COUNT, "local": _LOCAL,
                               "explore": EXPLORE_MODE,
                               "cloudskip": sorted(CLOUD_SKIP),
