@@ -1185,7 +1185,8 @@ def _apply_source_mapping(row, mapping):
     The mapping is only for RENAMES — {"server": {"field": "url"}} copies the row's
     `url` into `server` — and CONSTANTS — {"service": {"value": "ollama"}} forces a
     value. `models`, `version`, `service`-if-already-present, etc. need no entry."""
-    out = dict(row) if isinstance(row, dict) else {}
+    row = row if isinstance(row, dict) else {}   # a null/non-dict row in a source array
+    out = dict(row)                              # must not crash a {"field": …} lookup below
     if isinstance(mapping, dict):
         for target, spec in mapping.items():
             if not isinstance(spec, dict):
@@ -2932,9 +2933,11 @@ _STRUCTURAL_FAIL_RE = re.compile(
     r"|model [\"'].{0,80}?[\"'] not found"
     r"|does not exist"
     # Auth-gated: a 401/403 means the host needs credentials we don't have — permanent for US, so
-    # record once and hard-exclude instead of re-probing it every request. (The quick-test's detail
-    # is "status 401: …", so this matches it there AND in load_incompatible's last_fail_reason.)
-    r"|status 40[13]\b",
+    # record once and hard-exclude instead of re-probing it every request. The quick-test phrases it
+    # "status 401: …"; the comfy/a1111 image path phrases it "HTTP 401" (e.g. "/models/checkpoints
+    # HTTP 401") — match BOTH so an auth-gated image host is excluded just like a text one.
+    r"|status 40[13]\b"
+    r"|HTTP 40[13]\b",
     re.I)
 
 
@@ -11660,8 +11663,7 @@ async def handle_sd_models(request):
             # (checkpoints, UNETs like z-image / flux / sdxl) and drop the parts
             # (vae/clip/lora) and the non-image families (video/audio/music).
             for m in s.get("models", []):
-                name = str(m).replace("\\", "/").rsplit("/", 1)[-1]
-                if _NOT_A_MODEL.search(name) or _NOT_IMAGE_MODEL.search(name):
+                if not _is_image_gen_model(m):   # full-path test: drops folder-namespaced parts
                     continue
                 _add(m.rsplit("/", 1)[-1] if "/" in m else m, host)
     for row in seen.values():
@@ -11669,6 +11671,13 @@ async def handle_sd_models(request):
         row["family"] = fam
         row["sampler"] = takes_sampler    # False => flow/DiT family, sampler dropdown is inert
         row["nsfw"] = is_nsfw_model(row["id"])   # so the UI can hide NSFW models by default
+        # The model's actual sampling knobs, so the dashboard shows the RIGHT
+        # steps/cfg when a model is picked instead of a generic 20/CFG-7.
+        rec = _sampling_recipe(row["id"])
+        if "steps" in rec:
+            row["steps"] = rec["steps"]
+        if "cfg" in rec:
+            row["cfg"] = rec["cfg"]
     return web.json_response({
         "object": "list",
         "data": sorted(seen.values(), key=lambda x: -x["count"]),
@@ -12495,6 +12504,47 @@ async def handle_web_search(request):
     return web.json_response({"query": q, "results": results})
 
 
+def _image_pool(a1111_candidates, comfy_candidates, model_filter, marks, last_host):
+    """The image routing candidate pool — a1111 + comfyui hosts ordered by the SAME
+    rules text routing uses, best-first. Priority:
+      1. 👎 session-skip hosts hard-DROPPED (host-wide "do not go back"); 👍 to front.
+      2. STRUCTURAL failures hard-DROPPED (auth 401/403, missing model) via load_incompatible().
+      3. reputation tier (capability_tier: sticky > good > maybe_good > unknown > bad/unreachable).
+      4. fallback-chain order (_split_fallback): every 'z*image' host before any 'flux*2'.
+      5. least-loaded (the _idle_first signal).
+    `a1111_candidates`/`comfy_candidates` are already model-filtered server dicts.
+    Returns host-name strings. Image generation is thus NOT a separate routing scheme.
+    """
+    incompat = load_incompatible()
+    chain = _split_fallback(model_filter) if model_filter else []
+    sbh = {s.get("server"): s for s in a1111_candidates}
+    sbh.update({s.get("server"): s for s in comfy_candidates})
+
+    def _drop(h):
+        return _norm_host(h) in _session_skip_hosts or f"{h} {IMG_KEY}" in incompat
+
+    def _chain_pref(h):
+        if len(chain) <= 1:
+            return 0
+        ms = (sbh.get(h) or {}).get("models", [])
+        for i, a in enumerate(chain):
+            if any(_is_image_gen_model(m)
+                   and model_query_match(m.split(" [")[0] if " [" in m else m, a)
+                   for m in ms):
+                return i
+        return len(chain)
+
+    def _key(h):
+        return (0 if _norm_host(h) in _session_prefer_hosts else 1,
+                capability_tier(h, IMG_KEY, marks, last_host),
+                _chain_pref(h),
+                _inflight.get(h, 0) + (1 if is_active(h) else 0))
+
+    raw = list(dict.fromkeys([s.get("server") for s in a1111_candidates]
+                             + [s.get("server") for s in comfy_candidates]))
+    return sorted((h for h in raw if not _drop(h)), key=_key)
+
+
 async def handle_txt2img(request):
     """
     Text-to-image generation (A1111 format)
@@ -12665,13 +12715,10 @@ async def handle_txt2img(request):
     # empty a1111 list simply makes Phase 1/2 no-ops. The honest "nothing
     # anywhere had this model" answer is the tried_total == 0 check at the end.
 
-    # Was a two-way good/not-good sort, which meant a1111 never used maybe_good
-    # and re-probed hosts already known dead at the connection level.
+    # a1111 and comfyui hosts are pooled and ordered by the SAME rules below — one
+    # race, not a separate scheme per service. (marks/_last_img feed capability_tier.)
     marks = load_marks()
     _last_img = get_last(IMG_KEY)
-    hosts.sort(key=lambda h: capability_tier(
-        h, IMG_KEY, marks, _last_img[0] if _last_img else None))
-    hosts = _idle_first(hosts)
 
     wkey = model_filter or "*"   # worker-card title: the model search, not the prompt
 
@@ -12787,53 +12834,40 @@ async def handle_txt2img(request):
         data["service"] = service_of(host_used) if host_used else ""
         return web.json_response(data)
 
-    # A host-wide unreachable mark (dead at the connection level) must exclude a
-    # host from image routing too — it's stored under a sentinel "model", so the
-    # per-model IMG_KEY check alone would miss it and keep trying dead hosts.
-    _bad = load_bad()
-    _un = load_unreachable()
-    def _img_bad(h):
-        return h in _un or f"{h} {IMG_KEY}" in _bad
-
-    # ONE host per image (workers=1): each request occupies a single host and
-    # fails over to the next only if that one fails — the same shape as a text
-    # generation. Racing the whole pool and keeping the fastest (the old default)
-    # made every concurrent request converge on the one fastest host AND set a
-    # render going on every other host just to cancel it. With a single host per
-    # request, _idle_first (load-aware) spreads a burst of N requests across N
-    # hosts — the "quantity fans out across workers" behaviour.
-    # Phase 1: good + untested hosts (skip known-bad and unreachable)
-    data = await _race([h for h in hosts if not _img_bad(h)], a1111_attempt, workers=1)
-    if data:
-        return await _deliver(data)
-
-    # Phase 2: exhausted — retry the previously bad / unreachable (recovery path)
-    data = await _race([h for h in hosts if _img_bad(h)], a1111_attempt, workers=1)
-    if data:
-        return await _deliver(data)
-
-    # Phase 3: comfyui hosts
+    # ----- ONE candidate pool, ONE tiered race ---------------------------------
+    # Image routing is NOT a separate scheme from text. a1111 + comfyui hosts are
+    # pooled and ordered by, in priority:
+    #   1. 👎 session-skip hard-DROPPED (host-wide "do not go back"); 👍 to the front
+    #      — the SAME _session_skip_hosts / _session_prefer_hosts text routing uses.
+    #   2. STRUCTURAL failures hard-DROPPED (auth 401/403, missing model) via
+    #      load_incompatible() — the same hard-exclude text applies.
+    #   3. reputation tier (capability_tier: sticky > good > maybe_good > unknown >
+    #      bad/unreachable) — the same tiers, via the same marks.
+    #   4. fallback-chain order (_split_fallback): every 'z*image' host before any
+    #      'flux*2' host — the same ordered chain text honours.
+    #   5. least-loaded (the _idle_first signal), so a burst spreads across hosts.
+    # workers=1: one host per request, failing over down the ordered pool. The race
+    # engine, reputation recording (failure / timeout / HTTP-error / honeypot via
+    # record_verdict), and banker leasing are already shared — only the per-host
+    # render differs, dispatched by service_of below.
     comfy_candidates = [s for s in servers if s.get("service") == "comfyui"]
     if model_filter:
         comfy_candidates = [
             s for s in comfy_candidates
-            if any(model_query_match(m.split(" [")[0] if " [" in m else m, model_filter)
+            if any(_is_image_gen_model(m)
+                   and model_query_match(m.split(" [")[0] if " [" in m else m, model_filter)
                    for m in s.get("models", []))
         ]
-    comfy_hosts = _idle_first(
-        [s.get("server") for s in comfy_candidates if not _img_bad(s.get("server"))])
-    data = await _race(comfy_hosts, comfy_attempt, workers=1)   # one host per image; spread, don't spray
-    if data:
-        return await _deliver(data)
+    pool = _image_pool(candidates, comfy_candidates, model_filter, marks,
+                       _last_img[0] if _last_img else None)
 
-    # Phase 4 (recovery): the KNOWN-BAD comfy hosts — tried LAST, but tried. A comfy
-    # "no response" is usually flaky (busy/slow render, or our own workflow), not a
-    # dead host, so we deprioritise bad comfy hosts rather than excluding them forever.
-    # Without this the comfy pool only ever shrinks (a1111 has Phase 2; comfy lacked it),
-    # which is how a model ends up hammering the one host that isn't yet 'bad'.
-    comfy_bad = _idle_first(
-        [s.get("server") for s in comfy_candidates if _img_bad(s.get("server"))])
-    data = await _race(comfy_bad, comfy_attempt, workers=1)
+    async def img_attempt(host, wid, done):
+        # The ROUTING picked this host; the protocol only renders it.
+        if service_of(host) == "comfyui":
+            return await comfy_attempt(host, wid, done)
+        return await a1111_attempt(host, wid, done)
+
+    data = await _race(pool, img_attempt, workers=1)
     if data:
         return await _deliver(data)
 
@@ -13287,10 +13321,18 @@ async def _txt2img_comfyui(session, host, body, model_filter=None):
         reasons = []
         plan = _edit_plan(info, model_filter, n_images=0, reasons=reasons) if info else None
         if plan and model_query_match(plan["model"], model_filter):
-            eparams = {"width": width, "height": height, "steps": steps,
-                       "cfg_scale": cfg, "seed": seed, "sampler_name": sampler,
+            # Pass ONLY what the caller explicitly pinned (None otherwise), exactly
+            # as the t2i branch below does — so the encode family's own steps/cfg
+            # (ZImage 8/1.0, etc.) drive the render instead of the generic 20/CFG-7
+            # computed above from the *query*. `sampler` is stripped inside
+            # _edit_workflow regardless; the raw body value rides along only so an
+            # explicit caller sampler can still be honored there.
+            eparams = {"width": width, "height": height,
+                       "steps": (int(body["steps"]) if body.get("steps") is not None else None),
+                       "cfg_scale": (float(body["cfg_scale"]) if body.get("cfg_scale") is not None else None),
+                       "seed": seed, "sampler_name": body.get("sampler_name"),
                        "match_source": False}
-            workflow = _edit_workflow(plan, prompt_text, [], eparams)
+            workflow = _edit_workflow(plan, prompt_text, [], eparams, info=info)
             resolved = plan["model"]
         else:
             # Not a distinctive-node edit model — try the plain UNET t2i families
@@ -16112,6 +16154,17 @@ _NOT_A_MODEL = re.compile(
     r"|^(qwen[0-9._]*vl|qwen_[0-9._]+_vl|gemma|mistral|llava|byt5|pile-t5|flan)")
 
 
+def _is_image_gen_model(name):
+    """True if this ComfyUI file can itself generate an image — a checkpoint or a
+    diffusion/UNET model — not a VAE, CLIP/text-encoder, LoRA, controlnet, embed, or
+    a video/audio family. Tested on the FULL path so folder-namespaced PARTS are
+    excluded even when the basename alone looks like a model: a flux2/z-image host
+    carries `text_encoders/qwen_3_4b.safetensors` (a Qwen text encoder), which must
+    NOT make the host a match for a 'qwen' image query."""
+    s = str(name or "").replace("\\", "/")
+    return not (_NOT_A_MODEL.search(s) or _NOT_IMAGE_MODEL.search(s))
+
+
 # Image-generation families that do NOT use the A1111 sampler dropdown: the
 # flow-matching / DiT models (Flux and its Krea variant, z-image, Qwen-Image,
 # SD3/3.5, HiDream, Chroma, Sana, PixArt, AuraFlow, Lumina, Cosmos). dyva picks
@@ -16147,6 +16200,34 @@ def _image_family(name):
         if rx.search(base):
             return fam, fam not in _NONSAMPLER_FAMILIES
     return "", True
+
+
+def _sampling_recipe(name):
+    """Recommended {steps, cfg, sampler?, takes_sampler} for an image-gen model
+    filename — the knobs the submit path will ACTUALLY use, so the dashboard can
+    show them instead of a generic 20-steps/CFG-7 that over-cooks a cfg-1 flow
+    model. Source of truth by kind: the encode/t2i family tables for flow/DiT
+    models (z-image, Flux.2, Qwen-Image, SD3…), the checkpoint recipe table (plus
+    any step count baked into the name) for plain checkpoints, else classic SD.
+    Edit families are checked first and in order, matching how the submit path
+    resolves them."""
+    _, takes_sampler = _image_family(name)
+    rec = {}
+    for fam in load_edit_families() + load_t2i_families():
+        pat = fam.get("model")
+        if pat and re.search(pat, name):
+            rec = {k: fam[k] for k in ("steps", "cfg", "sampler", "scheduler") if k in fam}
+            break
+    if not rec:
+        rec = _ckpt_recipe(name)
+    out = {"takes_sampler": takes_sampler}
+    if rec.get("steps") is not None:
+        out["steps"] = int(rec["steps"])
+    if rec.get("cfg") is not None:
+        out["cfg"] = float(rec["cfg"])
+    if takes_sampler and rec.get("sampler"):
+        out["sampler"] = rec["sampler"]
+    return out
 
 
 async def handle_video_models(request):
@@ -16893,8 +16974,12 @@ def _t2i_unet_workflow(plan, prompt_text, negative_prompt, params, info=None):
     steps = int(params.get("steps") if params.get("steps") is not None else fam.get("steps", 20))
     cfg = float(params.get("cfg_scale") if params.get("cfg_scale") is not None else fam.get("cfg", 3.5))
     seed = params.get("seed", 0)
-    sampler = params.get("sampler_name") or "euler"
-    scheduler = params.get("scheduler") or "simple"
+    # Strip the caller's sampler: this builder only ever runs comfy flow/DiT models
+    # (flux, z-image, qwen-image, sd3 …), for which a client's A1111 sampler is ALWAYS
+    # wrong (a capital-E 'Euler' is rejected outright). dyva picks it — the family
+    # default, snapped onto the host's KSampler enum.
+    sampler = fam.get("sampler") or "euler"
+    scheduler = fam.get("scheduler") or "simple"
     if info:
         sampler = _resolve_combo(_enum_options(info, "KSampler", "sampler_name"), sampler, ["euler"])
         scheduler = _resolve_combo(_enum_options(info, "KSampler", "scheduler"), scheduler, ["simple", "normal"])
@@ -17012,7 +17097,22 @@ def _resolve_combo(options, want, fallbacks=()):
 def _match_rank(needle):
     """Order candidates so the closest name to what the user typed wins:
     an exact file-stem match, then a prefix, then anything containing it,
-    shortest first (a bare model beats a lora or a long variant)."""
+    shortest first (a bare model beats a lora or a long variant). A comma lists
+    alternatives in preference order (see model_query_match): an option is ranked
+    by the FIRST alternative it matches, so earlier-listed alternatives sort ahead
+    — `z*image,flux` prefers a z-image over a flux even when flux sorts first by
+    name — then exact/prefix/contains within that alternative."""
+    alts = [p.strip() for p in (needle or "").split(",") if p.strip()]
+    if len(alts) > 1:
+        subkeys = [(a, _match_rank(a)) for a in alts]
+
+        def key(option):
+            for i, (a, sk) in enumerate(subkeys):
+                if model_query_match(option, a):
+                    return (i,) + tuple(sk(option))
+            return (len(alts), 3, len(option), option.lower())
+        return key
+
     n = _sep_insensitive((needle or "").replace("*", "").replace("?", ""))
 
     def key(option):
@@ -17039,9 +17139,18 @@ def _sep_insensitive(v):
 
 def model_query_match(name, query):
     """match_model, but blind to separators. Globs still work: `flux*2` matches
-    flux2-dev and flux-2-klein, and so does the literal `flux.2`."""
+    flux2-dev and flux-2-klein, and so does the literal `flux.2`. A comma lists
+    alternatives in preference order — `z*image,flux,qwen` matches a name that ANY
+    one of them matches — the same ordered fallback syntax text routing splits on
+    (see _split_fallback). ',' never appears in a real model name, so this is a pure
+    superset: a comma-free query behaves exactly as before."""
     if not (query or "").strip():
         return True
+    if "," in query:
+        parts = [p.strip() for p in query.split(",") if p.strip()]
+        if len(parts) > 1:
+            return any(model_query_match(name, p) for p in parts)
+        query = parts[0] if parts else query
     # Try the name as written first, so wildcards keep their exact meaning
     # (`flux?2` still wants one character between them) ...
     if match_model(name, query):
@@ -17179,7 +17288,7 @@ def _edit_plan(info, model_filter=None, exclude=(), n_images=0, reasons=None):
     return None
 
 
-def _edit_workflow(plan, prompt, image_names, params=None):
+def _edit_workflow(plan, prompt, image_names, params=None, info=None):
     """Build the edit graph. `image_names` are already uploaded to the host."""
     params = params or {}
     fam = plan["family"]
@@ -17232,12 +17341,22 @@ def _edit_workflow(plan, prompt, image_names, params=None):
     if _asp in VIDEO_ASPECTS:
         width, height = image_dims(fam, _asp, _size if _size in IMAGE_SIZES else "medium")
     _size_mp = min(EDIT_MAX_MP * IMAGE_SIZES.get(_size, 1.0), EDIT_MAX_MP) if _size in IMAGE_SIZES else EDIT_MAX_MP
-    steps = int(params.get("steps", fam.get("steps", 20)))
-    cfg = float(params.get("cfg_scale", fam.get("cfg", 2.5)))
+    # The family recipe is authoritative for these flow/DiT models; the caller's
+    # value wins ONLY when it was explicitly given. A passed-through None (caller
+    # didn't pin it) must fall back to the family default, never become int(None)
+    # and never clobber the recipe with a generic 20/CFG-7 the way it did before.
+    steps = int(params["steps"]) if params.get("steps") is not None else int(fam.get("steps", 20))
+    cfg = float(params["cfg_scale"]) if params.get("cfg_scale") is not None else float(fam.get("cfg", 2.5))
     seed = int(params.get("seed", -1))
     if seed == -1:
         seed = random.randint(0, 2**31 - 1)
-    sampler = params.get("sampler_name", "euler")
+    # Strip the caller's sampler: these are comfy flow/encode models (z-image, Flux.2,
+    # Qwen-Image) for which a client's A1111 sampler is ALWAYS wrong (a capital-E
+    # 'Euler' is rejected outright). dyva picks it — the family default, snapped onto
+    # the host's KSampler enum when we have the host's /object_info.
+    sampler = fam.get("sampler") or "euler"
+    if info:
+        sampler = _resolve_combo(_enum_options(info, "KSampler", "sampler_name"), sampler, ["euler"])
 
     if fam.get("encode_unified"):
         # Qwen-Image-2.1 and kin: a SINGLE encode node is the whole front end — it emits
@@ -17661,7 +17780,7 @@ async def handle_image_edit(request):
             # Uploads are per-host, so they can only happen once a host is chosen.
             names = [await comfy_upload_image(session, host, data, fn)
                      for fn, data in images]
-            workflow = _edit_workflow(plan, prompt, names, params)
+            workflow = _edit_workflow(plan, prompt, names, params, info=info)
             prompt_id = await comfy_submit(session, host, workflow)
         except (ComfyError, asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
             err = str(e) or type(e).__name__

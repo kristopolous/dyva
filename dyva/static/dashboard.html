@@ -7728,6 +7728,26 @@ function bindSlider(id,out){
 }
 bindSlider('imgSteps','imgStepsVal');
 bindSlider('imgCfg','imgCfgVal');
+// A dragged steps/CFG slider is an EXPLICIT override — once touched it's not
+// overwritten by a model's recipe default. Programmatic sets (applyModelRecipe)
+// don't fire 'input', so they never mark the knob dirty.
+var _imgKnobDirty={steps:false,cfg:false};
+document.getElementById('imgSteps').addEventListener('input',function(){_imgKnobDirty.steps=true;});
+document.getElementById('imgCfg').addEventListener('input',function(){_imgKnobDirty.cfg=true;});
+function _setSlider(id,out,v){var s=document.getElementById(id),o=document.getElementById(out);if(!s)return;s.value=v;if(o)o.textContent=s.value;}
+var _imgRecipeByModel={},_imgLastRecipeModel=null;
+// Show the knobs the render will ACTUALLY use for the picked model (z-image 8/cfg 1,
+// flux 20/cfg 1, …) instead of the generic 20/CFG-7 that over-cooks a flow model.
+// Only for a known model; a free-typed pattern leaves the sliders alone. A fresh
+// model selection clears prior overrides so each model starts from its own recipe.
+function applyModelRecipe(){
+  var name=(document.getElementById('sdModel').value||'').trim();
+  var rec=_imgRecipeByModel[name];
+  if(!rec)return;
+  if(name!==_imgLastRecipeModel){_imgLastRecipeModel=name;_imgKnobDirty={steps:false,cfg:false};}
+  if(!_imgKnobDirty.steps&&rec.steps!=null)_setSlider('imgSteps','imgStepsVal',rec.steps);
+  if(!_imgKnobDirty.cfg&&rec.cfg!=null)_setSlider('imgCfg','imgCfgVal',rec.cfg);
+}
 // imgBatch is a plain number input now (no cap — type 50 if you insist), so it shows its
 // own value; no slider-value mirror needed.
 (function(){
@@ -7876,7 +7896,7 @@ function renderImageModels(){
   var dl=document.getElementById('sdModels');if(!dl)return;
   var allowNsfw=!!(document.getElementById('imgNsfw')||{}).checked;
   var rows=_imgRows.filter(function(o){return allowNsfw||!o.nsfw;});
-  dl.innerHTML='';_imgSamplerByModel={};
+  dl.innerHTML='';_imgSamplerByModel={};_imgRecipeByModel={};
   rows.forEach(function(o){
     var opt=document.createElement('option');
     opt.value=o.id;
@@ -7886,11 +7906,13 @@ function renderImageModels(){
     opt.label=o.id+'  \u00b7  '+o.count+' host'+(o.count===1?'':'s')+(o.family?'  \u00b7  '+o.family:'');
     dl.appendChild(opt);
     _imgSamplerByModel[o.id]=(o.sampler!==false);
+    _imgRecipeByModel[o.id]={steps:(o.steps!=null?o.steps:null),cfg:(o.cfg!=null?o.cfg:null)};
   });
   document.getElementById('sdModel').placeholder=rows.length
     ? rows.length+' image models \u2014 blank auto-picks'
     : (_imgRows.length?'no models shown \u2014 tick NSFW models to include them':'no image models found');
   updateSamplerState();
+  applyModelRecipe();
 }
 (function(){var c=document.getElementById('imgNsfw');if(c)c.addEventListener('change',renderImageModels);})();
 // A flow/DiT model (flux, krea, z-image, qwen-image, sd3...) has dyva choose the
@@ -7906,8 +7928,8 @@ function updateSamplerState(){
   sel.disabled=!takes;
   if(note){note.hidden=takes;if(!takes)note.textContent='\u2014 chosen automatically for this model';}
 }
-document.getElementById('sdModel').addEventListener('input',updateSamplerState);
-document.getElementById('sdModel').addEventListener('change',updateSamplerState);
+document.getElementById('sdModel').addEventListener('input',function(){updateSamplerState();applyModelRecipe();});
+document.getElementById('sdModel').addEventListener('change',function(){updateSamplerState();applyModelRecipe();});
 function setImgMode(m){
   _imgMode=m;
   try{localStorage.setItem('dyva_imgmode',m)}catch(e){}
@@ -8078,7 +8100,9 @@ async function generateImage(){
     steps:parseInt(document.getElementById('imgSteps').value)||20,
     cfg_scale:parseFloat(document.getElementById('imgCfg').value)||7,
     batch_size:1,
-    sampler_name:document.getElementById('imgSampler').value,
+    // Omit the sampler for a flow/DiT model (dropdown inert) so dyva picks the
+    // family sampler AND history doesn't record a misleading "Euler" it never used.
+    sampler_name:(document.getElementById('imgSampler').disabled?undefined:document.getElementById('imgSampler').value),
     allow_nsfw:!!(document.getElementById('imgNsfw')||{}).checked,
   };
   btn.disabled=true;
