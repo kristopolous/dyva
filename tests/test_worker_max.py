@@ -1,5 +1,5 @@
 """Tests for the absolute worker run-time cap decision.
-`uv run pytest dyva/test_worker_max.py`
+`uv run pytest tests/test_worker_max.py`
 """
 import os
 import sys

@@ -1,4 +1,4 @@
-"""Tests for _drop_nameless_tool_calls — pytest (`uv run pytest dyva/test_tool_calls.py`).
+"""Tests for _drop_nameless_tool_calls — pytest (`uv run pytest tests/test_tool_calls.py`).
 
 A host can stream a garbage/empty tool call ({"function":{"name":null,...}}); the client
 echoes it back and an OpenAI-typed host 400s on name=None, killing the whole race. These

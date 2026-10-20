@@ -1,4 +1,4 @@
-"""Tests for the `web` tool's search — pytest (`uv run pytest dyva/test_web_search.py`).
+"""Tests for the `web` tool's search — pytest (`uv run pytest tests/test_web_search.py`).
 
 Only the pure, offline pieces: mapping Keenable's JSON response to our {title,url,snippet}
 shape, the plain-text result formatter, and the per-IP throttle. No network.

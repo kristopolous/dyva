@@ -1,4 +1,4 @@
-"""Tests for the no-tools capability mark — pytest (`uv run pytest dyva/test_no_tools.py`).
+"""Tests for the no-tools capability mark — pytest (`uv run pytest tests/test_no_tools.py`).
 
 When a host 400s with "does not support tools", dyva records the (host, model) as
 tools-incapable (mirroring mark_no_vision) so tool requests stop doorknocking it,

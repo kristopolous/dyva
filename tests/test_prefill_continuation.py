@@ -1,5 +1,5 @@
 """Tests for prefill vs aside continuation shaping — pytest
-(`uv run pytest dyva/test_prefill_continuation.py`).
+(`uv run pytest tests/test_prefill_continuation.py`).
 
 When a partial answer is carried to the NEXT host (skip / stall / drop / context
 reissue), dyva shapes it per host: a PREFILL (open-ended final assistant turn +

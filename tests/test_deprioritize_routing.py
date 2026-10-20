@@ -1,5 +1,5 @@
 """A manual 👎 (deprioritize) must push a host to the BACK of routing, not just reorder
-it within its tier — pytest (`uv run pytest dyva/test_deprioritize_routing.py`).
+it within its tier — pytest (`uv run pytest tests/test_deprioritize_routing.py`).
 
 The bug: a down-voted host that was the sticky (last-good) stayed TIER_LAST and was tried
 FIRST every time, because the vote only broke ties WITHIN a tier. These pin the fix: a

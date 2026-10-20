@@ -1,5 +1,5 @@
 """Tests for the host_status ;key-op-value filter compiler.
-`uv run pytest dyva/test_host_status_where.py`
+`uv run pytest tests/test_host_status_where.py`
 """
 import os
 import sys
