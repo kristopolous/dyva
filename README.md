@@ -71,4 +71,6 @@ However, there's a rich testing and probing harness in dyva to block these machi
 
 You can also sweep and mark based on model queries to quarantine them but it's a slightly moving target because a static list of honeypots defeats the purpose. There is a protocol called [gossiper](docs/gossiper.md) that's intended to mostly mitigate this. YMMV. Also see the [survey](docs/survey.md) for more notes.
 
+You can also disable all the public surveys in the dash and just use your own list of hosts if you want this to be an enterprise SAAS product. Go put on a tie I guess...
+
 <img alt="dyva-ender" src="https://github.com/user-attachments/assets/2c3c10fa-76f2-4f68-9c3d-2c3c855ef461" />
