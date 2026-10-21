@@ -35,7 +35,7 @@ case "$SERVICE" in
     for i in ds4 strata vllm lmstudio fooocus llama.cpp ollama shodan comfyui a1111 gradio; do
       $CMD $i "${SUB_ARGS[@]}"
       last_res="$?"
-      echo ">>   "$last_res
+      echo ">>   $i -- "$last_res
       # this is ctrl+c
       [[ "$last_res" == "130" ]] && exit
       [[ "$last_res" == "3" ]] && exit
@@ -58,7 +58,8 @@ case "$SERVICE" in
         exit 1
       fi
     fi
-    cp /tmp/full-json.json /tmp/full-json-old.json
+    jq -c . /tmp/full-json.json > /tmp/full-json-old.json
+    cp /tmp/full-json-old.json /tmp/full-json.json
     echo "$COMBINED_JSON" | ssh $_SERVER "cat > $_SERVER_PATH"
     echo "$COMBINED_JSON" | ssh $_SERVER "cat > ${_SERVER_PATH%.json}-$DATE.json"
     exit 0
