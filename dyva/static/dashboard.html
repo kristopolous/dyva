@@ -250,13 +250,14 @@ a{color:var(--text-muted)}
 .ap-head{font-size:var(--fs-xl);text-transform:uppercase;letter-spacing:var(--eyebrow-tracking);color:var(--text-muted);margin-bottom:var(--sp-3);display:flex;align-items:center}
 .conn-count{text-transform:none;letter-spacing:0;font-size:var(--fs-sm);color:var(--text-faint);font-weight:normal;margin-left:var(--sp-3);font-variant-numeric:tabular-nums}
 .conn-count-row{font-size:var(--fs-2xs);color:var(--text-faint);margin:0 0 var(--sp-2);text-align:right;font-variant-numeric:tabular-nums}
+.header-text a{color:var(--color);}
 .header-text h1{font-family:var(--font-display);font-weight:400;font-size:var(--fs-h1);margin-bottom:2px}
 /* The "D" is a whimsical theme toggle: click it and it spins a full turn as light/dark flip. */
 .dyva-d{display:inline-block;cursor:pointer;transform-origin:50% 50%;outline:none}
-.dyva-d:hover{color:var(--accent-bright)}
+.dyva-d:hover, .header-text a:hover{color:var(--accent-bright)}
 .dyva-d.spin{animation:dSpin .55s cubic-bezier(.34,1.3,.5,1)}
 @keyframes dSpin{from{transform:rotate(0)}to{transform:rotate(360deg)}}
-.header-text .sub{color:var(--text-muted);font-size:var(--fs-md)}
+.header-text .sub{,color:var(--text-muted);font-size:var(--fs-md)}
 .tabs{display:flex;gap:0;margin-bottom:var(--sp-5);flex-shrink:0;border-bottom:1px solid var(--border)}
  .tab{padding:10px 18px;border:none;border-bottom:2px solid transparent;background:transparent;color:var(--text-muted);font-size:var(--fs-lg);cursor:pointer;transition:color var(--dur),border-color var(--dur),background var(--dur);border-radius:var(--r-md) var(--r-md) 0 0}
 .tab:hover{color:var(--text-2);background:var(--surface);border-bottom-color:var(--border-hover)}
@@ -1329,7 +1330,7 @@ body.dragging-image .hist-item{cursor:grabbing}
 <div class="header">
 <a style=font-size:0 href="guide"><img id="logoImg" src="dyva.avif" alt="" width="56" height="56" data-explore="__EXPLORE__"></a>
 <div class="header-text">
-<h1><span class="dyva-d" role="button" tabindex="0" title="Spin to switch light / dark" aria-label="Toggle light or dark theme" onclick="spinD(this);toggleTheme()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();spinD(this);toggleTheme();}">D</span>yva</h1>
+  <h1><span class="dyva-d" role="button" tabindex="0" title="Spin to switch light / dark" aria-label="Toggle light or dark theme" onclick="spinD(this);toggleTheme()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();spinD(this);toggleTheme();}">D</span><a style="text-decoration:none;" href="demos">y</a>va</h1>
 <p class="sub"><!--<span title="workers">🔨 __WORKER_COUNT__ </span>&middot;<span title="timeout"> 🕰️ __TIMEOUT__s </span>&middot;--><span id="hostsPill" title="servers - loaded at __HOSTS_LOADED__" style="cursor:pointer"> <span id="hostsIcon">🖥</span> <span id="serverCount">__SERVER_COUNT__</span>
 </p>
 </div>
@@ -6227,7 +6228,7 @@ document.getElementById('chatInput').addEventListener('keydown',function(e){
     }
     if(e.key==='Tab')return;
   }
-  if(e.key==='ArrowUp'){recallPrompt(-1,e);return;}
+  if(e.key==='ArrowUp'){if(editQueuedTop(e))return;recallPrompt(-1,e);return;}
   if(e.key==='ArrowDown'){recallPrompt(1,e);return;}
   if(e.key==='Enter'&&!e.shiftKey&&!_softKbd){e.preventDefault();hideSlashPop(false);sendChat();}
 });
@@ -6247,6 +6248,25 @@ slashPop().addEventListener('mousedown',function(e){
   var name=it.getAttribute('data-cmd');
   for(var i=0;i<SLASH_COMMANDS.length;i++)if(SLASH_COMMANDS[i].cmd===name){pickSlash(SLASH_COMMANDS[i]);return;}
 });
+// Up with an empty composer and a queued (steering) message pending: pull the most-
+// recent queued line BACK into the composer to revise it, removing it from the queue.
+// Up here is "wait, that's not what I want" — so the original must not be delivered at
+// the next tool-result boundary; resending (Enter) re-queues the edited version. Takes
+// priority over prompt-history recall. Returns true when it handled the key.
+function editQueuedTop(e){
+  var input=document.getElementById('chatInput');
+  if(input.value.trim()!=='')return false;        // only from an empty composer
+  var q=currentChat&&_queued[currentChat.id];
+  if(!q||!q.length)return false;
+  e.preventDefault();
+  var t=q.pop();
+  if(!q.length)delete _queued[currentChat.id];
+  renderQueue();
+  input.value=t;
+  input.selectionStart=input.selectionEnd=input.value.length;
+  promptHistIdx=-1;                                // not in a history cycle
+  return true;
+}
 // Cycle the composer through prompt history. dir -1 walks back (older), dir +1
 // forward (newer). Up only recalls when the input is empty, saving your current
 // text into a temp slot so Down can restore it.
