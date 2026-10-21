@@ -59,13 +59,4 @@ There's also a [simple command line](docs/freeollama.md).
 * Running this might get you blocked temporarily from numerous sites on CDNs such as Cloudflare. This includes IoT networks, imdb, huggingface, cloud storage, all kinds of stuff... even banks. The public surveys have honeypots with tripwires that get the `srcaddr` (you) put in some temporary ban pool with an expiry merely by a `tcp_connect()`. These are also called canaries in the literature. 
     * There's a rich testing and probing harness in dyva to block these based on an ensemble of techniques. You can also sweep and mark based on model queries to quarantine them but it's a slightly moving target because a static list of honeypots defeats the purpose. There is a protocol called [gossiper](docs/gossiper.md) that's intended to mostly mitigate this. YMMV. Also see the [survey](docs/survey.md) for more notes.
 
-```
-Pet the feral llama
-
-   \\         
-    l'> Bahhhhh
-    ll       
-    llama~  
-    || ||  
-    '' ''
-```
+<img alt="dyva-ender" src="https://github.com/user-attachments/assets/2c3c10fa-76f2-4f68-9c3d-2c3c855ef461" />
