@@ -966,6 +966,12 @@ details.toolbox>summary{cursor:pointer;color:var(--text-dim);font-size:var(--fs-
 .cloudskip-item{display:flex;align-items:center;gap:.35em;font-size:var(--fs-md);color:var(--text);cursor:pointer}
 .cloudskip-item .cloudskip-n{color:var(--text-muted);font-size:var(--fs-sm);font-variant-numeric:tabular-nums}
 .setting-sources{margin-bottom:var(--sp-6)}
+.src-toggle-head{margin-bottom:var(--sp-1)}
+.src-toggle-head .setting-name{font-size:var(--fs-lg)}
+.src-toggles{display:flex;flex-wrap:wrap;gap:var(--sp-2) var(--sp-4);margin:var(--sp-2) 0 var(--sp-5)}
+.src-toggle{display:flex;align-items:center;gap:.4em;font-size:var(--fs-md);color:var(--text);cursor:pointer}
+.src-toggle input{cursor:pointer}
+.src-toggle .src-tag{color:var(--text-muted);font-size:var(--fs-xs)}
 .src-head{display:flex;align-items:center;gap:var(--sp-3);position:relative}
 .src-head .setting-name{font-size:var(--fs-lg)}
 .src-help-btn{width:18px;height:18px;border-radius:var(--r-full);border:1px solid var(--border-hover);background:none;color:var(--text-muted);font-size:var(--fs-2xs);cursor:pointer;line-height:1;flex-shrink:0;padding:0}
@@ -1849,6 +1855,9 @@ body.dragging-image .hist-item{cursor:grabbing}
 <label class="setting"><span class="setting-text"><span class="setting-name">Admin password</span><small class="setting-help">Protect this Settings tab and its sources. When set, opening Settings requires this password — everything else (chat, models, the dashboard) stays public. Type a new value to set or change it; leave blank to keep the current one. Forgot it? Clear <code>admin_pw</code> in <code>settings.json</code> and restart.</small></span><span class="admin-pw-field"><template id="setAdminPwTpl"><input type="text" id="adminPwUserDecoy" name="username" class="admin-pw-decoy" placeholder="username" autocomplete="username" autocorrect="off" autocapitalize="none" spellcheck="false" tabindex="-1" aria-hidden="true"><input type="password" id="setAdminPw" placeholder="none" spellcheck="false" autocomplete="new-password"></template></span></label>
 <label class="setting"><span class="setting-text"><span class="setting-name">Localhost only</span><small class="setting-help">Restrict inference endpoints to localhost only (a remote host that reaches this port can't chat or generate). Equivalent to the <code>./dyva -l</code> flag; saved here it persists across restarts.</small></span><input type="checkbox" id="setLocal"></label>
 <div class="setting-sources">
+<div class="src-toggle-head"><span class="setting-name">Sources</span></div>
+<small class="setting-help">Turn discovery sources on or off. Built-ins ship with dyva; the rest come from Additional sources below. Unticking one drops its hosts from routing — saving re-pulls the pool automatically.</small>
+<div id="srcToggles" class="src-toggles"></div>
 <div class="src-head"><span class="setting-name">Additional sources</span><button type="button" id="srcHelpBtn" class="src-help-btn" title="Format &amp; examples">?</button>
 <div id="srcHelp" class="src-help-pop">
 <div class="src-help-title">Additional sources</div>
@@ -9714,6 +9723,22 @@ function _collectCloudSkip(){
   return Array.prototype.map.call(document.querySelectorAll('#cloudSkipList .cloudskip-cb:checked'),
                                   function(cb){return cb.value});
 }
+// Source on/off toggles. A checkbox per switchable source (built-in + configured);
+// unticking one disables it. We submit the DISABLED slugs (the unchecked ones), so
+// the server stores `disabled_sources` and re-pulls the cache on change.
+function renderSrcToggles(list){
+  var box=document.getElementById('srcToggles');if(!box)return;
+  if(!list||!list.length){box.innerHTML='<span class="hd-dim">no sources</span>';return;}
+  box.innerHTML=list.map(function(t){
+    var tag=t.builtin?' <span class="src-tag">built-in</span>':'';
+    return '<label class="src-toggle"><input type="checkbox" class="src-toggle-cb" data-slug="'
+      +escHtml(t.slug)+'"'+(t.enabled?' checked':'')+'><span>'+escHtml(t.name)+'</span>'+tag+'</label>';
+  }).join('');
+}
+function _collectDisabledSources(){
+  return Array.prototype.map.call(document.querySelectorAll('#srcToggles .src-toggle-cb:not(:checked)'),
+                                  function(cb){return cb.getAttribute('data-slug')});
+}
 // "Thinking token key" setting: which key(s) the /v1 output emits reasoning under.
 // Two canonical checkboxes + one free-text custom slot; the stored value is a flat list.
 function setReasoningKeys(keys){
@@ -9765,6 +9790,7 @@ function populateSettings(s){
   renderCloudSkip(s.cloudskip||[]);
   setPwState(!!s.admin_pw_set);
   document.getElementById('setSources').value=JSON.stringify(s.sources||[],null,2);
+  renderSrcToggles(s.source_toggles||[]);
   document.getElementById('srcError').textContent='';
   document.querySelectorAll('.settings-card .settings-status').forEach(function(e){e.textContent='';});
   _wireDirty();
@@ -9904,6 +9930,7 @@ function saveSettings(){
   try{sources=raw?JSON.parse(raw):[]}catch(e){srcErr.textContent='Invalid JSON: '+e.message;return;}
   if(!Array.isArray(sources)){srcErr.textContent='Sources must be a JSON array.';return;}
   body.sources=sources;
+  body.disabled_sources=_collectDisabledSources();
   var st=_stEl();st.style.color='var(--ok)';st.textContent='saving…';
   fetch('settings',{method:'POST',headers:adminHeaders({'Content-Type':'application/json'}),body:JSON.stringify(body)})
     .then(function(r){return r.json().then(function(s){return {ok:r.ok,s:s}})})
@@ -9935,6 +9962,7 @@ function saveSettings(){
       renderCloudSkip(s.cloudskip||[]);
       setPwState(!!s.admin_pw_set);
       document.getElementById('setSources').value=JSON.stringify(s.sources||[],null,2);
+      renderSrcToggles(s.source_toggles||[]);
       _clearDirty();   // one POST committed every card
       st.style.color='var(--ok)';st.textContent=s.refreshed?'saved · sources re-pulled':'saved';setTimeout(function(){st.textContent=''},3000);
     })

@@ -790,6 +790,26 @@ def set_sources_enabled(names, enabled):
     return changed, unknown
 
 
+def _source_toggles():
+    """[{name, slug, enabled, builtin}] for every switchable source — feeds the
+    Settings UI so the operator can flip a built-in (or configured) source off
+    without hand-editing settings.json. Deduped by slug: a configured source that
+    shadows a built-in name (e.g. a 'graflex' override) shows once, as built-in."""
+    off = disabled_sources()
+    builtin = {s["name"] for s in BUILTIN_SOURCES}
+    seen, out = set(), []
+    for n in known_source_names():
+        if not n:
+            continue
+        slug = _source_slug(n)
+        if slug in seen:
+            continue
+        seen.add(slug)
+        out.append({"name": n, "slug": slug,
+                    "enabled": slug not in off, "builtin": n in builtin})
+    return out
+
+
 def _stored_sources():
     """Raw sources list as stored (for the editor), before validation."""
     if not os.path.exists(SETTINGS_FILE):
@@ -9926,7 +9946,8 @@ async def handle_settings_get(request):
                               "admin_pw_set": bool(ADMIN_PW),
                               "model_list": MODEL_LIST, "model_list_on": MODEL_LIST_ON,
                               "gossiper_url": GOSSIPER_URL, "gossiper_enabled": GOSSIPER_ENABLED,
-                              "admin": True, "sources": _stored_sources()})
+                              "admin": True, "sources": _stored_sources(),
+                              "source_toggles": _source_toggles()})
 
 
 async def handle_settings_post(request):
@@ -10014,6 +10035,16 @@ async def handle_settings_post(request):
             return web.json_response({"error": '"sources" must be a list'}, status=400)
         sources_changed = body["sources"] != _stored_sources()
         extra = {"sources": body["sources"]}
+    # Source on/off toggles: the UI submits the authoritative list of DISABLED
+    # source slugs. Filter to known slugs, and re-pull the cache if it changed so
+    # a flipped source is dropped from / added back to routing right away.
+    if isinstance(body.get("disabled_sources"), list):
+        _valid = {_source_slug(x) for x in known_source_names() if x}
+        _newoff = sorted(s for s in {_source_slug(x) for x in body["disabled_sources"]} if s in _valid)
+        if set(_newoff) != disabled_sources():
+            sources_changed = True
+        extra = extra or {}
+        extra["disabled_sources"] = _newoff
     save_settings(extra)
     # if the source list changed, re-pull the cache so the new hosts are fetched
     if sources_changed:
@@ -10029,6 +10060,7 @@ async def handle_settings_post(request):
                               "model_list": MODEL_LIST, "model_list_on": MODEL_LIST_ON,
                               "gossiper_url": GOSSIPER_URL, "gossiper_enabled": GOSSIPER_ENABLED,
                               "admin": True, "sources": _stored_sources(),
+                              "source_toggles": _source_toggles(),
                               "refreshed": sources_changed})
 
 
