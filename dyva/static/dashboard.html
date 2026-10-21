@@ -250,7 +250,7 @@ a{color:var(--text-muted)}
 .ap-head{font-size:var(--fs-xl);text-transform:uppercase;letter-spacing:var(--eyebrow-tracking);color:var(--text-muted);margin-bottom:var(--sp-3);display:flex;align-items:center}
 .conn-count{text-transform:none;letter-spacing:0;font-size:var(--fs-sm);color:var(--text-faint);font-weight:normal;margin-left:var(--sp-3);font-variant-numeric:tabular-nums}
 .conn-count-row{font-size:var(--fs-2xs);color:var(--text-faint);margin:0 0 var(--sp-2);text-align:right;font-variant-numeric:tabular-nums}
-.header-text h1 > a{color:var(--color);}
+.header-text h1 > a{text-decoration:none;color:var(--color);}
 .header-text h1{font-family:var(--font-display);font-weight:400;font-size:var(--fs-h1);margin-bottom:2px}
 /* The "D" is a whimsical theme toggle: click it and it spins a full turn as light/dark flip. */
 .dyva-d{display:inline-block;cursor:pointer;transform-origin:50% 50%;outline:none}
@@ -1332,7 +1332,7 @@ body.dragging-image .hist-item{cursor:grabbing}
 <div class="header">
 <a style=font-size:0 href="guide"><img id="logoImg" src="dyva.avif" alt="" width="56" height="56" data-explore="__EXPLORE__"></a>
 <div class="header-text">
-  <h1><span class="dyva-d" role="button" tabindex="0" title="Spin to switch light / dark" aria-label="Toggle light or dark theme" onclick="spinD(this);toggleTheme()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();spinD(this);toggleTheme();}">D</span><a style="text-decoration:none;" target="_blank" href="demos">y</a>va</h1>
+  <h1><span class="dyva-d" role="button" tabindex="0" title="Spin to switch light / dark" aria-label="Toggle light or dark theme" onclick="spinD(this);toggleTheme()" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();spinD(this);toggleTheme();}">D</span><a target="_blank" href="demos">y</a><a target="_blank" href="//day50.dev/32k">v</a>a</h1>
 <p class="sub"><!--<span title="workers">🔨 __WORKER_COUNT__ </span>&middot;<span title="timeout"> 🕰️ __TIMEOUT__s </span>&middot;--><span id="hostsPill" title="servers - loaded at __HOSTS_LOADED__" style="cursor:pointer"> <span id="hostsIcon">🖥</span> <span id="serverCount">__SERVER_COUNT__</span>
 </p>
 </div>
