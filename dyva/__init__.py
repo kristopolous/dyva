@@ -18920,7 +18920,7 @@ def banner():
      l'>  \033[38;5;{color-i+1}m    █▍  ▐█  ▜▄▛    █▄  ▄█   ▄▛▜▄  \033[0m <-l
      ll   \033[38;5;{color-i+2}m    █▍  ▐█   █      █▄▄█   ▄█  █▄  \033[0m ll
      llama~\033[38;5;{color-i+3}m  ███▆▆▛▘   █       ▜▛   ▄█    █▄ \033[0m llama~
-     || ||              epixerus              || ||
+     || ||              feniseca              || ||
      '' ''                                    '' ''
      {VERSION}
 
