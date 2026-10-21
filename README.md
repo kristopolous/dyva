@@ -10,7 +10,7 @@
 ---
 **Dyva** is a dynamic proxy that transparently routes to insecure [Ollama](https://ollama.com/), [vLLM](https://github.com/vllm-project/vllm), [LM Studio](https://lmstudio.ai/), [LocalAI](https://localai.io/), [SGLang](https://github.com/sgl-project/sglang), [KTransformers](https://github.com/kvcache-ai/ktransformers), [MLX](https://github.com/ml-explore/mlx), [llama.cpp](https://github.com/ggml-org/llama.cpp), [ds4 (DwarfStar)](https://github.com/antirez/ds4), [Fooocus](https://github.com/lllyasviel/Fooocus), [Strata](https://github.com/Niko1221/Strata), [A1111 (stable-diffusion-webui)](https://github.com/AUTOMATIC1111/stable-diffusion-webui), [Gradio](https://gradio.app/), and [ComfyUI](https://comfy.org) hosts from [Shodan](https://www.shodan.io/), [ZoomEye](https://www.zoomeye.org/), [Censys](https://search.censys.io/), [hunter.how](https://hunter.how/) and [FOFA](https://fofa.info/) with graceful failover, context-window scaling, and honeypot detection. 
 
-Capable of text generation, embeddings, systemone (JEV) style decision models, vision, tool calling, image generation and editing, video generatoin, TTS, and music generation in a unified interface with state of the art, real-time tunable router providing sub 1s latency. 
+Capable of text generation, embeddings, systemone (JEV) decision models, vision, tool calling, image generation and editing, video generatoin, TTS, and music generation in a unified interface with state of the art, real-time tunable router providing sub 1s latency. 
 
 Dyva supports unified workflows for stable diffusion, minimax h3, z-image, ltx 2.2, 2.3, 2.5, qwen-image, loras, iris, flux.1, 2 and 3, including the klein variations, and much more. You can just chat with the agent and have it do it for you.
 
