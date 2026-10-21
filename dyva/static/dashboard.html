@@ -275,13 +275,15 @@ body.chat{height:100vh;height:100dvh}
 .hd-head{display:flex;align-items:center;gap:8px}
 .hd-close{margin-left:auto;background:none;border:none;color:var(--text-muted);font-size:1.3rem;line-height:1;cursor:pointer;padding:0 6px;border-radius:4px;flex:0 0 auto}
 .hd-close:hover{color:var(--text);background:var(--accent-bg)}
-/* the model-host card keeps the base fixed height so its stats-strip / host-list
-   split stays proportional (a model aggregate on top, the scrolling list below) */
-#modelStats{flex:0 0 3rem;min-height:0;overflow:auto;margin-bottom:var(--sp-4);padding-bottom:var(--sp-3);border-bottom:1px solid var(--border)}
+/* the model-host card's stats strip (a model aggregate on top, the scrolling host
+   list below). Sizes to its content up to a cap, then the list takes the rest; the
+   two stat columns wrap to a stack when the card is too narrow for them side by side. */
+#modelStats{flex:0 0 auto;max-height:5.5rem;min-height:0;overflow:auto;margin-bottom:var(--sp-4);padding-bottom:var(--sp-3);border-bottom:1px solid var(--border)}
 #modelStats .stat-pct{color:var(--text-muted);font-size:var(--fs-sm);margin-left:6px;display:inline-block;width:2.8em;text-align:right;font-variant-numeric:tabular-nums}
+#modelStats .stat-note{color:var(--text-muted);font-size:var(--fs-sm);margin-left:6px;white-space:nowrap}
 #modelStats:empty{display:none}
-#modelStats .two-column{display:flex;gap:var(--sp-6)}
-#modelStats .two-column>div{flex:1;min-width:0}
+#modelStats .two-column{display:flex;flex-wrap:wrap;gap:var(--sp-1) var(--sp-6)}
+#modelStats .two-column>div{flex:1 1 8rem;min-width:0}
 #modelStats table{width:100%;border-collapse:collapse;font-size:var(--fs-md)}
 #modelStats td{padding:2px 0}
 #modelStats td:first-child{color:var(--text-muted)}
@@ -3287,7 +3289,7 @@ function renderHostListFor(){
       +'<tr><td>Good</td><td>'+cell(st.good)+'</td></tr>'
       +'<tr><td>Bad</td><td>'+cell(st.bad)+'</td></tr>'
       +'</table></div><div><table>'
-      +'<tr><td title="failed the smoke test (honeypot/garbage)">Smoked</td><td>'+cell(st.fail_smoke)+(st.attested?' <span class="stat-pct" title="via gossiper sync from a peer">'+fmtCount(st.attested)+' synced</span>':'')+'</td></tr>'
+      +'<tr><td title="failed the smoke test (honeypot/garbage)">Smoked</td><td>'+cell(st.fail_smoke)+(st.attested?' <span class="stat-note" title="via gossiper sync from a peer">'+fmtCount(st.attested)+' synced</span>':'')+'</td></tr>'
       +'<tr><td>Untested</td><td>'+cell(st.unknown)+'</td></tr>'
       +'</table></div></div>';
     list.innerHTML='';
