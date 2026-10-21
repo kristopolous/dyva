@@ -41,27 +41,37 @@ FOFA_COOKIE="fofa_theme=dark; fofa_token=...; fofa_result_page_size=50; ..."
 # The \u0021 shell escape curl prints is handled automatically.
 SHODAN_KEY='polito="3edd633c..."'
 
-# Required for -t zoomeye — zoomeye.ai session cookie (the whole Cookie header,
-# copied from your browser / a curl -b invocation). It is a SESSION token that
-# EXPIRES, so refresh it when zoomeye starts failing. The JWT inside it (token=…)
-# is reused automatically for the Cube-Authorization header.
-ZOOMEYE_COOKIE='__jsluid_s=...; sessionid=...; token=...; ...'
-
 # Required for -t censys — platform.censys.io session cookie (the whole Cookie
 # header). Censys fronts the search API with Cloudflare, and the clearance is
 # bound to the IP that solved the challenge, so this MUST be generated on THIS
 # machine's egress IP (load platform.censys.io in a browser here, copy the request
 # Cookie). It EXPIRES; when a run stops with "Cloudflare challenge", regenerate it.
+#
+# IP MUST MATCH FROM WHERE YOU LOG IN FROM
+#
 CENSYS_COOKIE='cf_clearance=...; __cf_bm=...; csrf_v2=...; ...'
 # Cloudflare also binds the clearance to the User-Agent, so CENSYS_UA MUST be the
 # exact UA of the browser that generated the cookie or the challenge bounces you.
 # Optional — defaults to the UA in censys.txt; set it to match your browser.
 CENSYS_UA='Mozilla/5.0 (X11; Linux x86_64) ... Chrome/152.0.0.0 Safari/537.36'
 
+# Required for -t zoomeye — zoomeye.ai session cookie (the whole Cookie header,
+# copied from your browser / a curl -b invocation). It is a SESSION token that
+# EXPIRES, so refresh it when zoomeye starts failing. The JWT inside it (token=…)
+# is reused automatically for the Cube-Authorization header.
+#
+# IP MUST MATCH FROM WHERE YOU LOG IN FROM
+#
+ZOOMEYE_COOKIE='__jsluid_s=...; sessionid=...; token=...; ...'
+ZOOMEYE_UA='Mozilla/5.0 (X11; Linux x86_64) ... Chrome/152.0.0.0 Safari/537.36'
+
 # Required for -t hunter — hunter.how session cookie (the whole Cookie header) AND
 # the Authorization header. Deeper pages 401 with "coming soon" without the bearer.
 # HUNTER_AUTH is the FULL Authorization value copied verbatim (keep the "Bearer ").
 # Both EXPIRE; refresh when hunter starts returning code!=200.
+#
+# IP MUST MATCH FROM WHERE YOU LOG IN FROM
+#
 HUNTER_COOKIE='_ga=...; ack=...; token=...; ...'
 HUNTER_AUTH='Bearer eyJ...'
 ```
