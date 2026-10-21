@@ -622,9 +622,6 @@ table.hd-model-kv td.hd-kv-k{color:var(--text-faint);white-space:nowrap}
 .worker-stop:hover{background:var(--accent-bg-active);color:var(--text)}
 .worker-stop[disabled]{opacity:.6;cursor:default;font-style:italic}
 .worker-stop[disabled]:hover{background:var(--accent-bg);color:var(--text-2)}
-.worker-skip{flex:0 0 auto;background:transparent;border:1px solid var(--border);color:var(--text-2);border-radius:var(--r-sm);padding:0 7px;font-size:var(--fs-2xs);line-height:1.5;cursor:pointer;margin-left:4px}
-.worker-skip:hover{background:var(--accent-bg);color:var(--text)}
-.worker-skip[disabled]{opacity:.6;cursor:default;font-style:italic}
 .worker-flag{flex:0 0 auto;background:transparent;border:1px solid var(--border);color:var(--text-2);border-radius:var(--r-sm);padding:0 6px;font-size:var(--fs-3xs);line-height:1.5;cursor:pointer;margin-left:4px}
 .worker-flag:hover{background:#a73d5d;border-color:#a73d5d;color:#fff}
 .worker-flag[disabled]{opacity:.6;cursor:default;font-style:italic}
@@ -2995,10 +2992,11 @@ function renderWorkers(workers){
     // is cancelled via its re-armed stop handle (see _stream_chat_failover / _pump_stream),
     // so offer stop for every running worker. (The old `!w.phase` gate predated that and
     // hid the button exactly when a long generation most needs it.)
-    var _showStop=!w.done;
-    var _showSkip=!w.done;   // skip works at any point now, same as stop: abandon the current host mid-render and let the race move to the next server
-    if(_showStop||_showSkip){
-     if(_showStop){
+    // Stop (cancel the whole worker) is offered for every running worker. There is
+    // no per-row "skip the current host" button: it was wired to a skip handle that
+    // most worker kinds (streaming chat, image, speech, /api/generate, edit) never
+    // arm, so it silently did nothing on those rows. Stop is the honest control.
+    if(!w.done){
       var stop=document.createElement('button');stop.type='button';stop.className='worker-stop';
       // A stop isn't instant — the race has to unwind and the in-flight upstream
       // request has to be cancelled — so the button latches into "stopping…"
@@ -3017,21 +3015,6 @@ function renderWorkers(workers){
         });
       });
       sub.appendChild(stop);
-     }
-     if(_showSkip){
-      // skip: abandon the host being tried right now and let the race move on
-      // to the next server, without killing the whole job the way stop does.
-      var skb=document.createElement('button');skb.type='button';skb.className='worker-skip';
-      skb.textContent='skip';skb.title='abandon this host and try a different server';
-      skb.addEventListener('click',function(){
-        skb.disabled=true;skb.textContent='skipping…';
-        fetch('skip-worker?wid='+encodeURIComponent(w.wid)).catch(function(){}).then(function(){
-          // the job keeps running on the next host, so re-enable shortly
-          setTimeout(function(){skb.disabled=false;skb.textContent='skip';},1200);
-        });
-      });
-      sub.appendChild(skb);
-     }
     }
     var where=w.host?String(w.host).replace(/^https?:\/\//,''):'';
     var rm=w.rmodel?String(w.rmodel).replace(/\\/g,'/').split('/').pop():'';

@@ -1947,6 +1947,12 @@ BUILTIN_SOURCES = [
         "name": "happyshua",
         "url": "https://raw.githubusercontent.com/happyshua/ollamalist/refs/heads/main/output_with_models.csv",
     },
+    # Our OWN graflex survey, 
+    {
+        "name": "graflex",
+        "url": "https://getpostdelete.com/graflex/hosts.json",
+        "mapping": {"server": {"field": "url"}},
+    },
 ]
 
 
@@ -2400,6 +2406,32 @@ def refresh_cache(source=None, cleanse=True):
             host_map[ip] = {'source': 'spider', 'models': [], 'server': ip, 'version': ''}
 
           host_map[ip]['models'] += models
+
+    _gfx = next((s for s in BUILTIN_SOURCES if s["name"] == "graflex"), None)
+    if _gfx and 'graflex' not in off and os.path.exists(f"{_db}-graflex.tmp"):
+      try:
+        with open(f"{_db}-graflex.tmp", encoding="utf-8", errors="replace") as f:
+          _rows = json.loads(f.read())
+      except Exception as ex:
+        logging.warning(f"Unable to parse {_db}-graflex.tmp: {ex}")
+        _rows = []
+      for row in (_rows if isinstance(_rows, list) else []):
+        if not isinstance(row, dict):
+          continue
+        entry = _apply_source_mapping(row, _gfx.get("mapping", {}))
+        ip = str(entry.get('server') or entry.get('url') or '').rstrip('/')
+        if not ip or ip in host_map:
+          continue
+        entry['server'] = ip
+        entry.setdefault('source', 'graflex')
+        entry.setdefault('service', 'unknown')
+        entry.setdefault('version', '')
+        _m = entry.get('models')
+        if isinstance(_m, dict):
+          entry['models'] = list(_m.keys())
+        elif not isinstance(_m, list):
+          entry['models'] = []
+        host_map[ip] = entry
 
 
     for k,v in host_map.items():
