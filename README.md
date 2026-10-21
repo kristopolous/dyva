@@ -63,10 +63,12 @@ Not really. The pool is truly international and dyva only uses idle machines lis
 
 Not really. Other dyva servers get flagged and excluded from the survey so this will not just become a hall of mirrors. You can avoid getting picked up by other scanners in the wild by adding a `base_path`, this is configurable in settings on the dash. 
 
-**what about honeypots?**
+**What about honeypots?**
 
 Yes! This one is real. Running dyva *might* get you blocked temporarily from numerous sites on CDNs such as Cloudflare. This includes IoT networks, imdb, huggingface, cloud storage, all kinds of stuff... even banks. The public surveys have honeypots with tripwires that get the srcaddr (you) put in some temporary ban pool with an expiry merely by a tcp_connect(). These are also called canaries in the literature.
 
-However, there's a rich testing and probing harness in dyva to block these machines based on an ensemble of techniques. You can also sweep and mark based on model queries to quarantine them but it's a slightly moving target because a static list of honeypots defeats the purpose. There is a protocol called [gossiper](docs/gossiper.md) that's intended to mostly mitigate this. YMMV. Also see the [survey](docs/survey.md) for more notes.
+However, there's a rich testing and probing harness in dyva to block these machines based on an ensemble of techniques. Canary tripping is effectively solved and I haven't seen it in months. But of course, absence of evidence doesn't mean much.
+
+You can also sweep and mark based on model queries to quarantine them but it's a slightly moving target because a static list of honeypots defeats the purpose. There is a protocol called [gossiper](docs/gossiper.md) that's intended to mostly mitigate this. YMMV. Also see the [survey](docs/survey.md) for more notes.
 
 <img alt="dyva-ender" src="https://github.com/user-attachments/assets/2c3c10fa-76f2-4f68-9c3d-2c3c855ef461" />
