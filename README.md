@@ -56,12 +56,15 @@ There's also a [simple command line](docs/freeollama.md).
 #### Notes
 
 **Is this dangerous?**
+
 Not really. The pool is truly international and dyva only uses idle machines listed in public search engines. It's arguably below the level of Napster, torrents and Tor. 
 
 **Does this expose me?**
+
 Not really. Other dyva servers get flagged and excluded from the survey so this will not just become a hall of mirrors. You can avoid getting picked up by other scanners in the wild by adding a `base_path`, this is configurable in settings on the dash. 
 
 **what about honeypots?**
+
 Yes! This one is real. Running dyva *might* get you blocked temporarily from numerous sites on CDNs such as Cloudflare. This includes IoT networks, imdb, huggingface, cloud storage, all kinds of stuff... even banks. The public surveys have honeypots with tripwires that get the srcaddr (you) put in some temporary ban pool with an expiry merely by a tcp_connect(). These are also called canaries in the literature.
 
 However, there's a rich testing and probing harness in dyva to block these machines based on an ensemble of techniques. You can also sweep and mark based on model queries to quarantine them but it's a slightly moving target because a static list of honeypots defeats the purpose. There is a protocol called [gossiper](docs/gossiper.md) that's intended to mostly mitigate this. YMMV. Also see the [survey](docs/survey.md) for more notes.
