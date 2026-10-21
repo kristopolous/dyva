@@ -32,7 +32,7 @@ Memory footprint is under 1GB:
 ## Querying for models
 The massive varieties of models and installations are unified through a model query syntax which allows any tool to leverage any subslice of the pool by specifying the query *as* the model to use. 
 
-This is designed so you can slice and dice the pool in any application. Place it AS the model.
+This is designed so you can slice and dice the pool in any application.
 
 For instance `*` means use any model. `>2026` means anything released after 2026, `qwen>2026>10gb,gemma4` means 'use any qwen released in 2026 over 10gb and fallback to Gemma4 if you can't find any"
 
