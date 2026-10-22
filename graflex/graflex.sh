@@ -60,8 +60,8 @@ case "$SERVICE" in
     fi
     jq -c . /tmp/full-json.json > /tmp/full-json-old.json
     cp /tmp/full-json-old.json /tmp/full-json.json
-    echo "$COMBINED_JSON" | ssh $_SERVER "cat > $_SERVER_PATH"
-    echo "$COMBINED_JSON" | ssh $_SERVER "cat > ${_SERVER_PATH%.json}-$DATE.json"
+    scp -C /tmp/full-json.json "$_SERVER:$_SERVER_PATH"
+    scp -C /tmp/full-json.json "$_SERVER:${_SERVER_PATH%.json}-$DATE.json"
     exit 0
     ;;
 
