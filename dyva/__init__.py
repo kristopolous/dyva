@@ -17022,6 +17022,7 @@ def _t2i_unet_plan(info, model_filter=None, exclude=(), reasons=None):
     lacks a piece, records a specific reason (so the caller can say why, not just
     'no runnable graph')."""
     clip_types = _enum_options(info, "CLIPLoader", "type")
+    dual_types = _enum_options(info, "DualCLIPLoader", "type")
     for fam in load_t2i_families():
         loader = fam.get("loader", "UNETLoader")
         if loader not in info:
@@ -17040,8 +17041,14 @@ def _t2i_unet_plan(info, model_filter=None, exclude=(), reasons=None):
                 reasons.append(f"{_f['name']}: {msg}")
 
         latent = fam.get("latent", "EmptyLatentImage")
-        missing = next((n for n in (latent, "CLIPLoader", "CLIPTextEncode",
-                                    "KSampler", "VAEDecode") if n not in info), None)
+        # A family with a 2nd text encoder (Flux: clip_l + t5xxl) loads both
+        # through DualCLIPLoader; a single-encoder family (Qwen-Image) uses
+        # CLIPLoader. A guidance_node (FluxGuidance) must exist on the host too.
+        clip_loader = "DualCLIPLoader" if fam.get("clip2") else "CLIPLoader"
+        needed = [latent, clip_loader, "CLIPTextEncode", "KSampler", "VAEDecode"]
+        if fam.get("guidance_node"):
+            needed.append(fam["guidance_node"])
+        missing = next((n for n in needed if n not in info), None)
         if missing:
             _why(f"host lacks the {missing} node")
             continue
@@ -17049,21 +17056,30 @@ def _t2i_unet_plan(info, model_filter=None, exclude=(), reasons=None):
         if not out_node:
             _why("no image output node")
             continue
-        clip = _pick(_enum_options(info, "CLIPLoader", "clip_name"), *_hints(fam.get("clip")))
+        clips = _enum_options(info, "CLIPLoader", "clip_name")
+        clip = _pick(clips, *_hints(fam.get("clip")))
+        clip2 = _pick(clips, *_hints(fam.get("clip2"))) if fam.get("clip2") else None
         vae = _pick(_enum_options(info, "VAELoader", "vae_name"), *_hints(fam.get("vae")))
         if fam.get("clip") and not clip:
             _why("has the model but no matching text encoder")
             continue
+        if fam.get("clip2") and not clip2:
+            _why("has the model but no matching 2nd text encoder")
+            continue
         if fam.get("vae") and not vae:
             _why("has the model but no matching VAE")
             continue
-        if fam.get("clip_type") and fam["clip_type"] not in clip_types:
-            _why(f"host CLIPLoader lacks type '{fam['clip_type']}'")
-            continue
+        if fam.get("clip_type"):
+            # The type dropdown lives on whichever loader actually holds the clips.
+            type_opts = dual_types if fam.get("clip2") else clip_types
+            if fam["clip_type"] not in type_opts:
+                _why(f"host CLIPLoader lacks type '{fam['clip_type']}'")
+                continue
         chosen = sorted(cands, key=_match_rank(model_filter))[0]
         return {"family": fam["name"], "spec": fam, "loader": loader, "model": chosen,
-                "clip": clip, "vae": vae, "clip_type": fam.get("clip_type"),
-                "latent": latent, "out": out_node}
+                "clip": clip, "clip2": clip2, "vae": vae, "clip_type": fam.get("clip_type"),
+                "latent": latent, "out": out_node,
+                "guidance_node": fam.get("guidance_node"), "guidance": fam.get("guidance")}
     return None
 
 
@@ -17094,15 +17110,29 @@ def _t2i_unet_workflow(plan, prompt_text, negative_prompt, params, info=None):
     else:
         g["1"] = {"class_type": "UNETLoader",
                   "inputs": {"unet_name": plan["model"], "weight_dtype": "default"}}
-    g["2"] = {"class_type": "CLIPLoader",
-              "inputs": {"clip_name": plan["clip"], "type": plan.get("clip_type") or "qwen_image"}}
+    if plan.get("clip2"):
+        g["2"] = {"class_type": "DualCLIPLoader",
+                  "inputs": {"clip_name1": plan["clip"], "clip_name2": plan["clip2"],
+                             "type": plan.get("clip_type") or "flux"}}
+    else:
+        g["2"] = {"class_type": "CLIPLoader",
+                  "inputs": {"clip_name": plan["clip"], "type": plan.get("clip_type") or "qwen_image"}}
     g["3"] = {"class_type": "VAELoader", "inputs": {"vae_name": plan["vae"]}}
     g["4"] = {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": prompt_text}}
     g["5"] = {"class_type": "CLIPTextEncode", "inputs": {"clip": ["2", 0], "text": negative_prompt or ""}}
     g["6"] = {"class_type": plan["latent"],
               "inputs": {"width": width, "height": height, "batch_size": 1}}
+    # Flux/DiT families steer with a guidance value on the positive conditioning
+    # (FluxGuidance) rather than classic CFG; KSampler cfg stays ~1. Splice it
+    # between the positive encode and the sampler when the family asks for it.
+    pos = ["4", 0]
+    if plan.get("guidance_node"):
+        g["10"] = {"class_type": plan["guidance_node"],
+                   "inputs": {"conditioning": ["4", 0],
+                              "guidance": float(plan.get("guidance") or 3.5)}}
+        pos = ["10", 0]
     g["7"] = {"class_type": "KSampler", "inputs": {
-        "model": ["1", 0], "positive": ["4", 0], "negative": ["5", 0],
+        "model": ["1", 0], "positive": pos, "negative": ["5", 0],
         "latent_image": ["6", 0], "seed": seed, "steps": steps, "cfg": cfg,
         "sampler_name": sampler, "scheduler": scheduler, "denoise": 1}}
     g["8"] = {"class_type": "VAEDecode", "inputs": {"samples": ["7", 0], "vae": ["3", 0]}}

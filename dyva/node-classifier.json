@@ -319,6 +319,26 @@
       "cfg": 2.5,
       "steps": 20,
       "note": "Base Qwen-Image text-to-image, per the official Comfy-Org template (image_qwen_image_*.json): diffusion_models/qwen_image_fp8_e4m3fn + text_encoders/qwen_2.5_vl_7b_fp8_scaled (CLIPLoader type qwen_image) + vae/qwen_image_vae. It uses the GENERIC CLIPTextEncode node (no distinctive encode node) and a 16-channel EmptySD3LatentImage — so it fits neither the plain-checkpoint path nor _edit_plan, only the t2i-UNET builder. The model regex excludes -edit and -2.1 (those have their own edit families)."
+    },
+    {
+      "name": "Flux",
+      "model": "(?i)(flux(?![-_. ]?2)(?![-_. ]?klein)(?!.*kontext)|(^|[-_. ])krea)",
+      "clip": "(?i)clip_l",
+      "clip2": "(?i)t5xxl",
+      "clip_type": "flux",
+      "vae": [
+        "(?i)(^|/)ae\\.(safetensors|sft)$",
+        "(?i)flux.*vae",
+        "(?i)(^|/)ae\\."
+      ],
+      "loader": "UNETLoader",
+      "latent": "EmptyLatentImage",
+      "guidance_node": "FluxGuidance",
+      "guidance": 3.5,
+      "res": 1024,
+      "cfg": 1.0,
+      "steps": 20,
+      "note": "Plain FLUX.1-dev text-to-image — incl. FLUX.1 Krea dev (diffusion_models/flux1-krea-dev) and the community krea2_turbo Flux merges — which fit neither the single-clip t2i path (Qwen) nor _edit_plan (no ReferenceLatent/encode node). Standard Flux rig verified against live /object_info across krea hosts (2026-10-22): UNETLoader + DualCLIPLoader clip_l + t5xxl (type flux) + VAELoader ae.safetensors + EmptyLatentImage + FluxGuidance; KSampler cfg 1, guidance 3.5, euler/simple. flux2/klein/kontext are excluded via lookahead (they have their own edit families and are tried first). Some krea2 hosts also expose a bespoke 'krea2' CLIPLoader type + Krea2-HD-vae; the standard flux rig runs them regardless since krea2 is a Flux merge. The turbo krea2 merges are distilled (fewer steps ideal) but render fine at 20."
     }
   ],
   "edit": [
