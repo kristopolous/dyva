@@ -770,7 +770,7 @@ button.stop:hover{background:var(--btn-danger-hover)}
 .msg.assistant .body th,.msg.assistant .body td{border:1px solid var(--border-strong);padding:.3em .5em}
 .msg.assistant .body ul,.msg.assistant .body ol{margin:.4em 0;padding-left:1.4em}
 .msg.assistant .body li{margin:.15em 0}
-.msg.assistant .body p{margin:.35em 0}
+.msg.assistant .body p{margin:.75em 0;line-height:1.43rem}
 .msg.assistant .body h1,.msg.assistant .body h2,.msg.assistant .body h3,.msg.assistant .body h4{margin:.7em 0 .3em}
 .msg.assistant .body hr{border:none;border-top:1px solid var(--border-strong);margin:.7em 0}
 .input-row{display:flex;gap:var(--sp-3);align-items:stretch;position:relative}
@@ -845,7 +845,13 @@ details.toolbox>summary{cursor:pointer;color:var(--text-dim);font-size:var(--fs-
 
 .chat-status{display:flex;align-items:center;gap:.45em;color:var(--text-dim);font-size:var(--fs-xs);font-style:italic;margin:.15em 0 .3em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .chat-status::before{content:'';flex-shrink:0;width:.6em;height:.6em;border:1.5px solid var(--border-strong);border-top-color:var(--accent);border-radius:var(--r-full);animation:spin .8s linear infinite}
-.chat-layout{display:flex;gap:var(--sp-4);flex:1;min-height:0}
+.chat-layout{display:flex;gap:0;flex:1;min-height:0}
+/* invisible drag gutters between sidebar|main and main|doc — they occupy what was
+   the flex gap, so spacing is unchanged; only the cursor hints they're grabbable */
+.col-resizer{flex:0 0 var(--sp-4);align-self:stretch;cursor:col-resize;position:relative;z-index:5}
+body.col-resizing,body.col-resizing *{cursor:col-resize!important;user-select:none}
+@media(max-width:640px){.col-resizer{display:none}}
+@media(min-width:641px){#chat.chat-collapsed #sidebarResizer{display:none}}
 .chat-menu-btn{display:flex;align-items:center;justify-content:center;flex-shrink:0;min-width:var(--ctl-h);height:var(--ctl-h);padding:.5rem;font-size:1rem;box-sizing:border-box;background:transparent;border:0;border-radius:var(--r-md);color:var(--text-2);cursor:pointer}
 @media(hover:hover){.chat-menu-btn:hover{background:var(--accent-bg);color:var(--text)}}
 /* Desktop: collapse the conversation sidebar (toggled by the ☰ button; mobile uses the drawer). */
@@ -1025,6 +1031,22 @@ details.toolbox>summary{cursor:pointer;color:var(--text-dim);font-size:var(--fs-
 .doc-body{flex:1;min-height:0;overflow:auto;padding:14px;font-size:var(--fs-lg);line-height:var(--line-loose)}
 .doc-body pre{background:var(--bg-inset);border:1px solid var(--border);border-radius:var(--r-md);padding:.7em;overflow-x:auto;white-space:pre;margin:0}
 .doc-body code{font-family:var(--font-mono);font-size:var(--fs-sm)}
+/* spreadsheet ('sheet' doc type): an editable grid rendered from the doc's JSON */
+.sheet-wrap{overflow:auto;max-width:100%;max-height:100%}
+table.sheet{border-collapse:collapse;table-layout:fixed;width:max-content;font-size:var(--fs-sm);font-variant-numeric:tabular-nums}
+table.sheet th,table.sheet td{border:1px solid var(--border);padding:0;margin:0}
+table.sheet .sheet-colh,table.sheet .sheet-rowh,table.sheet .sheet-corner{background:var(--bg-inset);color:var(--text-muted);text-align:center;font-weight:600;padding:2px 6px;position:sticky;font-size:var(--fs-2xs)}
+table.sheet .sheet-colh{overflow:visible}
+.sheet-resize{position:absolute;top:0;right:-3px;width:7px;height:100%;cursor:col-resize;z-index:4}
+.sheet-resize:hover{background:var(--accent)}
+body.sheet-resizing,body.sheet-resizing *{cursor:col-resize!important;user-select:none}
+table.sheet thead th{position:sticky;top:0;z-index:2}
+table.sheet .sheet-rowh{left:0;z-index:1;min-width:2.2em}
+table.sheet .sheet-corner{left:0;top:0;z-index:3}
+table.sheet td.sheet-cell{min-width:5.5em;max-width:16em;padding:2px 6px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+table.sheet td.sheet-f{color:var(--accent)}
+table.sheet input.sheet-in{width:100%;min-width:5em;box-sizing:border-box;border:0;background:transparent;color:var(--text);font:inherit;padding:2px 6px}
+table.sheet input.sheet-in:focus{outline:2px solid var(--accent);outline-offset:-2px;background:var(--bg-sunken)}
 .code-wrap{position:relative}
 .code-copy{position:absolute;top:6px;right:6px;z-index:2;font-size:11px;line-height:1.5;padding:2px 8px;
   background:var(--bg-inset);color:var(--text-dim);border:1px solid var(--border);border-radius:var(--r-md);
@@ -1304,6 +1326,8 @@ body.dragging-image .hist-item{cursor:grabbing}
 #lightbox.open{display:flex}
 #lightbox img{max-width:90vw;max-height:78vh;border-radius:var(--r-lg)}
 #lightbox .cap{color:var(--text-2);font-size:var(--fs-md);max-width:90vw;overflow-wrap:anywhere;text-align:center}
+#lightbox .lb-btn{position:absolute;top:var(--sp-4);right:var(--sp-4);z-index:2;cursor:pointer;padding:6px 14px;border:1px solid var(--border);border-radius:var(--r-md);background:var(--bg-inset);color:var(--text);font-size:var(--fs-sm);font-family:inherit}
+#lightbox .lb-btn:hover{border-color:var(--border-accent);color:var(--accent);background:var(--bg-sunken)}
 @media (max-width:520px){
   .settings-inner .rc-grid{grid-template-columns:1fr}
   /* Only the LONG controls drop below their help so it isn't crushed into a half-
@@ -1446,6 +1470,7 @@ body.dragging-image .hist-item{cursor:grabbing}
 </div>
 <div id="chatList" class="chat-list"></div>
 </div>
+<div class="col-resizer" id="sidebarResizer" title="Drag to resize"></div>
 <div class="chat-main">
 <div id="tokEst" class="tok-est" title="estimated context size (~words × 1.33; varies by model)"></div>
 <div id="chatMessages" class="messages"></div>
@@ -1489,6 +1514,7 @@ body.dragging-image .hist-item{cursor:grabbing}
 </div>
 </div>
 </div>
+<div class="col-resizer" id="docResizer" style="display:none" title="Drag to resize"></div>
 <div class="doc-panel" id="docPanel" style="display:none">
 <div class="doc-head">
 <select id="docSelect" class="doc-select"></select>
@@ -5754,6 +5780,52 @@ async function runStream(chatId,chatCreated,chatTitle,model,msgs,bubble,depth,ex
         try{_cr=_calcEval(_cx)}catch(e){_cr='That did not evaluate: '+((e&&e.message)||e)}
         results.push({text:(_cx?_cx+' = ':'')+_cr,
                       md:'`= '+String(_cr).slice(0,160).replace(/`/g,"'")+'`'});
+      }else if(fn.name==='get_date'){
+        // Client-executed, no network/permission: the model has no clock, so hand it
+        // the current moment in the user's local zone AND in UTC/GMT.
+        var _now=new Date(),_WD=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+        var _p=function(n){return ('0'+n).slice(-2)};
+        var _loc=_WD[_now.getDay()]+' '+_now.getFullYear()+'-'+_p(_now.getMonth()+1)+'-'+_p(_now.getDate())+' '+_p(_now.getHours())+':'+_p(_now.getMinutes())+':'+_p(_now.getSeconds());
+        var _o=-_now.getTimezoneOffset(),_off='UTC'+(_o<0?'-':'+')+_p(Math.floor(Math.abs(_o)/60))+':'+_p(Math.abs(_o)%60);
+        var _tz='';try{_tz=Intl.DateTimeFormat().resolvedOptions().timeZone||''}catch(e){}
+        var _utc=_WD[_now.getUTCDay()]+' '+_now.getUTCFullYear()+'-'+_p(_now.getUTCMonth()+1)+'-'+_p(_now.getUTCDate())+' '+_p(_now.getUTCHours())+':'+_p(_now.getUTCMinutes())+':'+_p(_now.getUTCSeconds());
+        results.push({text:JSON.stringify({localtime:_loc+(_tz?' '+_tz:'')+' ('+_off+')',GMT:_utc+' UTC'}),md:'`get_date`'});
+      }else if(fn.name==='convert_currency'){
+        // Keyless, client-executed. Primary + mirror from the fawazahmed0 currency-api
+        // (lowercase shape {date, <base>:{<tgt>:rate}}), then the independent er-api
+        // open endpoint (uppercase shape {rates:{TGT:rate}, time_last_update_utc}) as
+        // a genuine third-party fallback. First source that yields the pair wins.
+        var _cf=String(args.from||args.from_currency||'').trim().toLowerCase().replace(/[^a-z0-9]/g,'');
+        var _ct=String(args.to||args.to_currency||'').trim().toLowerCase().replace(/[^a-z0-9]/g,'');
+        var _camt=parseFloat(args.amount);if(!isFinite(_camt))_camt=1;
+        if(!_cf||!_ct){
+          results.push({text:'convert_currency needs ISO currency codes in "from" and "to", e.g. from "usd", to "eur".',md:'`⚠ convert_currency`'});
+        }else{
+          setStatus('converting '+_cf.toUpperCase()+'→'+_ct.toUpperCase()+'…');
+          var _csrcs=['https://cdn.jsdelivr.net/npm/@fawazahmed0/currency-api@latest/v1/currencies/'+_cf+'.min.json',
+                      'https://latest.currency-api.pages.dev/v1/currencies/'+_cf+'.min.json',
+                      'https://open.er-api.com/v6/latest/'+_cf.toUpperCase()];
+          var _crate=null,_cdate='',_cerr='';
+          for(var _csi=0;_csi<_csrcs.length&&_crate===null;_csi++){
+            try{
+              var _cresp=await fetch(_csrcs[_csi],{signal:ac.signal});
+              if(!_cresp.ok){_cerr='HTTP '+_cresp.status;continue;}
+              var _cd=await _cresp.json();
+              if(_cd&&_cd[_cf]&&typeof _cd[_cf][_ct]==='number'){_crate=_cd[_cf][_ct];_cdate=_cd.date||'';}
+              else if(_cd&&_cd.rates&&typeof _cd.rates[_ct.toUpperCase()]==='number'){_crate=_cd.rates[_ct.toUpperCase()];_cdate=_cd.time_last_update_utc||'';}
+              else _cerr='no rate for '+_cf+'→'+_ct;
+            }catch(_cex){if(ac.signal.aborted)return;_cerr=(_cex&&_cex.message)||String(_cex);}
+          }
+          if(_crate===null){
+            results.push({text:'Could not convert '+_cf.toUpperCase()+' to '+_ct.toUpperCase()+' ('+(_cerr||'unknown')+'). Use valid ISO codes like usd, eur, gbp, jpy, btc, xau.',
+                          md:'`⚠ convert_currency: '+String(_cerr||'').replace(/`/g,"'").slice(0,50)+'`'});
+          }else{
+            var _cres=_camt*_crate;
+            var _clabel=(_cres>=1?(+_cres.toFixed(2)):(+_cres.toPrecision(4)));
+            results.push({text:JSON.stringify({amount:_camt,from:_cf.toUpperCase(),to:_ct.toUpperCase(),rate:_crate,result:_cres,date:_cdate}),
+                          md:'`'+_camt+' '+_cf.toUpperCase()+' = '+_clabel+' '+_ct.toUpperCase()+'`'});
+          }
+        }
       }else if(fn.name==='help'){
         var _t=TOOL_DEFS[args.tool];
         if(!_t){
@@ -5840,6 +5912,10 @@ async function runStream(chatId,chatCreated,chatTitle,model,msgs,bubble,depth,ex
         setStatus(dverb+' \u201c'+String(args.name||args.title||'file')+'\u201d\u2026');
         var dr=applyDocOp(chatId,fn.name,args);
         results.push({text:dr.text,md:dr.md});
+      }else if(fn.name==='get_values'||fn.name==='set_values'){
+        setStatus((fn.name==='set_values'?'writing':'reading')+' spreadsheet…');
+        var sr2=applySheetOp(chatId,fn.name,args);
+        results.push({text:sr2.text,md:sr2.md});
       }else if(fn.name==='get_asset'){
         setStatus('looking…');
         var ga=assetFind(currentChat,args.name);
@@ -6534,6 +6610,9 @@ function _resultMetaMd(name,model,service,host){
 var SEARCH_MODELS_TOOL={type:'function',function:{name:'search_models',description:'List the models available across discovered hosts for a kind of generation, optionally filtered by partial name or a * wildcard. Read-only; returns names and how many hosts have each.',parameters:{type:'object',properties:{type:{type:'string',enum:['image','edit','video','speech','text'],description:'Which capability: image create, image edit, video, speech, or text.'},substring:{type:'string',description:'Optional name filter. Two rules cover almost everything: a PARTIAL NAME matches as a case-insensitive substring ("flux" finds flux.1-dev, FLUX_schnell), and * is a WILDCARD ("z*image" matches z-image / zImage / z_image, "flux*2" matches flux.2 and flux-2). Combine them freely; omit to list all.'},page:{type:'integer',description:'1-based page number'}},required:['type']}}};
 var LIST_ASSETS_TOOL={type:'function',function:{name:'list_assets',description:'List the files in this conversation by name — images, videos and audio the user attached or a tool created, plus any files written in the side panel. Call this when you need to work on something from earlier and want its name, for example before combining two pictures with edit_image. Returns names like "garden.jpg" that other tools accept.',parameters:{type:'object',properties:{}}}};
 var CALC_TOOL={type:'function',function:{name:'calc',description:'Evaluate a math expression  and get the precise result. It is a math language (mathjs): + - * / ^ %, parentheses, and functions like sqrt, abs, log, exp, sin/cos, gcd, factorial, plus variables and matrices.',parameters:{type:'object',properties:{expression:{type:'string',description:'The expression to evaluate, e.g. "sqrt(19310)", "2^64", "(1+0.05)^30 * 1000", "det([[1,2],[3,4]])".'}},required:['expression']}}};
+// Companion to calc: keyless live FX (fawazahmed0 currency-api + er-api fallback),
+// fetched in the browser. 200+ fiat currencies, crypto and metals.
+var CONVERT_CURRENCY_TOOL={type:'function',function:{name:'convert_currency',description:'Convert an amount of money from one currency to another at the latest exchange rate. Covers 200+ world currencies, cryptocurrencies and precious metals. Returns the converted amount, the rate used, and the rate date.',parameters:{type:'object',properties:{amount:{type:'number',description:'How much to convert. Defaults to 1 if omitted.'},from:{type:'string',description:'The currency to convert FROM, as a lowercase ISO code, e.g. "usd", "eur", "gbp", "jpy", "btc".'},to:{type:'string',description:'The currency to convert TO, as a lowercase ISO code, e.g. "eur", "inr", "xau".'}},required:['from','to']}}};
 // A locked-down mathjs instance for calc: BigNumber precision, and the
 // expression-level functions that mathjs's own security guide flags as able to
 // reach JS (import/createUnit/evaluate/parse/simplify/derivative) are disabled.
@@ -6717,7 +6796,9 @@ async function runAgentJob(payload,signal,onTick){
 var DOC_TOOLS=[
   {type:'function',function:{name:'write_file',description:'Write a file — creates it or overwrites/appends. Use for content the user keeps, copies or iterates on (essays, reports, source, scratchpad). Markdown, HTML and SVG RENDER live for the user (a .html/.svg name with type "code"; prose uses type "markdown").',parameters:{type:'object',properties:{name:{type:'string',description:'File name, WITH an extension for code'},type:{type:'string',enum:['markdown','code'],description:'"markdown" for prose, "code" for source / HTML / SVG'},language:{type:'string',description:'For code files, the language e.g. perl'},content:{type:'string',description:'File content'},append:{type:'boolean',description:'Append to the file instead of overwriting — use for a running scratchpad or notes'}},required:['name','content']}}},
   {type:'function',function:{name:'read_file',description:'Read a file: a range of lines (numbered, with the total line count), or — with `search` — the lines matching a string plus surrounding context',parameters:{type:'object',properties:{name:{type:'string',description:'File name'},search:{type:'string',description:'If given, return only lines matching this'},regex:{type:'boolean',description:'Treat search as a regex'},context:{type:'integer',description:'Lines of context (default 2)'},start_line:{type:'integer',description:'1-based line to start reading from (default 1)'},line_count:{type:'integer',description:'How many lines to return (default 100)'}},required:[]}}},
-  {type:'function',function:{name:'edit_file',description:'Change PART of a file. old_text must appear EXACTLY ONCE — copy it verbatim with enough surrounding lines to be unique. Do not use line numbers. For a full rewrite, use write_file.',parameters:{type:'object',properties:{name:{type:'string',description:'File name'},old_text:{type:'string',description:'The exact text to replace'},new_text:{type:'string',description:'What to put in its place. Empty string deletes the snippet.'},all:{type:'boolean',description:'Replace every occurrence instead of requiring exactly one'}},required:['old_text','new_text']}}}
+  {type:'function',function:{name:'edit_file',description:'Change PART of a file. old_text must appear EXACTLY ONCE — copy it verbatim with enough surrounding lines to be unique. Do not use line numbers. For a full rewrite, use write_file.',parameters:{type:'object',properties:{name:{type:'string',description:'File name'},old_text:{type:'string',description:'The exact text to replace'},new_text:{type:'string',description:'What to put in its place. Empty string deletes the snippet.'},all:{type:'boolean',description:'Replace every occurrence instead of requiring exactly one'}},required:['old_text','new_text']}}},
+  {type:'function',function:{name:'set_values',description:'Write cells into a spreadsheet (a side-panel document of type "sheet"), CREATING it if none by that name exists. Each cell is a plain value (text or number) or a formula starting with "=" that uses A1-style cell refs and ranges — e.g. "=B2*C2", "=sum(A1:A10)", "=mean(B1:B5)", "=max(C1:C9)". Math is mathjs (sum, mean, min, max, round, abs, sqrt, + - * / ^ and more). The user can also edit the grid by hand in the side panel.',parameters:{type:'object',properties:{name:{type:'string',description:'The spreadsheet title. If no sheet by this name exists it is created.'},cells:{type:'object',description:'A map of A1-style cell → value, e.g. {"A1":"Item","B1":"Qty","B2":3,"C2":"=B2*1.1"}. A 2D array is also accepted (written from the top-left, or from "at").'},at:{type:'string',description:'Only when "cells" is a 2D array: the top-left cell to place it at, e.g. "A1" (default).'}},required:['cells']}}},
+  {type:'function',function:{name:'get_values',description:'Read a spreadsheet (a document of type "sheet") as a 2D array of COMPUTED values (formulas already evaluated). Use it to see what a sheet holds — including after the user has edited cells by hand in the side panel.',parameters:{type:'object',properties:{name:{type:'string',description:'The spreadsheet to read, by title. Omit to use the only or currently-open sheet.'},range:{type:'string',description:'Optional A1-style range to limit the read, e.g. "A1:C10". Omit for the whole sheet.'}},required:[]}}}
 ];
 var chatToolsBtn=document.getElementById('chatTools');
 var toolsPop=document.getElementById('toolsPop');
@@ -6762,6 +6843,9 @@ var GET_ASSET_TOOL={type:'function',function:{name:'get_asset',description:'Look
 var GET_SCREENSHOT_TOOL={type:'function',function:{name:'get_screenshot',description:'See what the document you are working on looks like rendered. Takes a picture of the current side-panel document and shows it to you so you can check its layout and design. Captures static appearance only (page scripts are not run). Requires a vision-capable model to actually see it.',parameters:{type:'object',properties:{name:{type:'string',description:'Optional: which document to capture, by title. Omit to capture the one currently open.'}}}}};
 // Host access: a CLIENT-executed tool. The model asks, the browser runs it and prompts the
 // user for permission (the real consent gate); the "Host access" tick only exposes the tool.
+// No params, no network, no permission: computed in the browser from the user's clock.
+// Always offered (like ask_question) so the model always has a current date/time.
+var GET_DATE_TOOL={type:'function',function:{name:'get_date',description:'Get the current date and time. Returns the user’s local time (with day of week and time zone) and the equivalent UTC/GMT time. You have no clock of your own — call this whenever the current date, day, or time matters.',parameters:{type:'object',properties:{}}}};
 var GET_LOCATION_TOOL={type:'function',function:{name:'get_location',description:'Get the user’s current location (latitude, longitude, accuracy in metres). Runs in the user’s browser, which asks their permission first — they may decline. Use it only when the task genuinely needs where they are (local weather, nearby places, their time zone). Returns coordinates, not a street address.',parameters:{type:'object',properties:{}}}};
 // Resolves to {ok,lat,lon,acc} or {ok:false,err}. The browser's own permission prompt is the
 // consent gate; never throws (a decline/unavailable is a normal tool result the model handles).
@@ -6775,8 +6859,8 @@ function _getLocation(){
   });
 }
 var _ALL_TOOL_DEFS=[IMG_TOOL,EDIT_TOOL,VIDEO_TOOL,ASK_TOOL,SPEECH_TOOL,WEB_TOOL,
-                    SPAWN_TOOL,CALC_TOOL,LIST_ASSETS_TOOL,SEARCH_MODELS_TOOL,
-                    GET_ASSET_TOOL,GET_SCREENSHOT_TOOL,GET_LOCATION_TOOL].concat(DOC_TOOLS);
+                    SPAWN_TOOL,CALC_TOOL,CONVERT_CURRENCY_TOOL,LIST_ASSETS_TOOL,SEARCH_MODELS_TOOL,
+                    GET_ASSET_TOOL,GET_SCREENSHOT_TOOL,GET_LOCATION_TOOL,GET_DATE_TOOL].concat(DOC_TOOLS);
 var TOOL_DEFS={};_ALL_TOOL_DEFS.forEach(function(t){if(t&&t.function)TOOL_DEFS[t.function.name]=t.function});
 // The heavy tools: shipped with a BLANKED parameter schema (just the name + terse
 // description) to keep the biggest schemas off every turn's wire. The model guesses
@@ -6863,7 +6947,7 @@ function buildTools(){
   // and useless without them.
   if(imageOn||videoOn||speechOn||webOn){t.push(LIST_ASSETS_TOOL);t.push(GET_ASSET_TOOL);}   // list, then look
   if(imageOn||videoOn||speechOn)t.push(SEARCH_MODELS_TOOL);
-  if(t.length)t.push(CALC_TOOL);   // exact math, useful alongside anything
+  if(t.length){t.push(CALC_TOOL);t.push(CONVERT_CURRENCY_TOOL);}   // exact math + live FX, useful alongside anything
   // terse the opt-in tools (COPIES — TOOL_DEFS keeps the full text) and add
   // read_docs so the model can pull full docs for them — but only when there ARE
   // opt-in tools to read about.
@@ -6871,7 +6955,7 @@ function buildTools(){
   // ask_question has no toggle: clarifying a genuinely ambiguous request is core
   // assistant behaviour, not an opt-in capability, so it is always available.
   // Kept full (not tersed) — it is short and self-explanatory.
-  return out.concat([ASK_TOOL]);
+  return out.concat([ASK_TOOL,GET_DATE_TOOL]);
 }
 // wrench stays lit whenever any tool is enabled
 function paintTools(){
@@ -7200,6 +7284,198 @@ function applyDocOp(chatId,name,args){
   if(ctx.inView){refreshDocUI();if(out.docId)openDoc(out.docId);}
   return out;
 }
+// ---- spreadsheets (the 'sheet' document type) ---------------------------
+// A sheet is a document whose content is JSON: a 2D array of raw cell strings
+// (plain values, or formulas that start with '='). Formulas reuse the SAME
+// locked-down mathjs instance as calc — cell refs (A1) and ranges (A1:C3) are
+// expanded to numbers / matrices, then evaluated. The model reads/writes with
+// get_values / set_values; the user edits the grid in the doc panel; both see
+// the same cells. Deliberately small: no cross-sheet refs, no graphs.
+var _SHEET_MAXROWS=200,_SHEET_MAXCOLS=52;   // sanity ceiling for eval + render
+function _colName(n){var s='';n++;while(n>0){var m=(n-1)%26;s=String.fromCharCode(65+m)+s;n=Math.floor((n-1)/26);}return s;}
+function _colIdx(s){var n=0;s=String(s).toUpperCase();for(var i=0;i<s.length;i++)n=n*26+(s.charCodeAt(i)-64);return n-1;}
+function _refRC(ref){var m=/^\s*([A-Za-z]+)(\d+)\s*$/.exec(String(ref||''));return m?{r:parseInt(m[2],10)-1,c:_colIdx(m[1])}:null;}
+// parse content -> rectangular 2D array of strings
+function _sheetGrid(content){
+  var g;try{g=JSON.parse(content||'[]')}catch(e){g=[]}
+  if(!Array.isArray(g))g=[];
+  var w=0;g.forEach(function(r){if(Array.isArray(r)&&r.length>w)w=r.length});
+  return g.map(function(r){r=Array.isArray(r)?r:[];var out=[];for(var c=0;c<w;c++)out.push(r[c]==null?'':String(r[c]));return out;});
+}
+// 2D array -> JSON, trimming trailing all-empty rows/cols so stored content stays tidy
+function _sheetJSON(grid){
+  var lastR=-1,lastC=-1;
+  for(var r=0;r<grid.length;r++)for(var c=0;c<grid[r].length;c++)if(String(grid[r][c]).trim()!==''){if(r>lastR)lastR=r;if(c>lastC)lastC=c;}
+  if(lastR<0)return '[]';
+  var out=[];for(var r2=0;r2<=lastR;r2++){var row=[];for(var c2=0;c2<=lastC;c2++)row.push((grid[r2]&&grid[r2][c2]!=null)?String(grid[r2][c2]):'');out.push(row);}
+  return JSON.stringify(out);
+}
+// Evaluate one formula body (no leading '='). cellVal(r,c) returns the raw computed
+// value (number|string), cellNum(r,c) coerces to a number (non-numeric -> 0).
+function _sheetEval(expr,cellVal,cellNum){
+  var s=String(expr);
+  var pure=/^\s*([A-Za-z]+)(\d+)\s*$/.exec(s);          // bare ref: pass value through (keeps text)
+  if(pure){var rc=_refRC(pure[1]+pure[2]);return cellVal(rc.r,rc.c);}
+  s=s.replace(/([A-Za-z]+)(\d+)\s*:\s*([A-Za-z]+)(\d+)/g,function(_,a1,n1,a2,n2){   // ranges -> matrix
+    var ci1=_colIdx(a1),ci2=_colIdx(a2),ri1=parseInt(n1,10)-1,ri2=parseInt(n2,10)-1,t;
+    if(ci1>ci2){t=ci1;ci1=ci2;ci2=t;} if(ri1>ri2){t=ri1;ri1=ri2;ri2=t;}
+    if((ci2-ci1+1)*(ri2-ri1+1)>_SHEET_MAXROWS*_SHEET_MAXCOLS)throw new Error('range too large');
+    var rows=[];for(var rr=ri1;rr<=ri2;rr++){var rc=[];for(var cc=ci1;cc<=ci2;cc++)rc.push(cellNum(rr,cc));rows.push('['+rc.join(',')+']');}
+    return '['+rows.join(',')+']';
+  });
+  s=s.replace(/([A-Za-z]+)(\d+)/g,function(_,a1,n1){return String(cellNum(parseInt(n1,10)-1,_colIdx(a1)));}); // single refs -> number
+  s=s.toLowerCase().replace(/\baverage\b/g,'mean').replace(/\bavg\b/g,'mean').replace(/\bproduct\b/g,'prod');
+  var r=_calcEval(s);                                   // locked-down mathjs (same as calc)
+  return (r!==''&&r!=null&&isFinite(r))?Number(r):r;
+}
+// Compute every cell. Recursive with a visiting set, so a circular reference
+// resolves to '#CYCLE' rather than hanging. Returns {values:2D, rows, cols}.
+function _sheetCompute(grid){
+  var rows=grid.length,cols=rows?grid[0].length:0,cache={},visiting={};
+  function cellVal(r,c){
+    if(r<0||c<0||r>=grid.length||!grid[r]||c>=grid[r].length)return '';
+    var key=r+':'+c;
+    if(key in cache)return cache[key];
+    if(visiting[key]){return (cache[key]='#CYCLE');}
+    var raw=String(grid[r][c]==null?'':grid[r][c]).trim();
+    if(raw.charAt(0)!=='='){return (cache[key]=(raw!==''&&isFinite(raw))?Number(raw):raw);}
+    visiting[key]=1;
+    var res;try{res=_sheetEval(raw.slice(1),cellVal,cellNum);}catch(e){res='#ERR';}
+    delete visiting[key];
+    return (cache[key]=res);
+  }
+  function cellNum(r,c){var v=cellVal(r,c);var n=(typeof v==='number')?v:((v!==''&&v!=null&&isFinite(v))?Number(v):NaN);return isFinite(n)?n:0;}
+  var values=[];for(var r=0;r<rows;r++){var row=[];for(var c=0;c<cols;c++)row.push(cellVal(r,c));values.push(row);}
+  return {values:values,rows:rows,cols:cols};
+}
+function _sheetFmt(v){
+  if(v==null)return '';
+  if(typeof v==='number'){if(!isFinite(v))return String(v);return ''+(Math.round(v*1e9)/1e9);}
+  return String(v);
+}
+function _sheetCSV(content){
+  return _sheetCompute(_sheetGrid(content)).values.map(function(row){
+    return row.map(function(v){var s=_sheetFmt(v);return /[",\n]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s;}).join(',');
+  }).join('\n');
+}
+function _findSheet(docs,name){
+  if(name){var d=findDoc(docs,name);return (d&&d.type==='sheet')?d:null;}
+  var active=findDoc(docs,activeDocId);if(active&&active.type==='sheet')return active;
+  var sheets=docs.filter(function(d){return d.type==='sheet';});
+  return sheets.length===1?sheets[0]:null;
+}
+function applySheetOp(chatId,name,args){
+  var ctx=docCtx(chatId);
+  if(!ctx)return {text:'No active conversation for the spreadsheet tools.'};
+  var docs=ctx.docs,sname=String(args.name||args.title||'').trim();
+  if(name==='get_values'){
+    var d=_findSheet(docs,sname);
+    if(!d)return {text:'No spreadsheet'+(sname?' named "'+sname+'"':'')+'. Create one with set_values, or call list_assets to see what exists.'};
+    var vals=_sheetCompute(_sheetGrid(d.content)).values,rng=String(args.range||'').trim(),m=rng&&/^([A-Za-z]+)(\d+)\s*:\s*([A-Za-z]+)(\d+)$/.exec(rng);
+    if(m){
+      var r1=Math.min(+m[2],+m[4])-1,r2=Math.max(+m[2],+m[4])-1,c1=Math.min(_colIdx(m[1]),_colIdx(m[3])),c2=Math.max(_colIdx(m[1]),_colIdx(m[3])),sub=[];
+      for(var r=r1;r<=r2;r++){var row=[];for(var c=c1;c<=c2;c++)row.push((vals[r]&&vals[r][c]!=null)?vals[r][c]:'');sub.push(row);}
+      vals=sub;
+    }
+    return {text:'Spreadsheet "'+d.title+'"'+(rng?(' '+rng):'')+' (formulas evaluated):\n'+JSON.stringify(vals),md:'`get_values` '+escHtml(d.title)};
+  }
+  // set_values
+  var sd=_findSheet(docs,sname),created=false;
+  if(!sd){sd={id:_docId(),title:(sname||'sheet1').slice(0,120),type:'sheet',language:'',content:'[]',updated:Date.now(),versions:[]};docs.push(sd);created=true;}
+  var grid=_sheetGrid(sd.content);
+  function ensure(r,c){if(r>=_SHEET_MAXROWS||c>=_SHEET_MAXCOLS)return false;while(grid.length<=r)grid.push([]);var w=c+1;grid.forEach(function(row){while(row.length<w)row.push('');});return true;}
+  var cells=args.cells,wrote=0;
+  if(Array.isArray(cells)){
+    var origin=_refRC(args.at||'A1')||{r:0,c:0};
+    for(var i=0;i<cells.length;i++){var rv=cells[i];if(!Array.isArray(rv))continue;for(var j=0;j<rv.length;j++){if(ensure(origin.r+i,origin.c+j)){grid[origin.r+i][origin.c+j]=(rv[j]==null?'':String(rv[j]));wrote++;}}}
+  }else if(cells&&typeof cells==='object'){
+    Object.keys(cells).forEach(function(k){var rc=_refRC(k);if(rc&&ensure(rc.r,rc.c)){grid[rc.r][rc.c]=(cells[k]==null?'':String(cells[k]));wrote++;}});
+  }else{
+    if(created){docs.pop();}   // don't leave an empty sheet behind on a malformed call
+    return {text:'set_values needs "cells" as a map of A1 cell → value, e.g. {"A1":"Item","B2":"=B1*2"}, or a 2D array.'};
+  }
+  sd.content=_sheetJSON(grid);sd.updated=Date.now();_docCommitVersion(sd);
+  var out={text:(created?'Created spreadsheet "':'Updated spreadsheet "')+sd.title+'" ('+wrote+' cell'+(wrote===1?'':'s')+' set). Current values:\n'+JSON.stringify(_sheetCompute(_sheetGrid(sd.content)).values),
+           docId:sd.id,md:(created?'Created ':'Updated ')+'**'+sd.title+'**'};
+  ctx.commit();
+  if(ctx.inView){refreshDocUI();openDoc(sd.id);}
+  return out;
+}
+// Per-sheet column widths (px), kept in memory for the session so a width survives
+// the full re-render on every cell edit. Keyed by doc id, then column index.
+var _sheetColW={},_SHEET_COLW_DEFAULT=96;
+// Render a sheet into the doc body. `editable` draws <input> cells (latest version,
+// not streaming); otherwise a static grid (an older snapshot). Pads a few spare
+// rows/cols so there's room to type; the grid grows as cells beyond them are set.
+function renderSheetDoc(content,editable,body){
+  var docId=activeDocId,widths=_sheetColW[docId]||{};
+  var raw=_sheetGrid(content),usedR=raw.length,usedC=raw.length?raw[0].length:0;
+  var nR=Math.min(_SHEET_MAXROWS,Math.max(usedR+(editable?3:0),editable?8:Math.max(usedR,1)));
+  var nC=Math.min(_SHEET_MAXCOLS,Math.max(usedC+(editable?2:0),editable?5:Math.max(usedC,1)));
+  var grid=[];for(var r=0;r<nR;r++){var row=[];for(var c=0;c<nC;c++)row.push((raw[r]&&raw[r][c]!=null)?raw[r][c]:'');grid.push(row);}
+  var comp=_sheetCompute(grid);
+  var _rowh=44,_tw=_rowh,_cg='<colgroup><col style="width:'+_rowh+'px">';
+  for(var cw=0;cw<nC;cw++){var _ww=widths[cw]||_SHEET_COLW_DEFAULT;_tw+=_ww;_cg+='<col style="width:'+_ww+'px">';}
+  _cg+='</colgroup>';
+  var h='<div class="sheet-wrap"><table class="sheet" style="width:'+_tw+'px">'+_cg+'<thead><tr><th class="sheet-corner"></th>';
+  for(var c2=0;c2<nC;c2++)h+='<th class="sheet-colh">'+_colName(c2)+'<span class="sheet-resize" data-c="'+c2+'" title="Drag to resize"></span></th>';
+  h+='</tr></thead><tbody>';
+  for(var r2=0;r2<nR;r2++){
+    h+='<tr><th class="sheet-rowh">'+(r2+1)+'</th>';
+    for(var c3=0;c3<nC;c3++){
+      var isF=String(grid[r2][c3]).charAt(0)==='=',disp=escHtml(_sheetFmt(comp.values[r2][c3]));
+      if(editable)h+='<td class="sheet-cell'+(isF?' sheet-f':'')+'"><input class="sheet-in" data-r="'+r2+'" data-c="'+c3+'" data-raw="'+escHtml(String(grid[r2][c3]))+'" data-disp="'+disp+'" value="'+disp+'"></td>';
+      else h+='<td class="sheet-cell'+(isF?' sheet-f':'')+'">'+disp+'</td>';
+    }
+    h+='</tr>';
+  }
+  body.innerHTML=h+'</tbody></table></div>';
+  _wireSheetResize(body,docId);
+  if(editable){
+    var ins=body.querySelectorAll('.sheet-in');
+    Array.prototype.forEach.call(ins,function(inp){
+      inp.addEventListener('focus',function(){this.value=this.getAttribute('data-raw')||'';this.select();});
+      inp.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();this.blur();}else if(e.key==='Escape'){this.value=this.getAttribute('data-raw')||'';this.blur();}});
+      inp.addEventListener('blur',function(){_commitSheetCell(this);});
+    });
+  }
+}
+// Column-header drag handles: resize the matching <col>, remembering the width in
+// _sheetColW so it holds across re-renders. Works on editable and read-only grids.
+function _wireSheetResize(body,docId){
+  var table=body.querySelector('table.sheet');if(!table)return;
+  var cols=table.querySelectorAll('colgroup col'),ths=table.querySelectorAll('thead th');
+  Array.prototype.forEach.call(body.querySelectorAll('.sheet-resize'),function(h){
+    h.addEventListener('mousedown',function(e){
+      e.preventDefault();e.stopPropagation();
+      var ci=parseInt(h.getAttribute('data-c'),10),col=cols[ci+1],th=ths[ci+1];   // +1: col 0 is the row-header
+      if(!col||!th)return;
+      var startX=e.clientX,startW=th.offsetWidth;
+      function mv(ev){
+        var w=Math.max(40,startW+(ev.clientX-startX));
+        col.style.width=w+'px';
+        (_sheetColW[docId]||(_sheetColW[docId]={}))[ci]=w;
+        var tw=0;Array.prototype.forEach.call(cols,function(cc){tw+=parseInt(cc.style.width,10)||0;});
+        table.style.width=tw+'px';   // keep the fixed-layout table sized to its columns
+      }
+      function up(){document.removeEventListener('mousemove',mv);document.removeEventListener('mouseup',up);document.body.classList.remove('sheet-resizing');}
+      document.addEventListener('mousemove',mv);document.addEventListener('mouseup',up);document.body.classList.add('sheet-resizing');
+    });
+  });
+}
+// User edited a cell in the panel: write it back, recompute, snapshot, re-render.
+function _commitSheetCell(inp){
+  var doc=findDoc(currentDocs(),activeDocId);if(!doc||doc.type!=='sheet')return;
+  var r=parseInt(inp.getAttribute('data-r'),10),c=parseInt(inp.getAttribute('data-c'),10);
+  var newRaw=inp.value,oldRaw=inp.getAttribute('data-raw')||'';
+  if(newRaw===oldRaw){inp.value=inp.getAttribute('data-disp')||'';return;}   // no change — restore computed view, no rebuild (keeps Tab navigation)
+  var grid=_sheetGrid(doc.content);
+  while(grid.length<=r)grid.push([]);
+  var w=c+1;grid.forEach(function(row){while(row.length<w)row.push('');});
+  grid[r][c]=newRaw;
+  doc.content=_sheetJSON(grid);doc.updated=Date.now();_docCommitVersion(doc);
+  saveCurrentChat();renderDocPanel();
+}
 // ---- inline <file> blocks -----------------------------------------------
 // A tool call's arguments only arrive once the whole call is parsed, so a file
 // written that way lands in one lump with nothing to watch. Instead the model
@@ -7218,7 +7494,12 @@ var DOC_SYSTEM='When you produce something the user will keep, copy, or iterate 
   +'written. Keep ordinary conversational replies outside file blocks.\n\n'
   +'To CHANGE a file you already wrote, do not repeat the whole thing: use read_file with a '
   +'`search` to find the text, then edit_file with that exact snippet. Re-emit a full block only '
-  +'for a total rewrite.';
+  +'for a total rewrite.\n\n'
+  +'For tabular data or anything the user will tweak and recompute (budgets, tallies, estimates), '
+  +'make a SPREADSHEET instead of a text file: call set_values (it creates a sheet by name) with '
+  +'cell values and formulas like "=sum(A1:A9)" or "=B2*C2", and read it back with get_values. The '
+  +'user can edit the sheet’s cells directly in the side panel, so re-read with get_values before '
+  +'reacting to "does this look better?".';
 // `<file>` is the current block; `<document>` is still accepted so older chats
 // (whose stored content used it) keep rendering.
 var DOC_OPEN_RE=/<(?:file|document)\b([^>]*)>/i;
@@ -7439,10 +7720,11 @@ function openDoc(id){
   activeDocId=id;
   _docPanelWanted=true;
   document.getElementById('docPanel').style.display='';
+  var _dr=document.getElementById('docResizer');if(_dr)_dr.style.display='';
   renderDocPanel();
   syncDocBtn();
 }
-function hideDocPanel(){document.getElementById('docPanel').style.display='none';syncDocBtn();}   // hide without changing intent
+function hideDocPanel(){document.getElementById('docPanel').style.display='none';var _dr=document.getElementById('docResizer');if(_dr)_dr.style.display='none';syncDocBtn();}   // hide without changing intent
 function closeDoc(){_docPanelWanted=false;hideDocPanel();                              // user dismissed it
   var p=document.getElementById('docPanel');if(p)p.classList.remove('doc-max');       // leave maximized state behind
   var mb=document.getElementById('docMax');if(mb&&typeof _docMaxIcon!=='undefined'){mb.title='Maximize';mb.innerHTML=_docMaxIcon.off;}}
@@ -7450,12 +7732,16 @@ function docFilename(doc){
   // the model names documents with their extension (e.g. hanoi.pl); use the
   // title verbatim, only supplying a fallback extension if it left one off
   var base=(doc.title||'document').replace(/[^\w.\- ]+/g,'').trim()||'document';
+  if(doc.type==='sheet')return /\.csv$/i.test(base)?base:base.replace(/\.\w+$/,'')+'.csv';
   if(/\.\w+$/.test(base))return base;
   return base+(doc.type==='code'?'.txt':'.md');
 }
 function downloadDoc(){
   var doc=findDoc(currentDocs(),activeDocId);if(!doc)return;
-  var blob=new Blob([docViewState(doc).content],{type:'text/plain;charset=utf-8'});
+  var _dc=docViewState(doc).content;
+  var blob=(doc.type==='sheet')
+    ?new Blob([_sheetCSV(_dc)],{type:'text/csv;charset=utf-8'})
+    :new Blob([_dc],{type:'text/plain;charset=utf-8'});
   var url=URL.createObjectURL(blob);
   var a=document.createElement('a');a.href=url;a.download=docFilename(doc);
   document.body.appendChild(a);a.click();document.body.removeChild(a);
@@ -7589,6 +7875,10 @@ function renderDocPanel(streaming){
     }
     return;
   }
+  if(doc.type==='sheet'){
+    renderSheetDoc(content,vw.latest&&!doc.streaming,body);
+    return;
+  }
   if(doc.type==='code'){
     body.innerHTML='<pre><code></code></pre>';
     var code=body.querySelector('code');
@@ -7663,6 +7953,37 @@ document.getElementById('docToggle').addEventListener('click',function(){
     var d=currentDocs();if(d.length)openDoc((findDoc(d,activeDocId)||d[d.length-1]).id);
   }else closeDoc();
 });
+// Draggable column widths for the conversation sidebar and the document panel.
+// The gutters are the (invisible) .col-resizer strips that sit where the flex gap
+// used to be. Sizes persist to localStorage. Desktop only (mobile sidebar is a drawer).
+(function initPanelResizers(){
+  var sb=document.getElementById('chatSidebar'),sbr=document.getElementById('sidebarResizer');
+  var dp=document.getElementById('docPanel'),dpr=document.getElementById('docResizer');
+  var layout=document.querySelector('.chat-layout');
+  try{var sw=parseInt(localStorage.getItem('dyva_sidebar_w'),10);if(sb&&sw>=140)sb.style.width=sw+'px';}catch(e){}
+  try{var dw=parseInt(localStorage.getItem('dyva_doc_w'),10);if(dp&&dw>=240)dp.style.flex='0 0 '+dw+'px';}catch(e){}
+  function drag(resizer,spec){
+    if(!resizer)return;
+    resizer.addEventListener('mousedown',function(e){
+      e.preventDefault();
+      var sx=e.clientX,start=spec.start();
+      function mv(ev){spec.move(ev.clientX-sx,start);}
+      function up(){document.removeEventListener('mousemove',mv);document.removeEventListener('mouseup',up);document.body.classList.remove('col-resizing');spec.end();}
+      document.addEventListener('mousemove',mv);document.addEventListener('mouseup',up);document.body.classList.add('col-resizing');
+    });
+  }
+  if(sb)drag(sbr,{
+    start:function(){return sb.getBoundingClientRect().width;},
+    move:function(dx,w0){sb.style.width=Math.max(140,Math.min(520,w0+dx))+'px';},
+    end:function(){try{localStorage.setItem('dyva_sidebar_w',String(Math.round(sb.getBoundingClientRect().width)));}catch(e){}}
+  });
+  if(dp)drag(dpr,{
+    start:function(){return dp.getBoundingClientRect().width;},
+    // doc panel is on the RIGHT, so dragging the gutter left (dx<0) widens it
+    move:function(dx,w0){var maxw=(layout?layout.getBoundingClientRect().width:1200)-320;dp.style.flex='0 0 '+Math.max(240,Math.min(Math.max(240,maxw),w0-dx))+'px';},
+    end:function(){try{localStorage.setItem('dyva_doc_w',String(Math.round(dp.getBoundingClientRect().width)));}catch(e){}}
+  });
+})();
 
 var attachments=[];
 var chatFilesInput=document.getElementById('chatFiles');
@@ -8727,13 +9048,38 @@ document.getElementById('imgNext').addEventListener('click',function(){imgPageBy
 document.getElementById('imgSearch').addEventListener('input',function(){_imgPage=0;filterImgHistory()});
 var lightbox=document.createElement('div');
 lightbox.id='lightbox';
-lightbox.innerHTML='<img alt=""><div class="cap"></div>';
+lightbox.innerHTML='<img alt=""><div class="cap"></div><button type="button" id="lbEdit" class="lb-btn">Use as reference</button>';
 document.body.appendChild(lightbox);
 var _lbSwallowClick=false;
 lightbox.addEventListener('click',function(){
   if(_lbSwallowClick){_lbSwallowClick=false;return}
   lightbox.classList.remove('open');_lightboxAt=-1;_lbChatAt=-1;
 });
+// Pull the image you're looking at into the Edit pane's reference set, then
+// jump there. stopPropagation so this click doesn't close the lightbox first.
+lightbox.querySelector('#lbEdit').addEventListener('click',function(e){e.stopPropagation();_lbUseAsRef()});
+function _lbUseAsRef(){
+  var im=lightbox.querySelector('img'),src=im&&im.src;
+  if(!src)return;
+  // Nice filename: chat asset name if we can map it, else the URL's last
+  // segment, else a default (data: URLs have no useful name).
+  var name='',a=assetForImg(src);
+  if(a&&a.name)name=a.name;
+  else if(src.indexOf('data:')!==0){try{name=decodeURIComponent(src.split('/').pop().split('?')[0])}catch(_){name=''}}
+  if(!name)name='image.png';
+  // Mirrors addImageFromUrl (trapped in a closure): fetch -> blob -> File ->
+  // _editFiles -> repaint. Works for sdapi/v1/images URLs and data: URLs alike.
+  fetch(src).then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.blob()}).then(function(b){
+    _editFiles.push(new File([b],name,{type:b.type||'image/png'}));
+    _renderEditThumbs();
+  }).catch(function(ex){
+    var hint=document.querySelector('#editDrop .drop-hint');
+    if(hint)hint.textContent='could not read that image — '+ex.message;
+  });
+  lightbox.classList.remove('open');_lightboxAt=-1;_lbChatAt=-1;
+  var want='media/image/edit';
+  if(location.hash==='#'+want)setImgMode('edit');else location.hash=want;
+}
 // Swipe is the same step the arrow keys take. Horizontal-dominant and over
 // 45px, so a scroll-ish drag or a tap-with-wobble doesn't count.
 var _lbX=0,_lbY=0,_lbTouch=null;
