@@ -14,7 +14,7 @@ Capable of text generation, embeddings, systemone (JEV) decision models, vision,
 
 Dyva supports unified workflows for stable diffusion, MiniMax H3, Z-image, LTX 2.2, 2.3, 2.5, Qwen-Image, loras, iris, Flux.1, 2 and 3, including the Klein variations, and much more. You can just chat with the agent and have it do it for you.
 
-[See a demo](https://9ol.es/11434) or run it yourself with a few keystrokes on Linux, Windows, Mac, and even Android. 
+[Use the demo server](https://9ol.es/11434) or run it yourself with a few keystrokes on Linux, Windows, Mac, and even Android. 
 
 ```
 uvx dyva
