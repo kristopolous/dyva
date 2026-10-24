@@ -64,7 +64,7 @@ Not really. Other dyva servers get flagged and excluded from the survey so this 
 
 **What about honeypots?**
 
-Yes! This one is real. Running dyva *might* get you blocked temporarily from numerous sites on CDNs such as Cloudflare. This includes IoT networks, imdb, huggingface, cloud storage, all kinds of stuff... even banks. The public surveys have honeypots with tripwires that get the srcaddr (you) put in some temporary ban pool with an expiry merely by a tcp_connect(). These are also called canaries in the literature.
+Yes! This one is real. Running dyva *might* get you blocked temporarily (~4 days) from numerous sites on CDNs such as Cloudflare. This includes IoT networks, imdb, huggingface, cloud storage, all kinds of stuff... even banks. The public surveys have honeypots with tripwires that get the srcaddr (you) put in some temporary ban pool with an expiry merely by a tcp_connect(). These are also called canaries in the literature.
 
 However, there's a rich testing and probing harness in dyva to block these machines based on an ensemble of techniques. Canary tripping is effectively solved and I haven't seen it in months. But of course, absence of evidence doesn't mean much.
 
