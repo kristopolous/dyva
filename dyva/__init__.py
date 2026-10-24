@@ -415,6 +415,11 @@ CONTINUATION_HEDGE_PROBE = 45
 STICKY_TTL = 2 * 3600   # 2 hours
 MIN_COUNT = 0   # hide models served by fewer than this many hosts (0/1 = show all)
 EXPLORE_MODE = False   # route UNKNOWN/unvisited hosts first to map more of the pool (slower)
+# "Hide dyva": when on, a remote bot/curl GET of a WEB PAGE (the dashboard/HTML, not
+# the /v1 or /api endpoints) gets an empty 404 instead of the UI — so a drive-by
+# `curl server:11434/` sees nothing. Honest browser UAs still get the page; localhost
+# always does; the API stays reachable to non-browser clients. Off by default.
+HIDE_DYVA = False
 # Clouds (enrichment `provider` labels, lowercased) the operator has chosen to
 # NEVER touch — "cloudskipper". A skipped cloud's hosts are removed from the
 # candidate list in find_servers, so dyva never even TCP-connects to them (the
@@ -651,7 +656,7 @@ def model_modalities(model):
 def load_settings():
     """Apply persisted runtime settings (workers/timeout/min_count/local) over
     the CLI defaults, so changes made in the dashboard survive restarts."""
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA
     if not os.path.exists(SETTINGS_FILE):
         return
     try:
@@ -692,6 +697,8 @@ def load_settings():
         _LOCAL = s["local"]
     if isinstance(s.get("explore"), bool):
         EXPLORE_MODE = s["explore"]
+    if isinstance(s.get("hide_dyva"), bool):
+        HIDE_DYVA = s["hide_dyva"]
     if "model_list" in s:
         MODEL_LIST = parse_model_list(s["model_list"])
     if "model_list_on" in s:
@@ -720,7 +727,7 @@ def save_settings(extra=None):
     data.update({"workers": WORKER_COUNT, "timeout": TIMEOUT,
                  "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS,
                  "worker_max": WORKER_MAX, "worker_max_failover": WORKER_MAX_FAILOVER, "tool_resume": TOOL_RESUME, "race_watchdog": RACE_WATCHDOG,
-                 "min_count": MIN_COUNT, "local": _LOCAL, "explore": EXPLORE_MODE,
+                 "min_count": MIN_COUNT, "local": _LOCAL, "explore": EXPLORE_MODE, "hide_dyva": HIDE_DYVA,
                  "admin_pw": ADMIN_PW, "model_list": MODEL_LIST, "model_list_on": MODEL_LIST_ON,
                  "cloudskip": sorted(CLOUD_SKIP), "base_path": BASE_PATH,
                  "gossiper_url": GOSSIPER_URL, "gossiper_enabled": GOSSIPER_ENABLED})
@@ -4246,6 +4253,32 @@ def _model_size(model):
     """Recorded disk size (bytes) for a model from the survey, or None."""
     rec = load_survey().get(model)
     return rec.get("size") if isinstance(rec, dict) else None
+
+
+# Curated GGUF manifest-digest -> human display name. Lets a collapsed rename-family
+# (see handle_dashboard_models) show a real base name instead of a throwaway
+# representative. Hand-maintained, low-velocity, shipped with the package. Fail-safe:
+# a missing/corrupt file just means no labels. Non-hex keys (e.g. _comment) are
+# dropped so the file can document itself.
+GGUF_LABELS_FILE = os.path.join(os.path.dirname(__file__), "gguf-labels.json")
+_gguf_labels = None
+_HEX64 = re.compile(r"^[0-9a-f]{64}$", re.I)
+
+
+def load_gguf_labels():
+    global _gguf_labels
+    if _gguf_labels is None:
+        _gguf_labels = {}
+        try:
+            with open(GGUF_LABELS_FILE, encoding="utf-8") as f:
+                d = json.load(f)
+            if isinstance(d, dict):
+                _gguf_labels = {k.lower(): str(v) for k, v in d.items()
+                                if isinstance(k, str) and _HEX64.match(k)
+                                and v and isinstance(v, str)}
+        except (ValueError, OSError):
+            pass
+    return _gguf_labels
 
 
 _SIZE_MULT = {"k": 1e3, "m": 1e6, "g": 1e9, "t": 1e12}
@@ -9565,9 +9598,22 @@ async def handle_dashboard_models(request):
     # (how many hosts, how many good/bad), never on the host IPs — those are fetched
     # on demand (see /dashboard-model-hosts). This turns an (hosts x their models)
     # payload — the whole private inventory — into one small row per distinct model.
-    agg = {}   # model id -> {"count": n, "image": bool}
+    # Per-model GGUF digest from the survey (same /api/tags digest graflex already
+    # records). Renamed junk — probe_zz_*, sysverify-*, zzc_* — is the same base
+    # re-uploaded under throwaway names, so its members share one digest; we use
+    # that to collapse the family into a single row below.
+    survey = load_survey()
+
+    def _model_digest(name):
+        r = survey.get(name)
+        return (r.get("digest") if isinstance(r, dict) else None) or None
+
+    agg = {}            # model id -> {"count": n, "image": bool}
+    dig_members = {}    # gguf digest -> set of model names sharing it
+    dig_hosts = {}      # gguf digest -> set of hosts serving any member
     for s in servers:
-        if not s.get("server"):
+        host = s.get("server")
+        if not host:
             continue
         is_img = s.get("service") in ("a1111", "comfyui")
         for m in s.get("models") or []:
@@ -9579,6 +9625,10 @@ async def handle_dashboard_models(request):
             a["count"] += 1
             if is_img:
                 a["image"] = True
+            dg = _model_digest(m)
+            if dg:
+                dig_members.setdefault(dg, set()).add(m)
+                dig_hosts.setdefault(dg, set()).add(host)
     # Complete good/bad host counts per model straight from the reputation DB — one
     # GROUP BY, and unlike the dashboard-data panes these aren't a truncated slice,
     # so the coverage bars are exact again.
@@ -9587,11 +9637,40 @@ async def handle_dashboard_models(request):
             f"SELECT model, state, COUNT(*) FROM host_status "
             f"WHERE state IN ('good','bad') AND {_LIVE_REAL} GROUP BY model, state").fetchall():
         gb.setdefault(model, {})[state] = n
+    # Collapse rename families: when FAMILY_MIN+ distinct model NAMES share one GGUF
+    # digest, they're one base under junk names — emit a SINGLE row instead of
+    # hundreds. The surviving row is keyed on a real member name (so the host
+    # drill-down still resolves) and carries `aka` = how many names folded in; its
+    # host count is the UNION across the family. The representative is the
+    # most-served member (ties broken by name) so the row is as "real" as the data
+    # allows. Image checkpoints never carry a GGUF digest, so they're never touched.
+    # (Labeling the row with the true base name is a separate, later layer.)
+    FAMILY_MIN = 3
+    labels = load_gguf_labels()   # digest -> real base name, when known (curated)
+    collapsed = {}      # member name -> representative name (the row that survives)
+    fam_meta = {}       # representative -> {"count", "aka", "label"}
+    for dg, members in dig_members.items():
+        if len(members) < FAMILY_MIN:
+            continue
+        rep = max(members, key=lambda n: (agg.get(n, {}).get("count", 0), n))
+        fam_meta[rep] = {"count": len(dig_hosts.get(dg, ())), "aka": len(members),
+                         "label": labels.get(dg.lower())}
+        for n in members:
+            collapsed[n] = rep
     out = []
     for m, a in agg.items():
+        rep = collapsed.get(m)
+        if rep is not None and rep != m:
+            continue   # folded into its family's representative row
         c = gb.get(canon_pattern(m), {})
         _row = {"id": m, "count": a["count"], "image": a["image"],
                 "good": c.get("good", 0), "bad": c.get("bad", 0)}
+        fm = fam_meta.get(m)
+        if fm:
+            _row["count"] = fm["count"]
+            _row["aka"] = fm["aka"]
+            if fm.get("label"):
+                _row["label"] = fm["label"]
         if a["image"] and is_nsfw_model(m):   # label image checkpoints only
             _row["nsfw"] = True
         out.append(_row)
@@ -9940,7 +10019,7 @@ async def handle_settings_get(request):
                               "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS,
                               "worker_max": WORKER_MAX, "worker_max_failover": WORKER_MAX_FAILOVER, "tool_resume": TOOL_RESUME, "race_watchdog": RACE_WATCHDOG,
                               "min_count": MIN_COUNT, "local": _LOCAL,
-                              "explore": EXPLORE_MODE,
+                              "explore": EXPLORE_MODE, "hide_dyva": HIDE_DYVA,
                               "cloudskip": sorted(CLOUD_SKIP),
                               "base_path": BASE_PATH,
                               "admin_pw_set": bool(ADMIN_PW),
@@ -9960,7 +10039,7 @@ async def handle_settings_post(request):
       '200':
         description: Updated settings
     """
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA
     resp = await _check_local(request) or _check_admin(request)
     if resp:
         return resp
@@ -10008,6 +10087,8 @@ async def handle_settings_post(request):
         _LOCAL = body["local"]
     if isinstance(body.get("explore"), bool):
         EXPLORE_MODE = body["explore"]
+    if isinstance(body.get("hide_dyva"), bool):
+        HIDE_DYVA = body["hide_dyva"]
     if isinstance(body.get("cloudskip"), list):
         CLOUD_SKIP = {x.lower() for x in body["cloudskip"] if isinstance(x, str) and x.strip()}
     if isinstance(body.get("base_path"), str):
@@ -10053,7 +10134,7 @@ async def handle_settings_post(request):
                               "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS,
                               "worker_max": WORKER_MAX, "worker_max_failover": WORKER_MAX_FAILOVER, "tool_resume": TOOL_RESUME, "race_watchdog": RACE_WATCHDOG,
                               "min_count": MIN_COUNT, "local": _LOCAL,
-                              "explore": EXPLORE_MODE,
+                              "explore": EXPLORE_MODE, "hide_dyva": HIDE_DYVA,
                               "cloudskip": sorted(CLOUD_SKIP),
                               "base_path": BASE_PATH,
                               "admin_pw_set": bool(ADMIN_PW),
@@ -18743,8 +18824,39 @@ async def _loop_lag_watchdog(thresh=2.0, period=0.5):
                 log.warning(f"EVENT LOOP STALLED {lag:.1f}s (stack dump failed: {e})")
 
 
+# Paths that are the MACHINE API, not the human web UI — exempt from "hide dyva" so a
+# non-browser API client (curl against /v1, an app hitting /api) keeps working while the
+# dashboard is hidden. Matched against the path with any --base prefix already stripped.
+_HIDE_API_PREFIXES = ("/v1/", "/v1", "/api/", "/api", "/workers-ws", "/comfyui/")
+
+
+def _looks_like_browser(ua):
+    # Every real browser (Chrome/Firefox/Safari/Edge) sends a "Mozilla/" UA; curl, wget,
+    # python-requests, Go-http-client, scanners and bots do not. So a present "Mozilla/"
+    # token is a cheap, robust "this is a human's browser" signal — and its absence
+    # (including an empty UA) is the bot/curl we want to hide from.
+    return "mozilla/" in (ua or "").lower()
+
+
+@web.middleware
+async def _hide_dyva_mw(request, handler):
+    # When "hide dyva" is on, a remote non-browser GET of a WEB PAGE gets an empty 404 —
+    # so a drive-by `curl server:11434/` sees nothing. Localhost always passes; the /v1
+    # and /api endpoints always pass (the API stays reachable to non-browser clients);
+    # honest browser UAs always pass. Off by default, so this is a no-op unless enabled.
+    if HIDE_DYVA and request.remote not in ("127.0.0.1", "::1", "localhost"):
+        path = request.path
+        if BASE_PATH and path.startswith(BASE_PATH):
+            path = path[len(BASE_PATH):] or "/"
+        is_api = any(path == p or path.startswith(p.rstrip("/") + "/") for p in _HIDE_API_PREFIXES)
+        if not is_api and not _looks_like_browser(request.headers.get("User-Agent")):
+            return web.Response(status=404)
+    return await handler(request)
+
+
 def make_app():
-    app = web.Application(client_max_size=128 * 1024 * 1024)
+    app = web.Application(client_max_size=128 * 1024 * 1024,
+                          middlewares=[_hide_dyva_mw])
 
     async def on_startup(app):
         app["session"] = aiohttp.ClientSession(
@@ -18996,7 +19108,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="dumpster-dyva - Like the Ollama :cloud models, but you don't pay.")
     parser.add_argument("-p", "--port",     type=int, default=PORT, help=f"port to listen on (default: {PORT})")
-    parser.add_argument("-u", "--host",     type=str, default="", help="host address to bind to (default: all interfaces)")
+    parser.add_argument("-u", "--host",     action="append", default=None, metavar="ADDR", help="host address to bind to; repeat to bind several, e.g. -u 127.0.0.1 -u 10.0.0.1 (default: all interfaces)")
     parser.add_argument("--base",           type=str, default=None, help="secret URL path to serve dyva under, e.g. /some-path -> /some-path/v1/models (overrides the base_path setting; default: served at root)")
     parser.add_argument("-t", "--timeout",  type=int, default=30, help="request timeout in seconds (default: 30)")
     parser.add_argument("-c", "--config",   type=str, default="", metavar="DIR", help="data/cache directory (default: ~/.cache/free-ollama). Override it to run more than one dyva on a box.")
@@ -19078,17 +19190,30 @@ def main():
     # Bind to the requested port, but if it's already taken (another dyva, a leftover
     # process), walk forward to the next free one instead of dying. __PORT__ in the
     # dashboard and the reload poke read this global, so set it before make_app()/serve.
-    host = args.host or "0.0.0.0"
+    # -u may be repeated (-u A -u B) to bind several interfaces; aiohttp's run_app takes
+    # a list of hosts (one TCPSite each). No -u at all = bind every interface.
+    hosts = args.host or ["0.0.0.0"]
     import socket as _socket
-    _bind_probe_host = "" if host == "0.0.0.0" else host
-    for _cand in range(PORT, PORT + 50):
-        with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as _s:
-            _s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
-            try:
-                _s.bind((_bind_probe_host, _cand))
-                break
-            except OSError:
+
+    def _port_free(cand):
+        # A candidate port is usable only if it's free on EVERY requested interface.
+        # Probe each with AF_INET; "0.0.0.0" probes as INADDR_ANY, and an IPv6 literal
+        # (contains ':') can't be tested this way, so it's trusted rather than walked over.
+        for h in hosts:
+            if ":" in h:
                 continue
+            bh = "" if h == "0.0.0.0" else h
+            with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as _s:
+                _s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+                try:
+                    _s.bind((bh, cand))
+                except OSError:
+                    return False
+        return True
+
+    for _cand in range(PORT, PORT + 50):
+        if _port_free(_cand):
+            break
     else:
         log.error(f"no free port in {PORT}..{PORT + 49} — is something stuck?")
         return
@@ -19098,19 +19223,27 @@ def main():
 
     log.info(f"Starting dumpster-dyva on port {PORT}, WORKER_COUNT={WORKER_COUNT}, TIMEOUT={TIMEOUT}, MIN_COUNT={MIN_COUNT}, LOCAL={_LOCAL}")
 
-    # Big, obvious, clickable (OSC8) link so there's zero hunting for where to go.
-    _disp_host = "localhost" if host in ("0.0.0.0", "", "::") else host
-    _url = f"http://{_disp_host}:{PORT}{BASE_PATH}"
-    _iw = len(_url) + 6                                   # 3 spaces of padding each side
-    _link = f"\x1b]8;;{_url}\x1b\\\x1b[1;96m{_url}\x1b[0m\x1b]8;;\x1b\\"   # bold bright-cyan + clickable
+    # Big, obvious, clickable (OSC8) links so there's zero hunting for where to go.
+    # One line per bound interface (-u may be repeated); a wildcard bind shows as
+    # localhost. Deduped, order preserved.
+    _disp_hosts = []
+    for _h in hosts:
+        _d = "localhost" if _h in ("0.0.0.0", "", "::") else _h
+        if _d not in _disp_hosts:
+            _disp_hosts.append(_d)
+    _urls = [f"http://{_d}:{PORT}{BASE_PATH}" for _d in _disp_hosts]
+    _iw = max(len(u) for u in _urls) + 6                 # box width fits the longest, 3 pad each side
     _pad = " " * 13                                       # fixed 14-space indent, not centered
     _label = "DASHBOARD"
     _lp = (_iw - len(_label)) // 2                         # center the label within the box
     _dash = "│" + " " * _lp + "\x1b[1m" + _label + "\x1b[0m" + " " * (_iw - len(_label) - _lp) + "│"
-    print("\n" + _pad + "╭" + "─" * _iw + "╮"
-          + "\n" + _pad + _dash
-          + "\n" + _pad + "│   " + _link + "   │"
-          + "\n" + _pad + "╰" + "─" * _iw + "╯" + "\n", flush=True)
+    _rows = ["\n" + _pad + "╭" + "─" * _iw + "╮",
+             "\n" + _pad + _dash]
+    for _u in _urls:
+        _link = f"\x1b]8;;{_u}\x1b\\\x1b[1;96m{_u}\x1b[0m\x1b]8;;\x1b\\"   # bold bright-cyan + clickable
+        _rows.append("\n" + _pad + "│   " + _link + " " * (_iw - 6 - len(_u)) + "   │")
+    _rows.append("\n" + _pad + "╰" + "─" * _iw + "╯" + "\n")
+    print("".join(_rows), flush=True)
 
     app = make_app()
 
@@ -19122,7 +19255,7 @@ def main():
     try:
         web.run_app(
             app,
-            host=host,
+            host=hosts,
             port=PORT,
             # Don't wait out aiohttp's default 60s for lingering connections on quit
             # — on_shutdown already cancels the background tasks, so a couple seconds

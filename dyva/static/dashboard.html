@@ -308,6 +308,7 @@ body.chat{height:100vh;height:100dvh}
 .done-line{color:var(--text-faint);font-style:italic}
 .model-item{padding:var(--sp-2) 0;font-size:var(--fs-md);display:flex;justify-content:space-between}
 .nsfw-badge{display:inline-block;font-size:var(--fs-2xs);text-transform:uppercase;letter-spacing:.04em;color:var(--text-muted);border:1px solid var(--border);border-radius:var(--r-sm);padding:0 .3em;vertical-align:middle}
+.aka-badge{display:inline-block;font-size:var(--fs-2xs);color:var(--text-dim);border:1px solid var(--border);border-radius:var(--r-sm);padding:0 .3em;vertical-align:middle;font-family:var(--font-mono)}
 .model-name{font-family:var(--font-mono);font-size:var(--fs-sm);max-width:85%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .model-count{color:var(--text-dim);flex-shrink:0;padding-left:var(--sp-3);white-space:nowrap}
 /* Model coverage bar: working/failing/untested, muted pastels (not a christmas tree) */
@@ -686,6 +687,9 @@ button.stop:hover{background:var(--btn-danger-hover)}
 .msg-time{margin-left:auto;color:var(--text-faint);font-size:var(--fs-2xs);letter-spacing:0;text-transform:none;font-weight:400;flex-shrink:0}
 .msg .body{background:var(--surface);border-radius:var(--r-lg);padding:.7em;font-size:var(--fs-lg);overflow-wrap:anywhere;line-height:var(--line-body)}
 .msg .body .error{color:var(--err)}
+/* Wide math can't wrap (katex is white-space:nowrap); scroll it inside the
+   bubble instead of letting it stretch the chat column, same as .body pre. */
+.msg .body .katex-display{max-width:100%;overflow-x:auto;overflow-y:hidden;padding:2px 0}
 .rummage-wrap{display:flex;align-items:center;gap:14px}
 .rummage{width:96px;height:96px;flex-shrink:0;display:block;border-radius:var(--r-lg)}
 .rummage-msg{color:var(--text-3);font-size:var(--fs-2xl)}
@@ -740,6 +744,11 @@ button.stop:hover{background:var(--btn-danger-hover)}
 .msg.note .note-text .asset-meta{font-size:var(--fs-2xs);color:var(--text-dim);overflow-wrap:anywhere}
 .msg.note .note-text a{color:var(--accent)}   /* lift system-section links off the dim default with a blue tinge */
 .msg.note .note-text .asset-about{margin-top:.2em;font-size:var(--fs-xs);color:var(--text-3);line-height:var(--line-body);overflow-wrap:anywhere}
+/* Memories (/list): a fact and a remove button on one row. */
+.msg.note .note-text .mem-card{display:flex;gap:var(--sp-3);align-items:flex-start;justify-content:space-between;border:1px solid var(--border);border-radius:var(--r-md);padding:.5em;margin:.4em 0;max-width:44rem}
+.msg.note .note-text .mem-text{min-width:0;flex:1 1 auto;font-size:var(--fs-sm);color:var(--text);line-height:var(--line-body);overflow-wrap:anywhere}
+.msg.note .note-text .mem-del{flex:0 0 auto;cursor:pointer;padding:2px 10px;border:1px solid var(--border);border-radius:var(--r-md);background:var(--bg-inset);color:var(--text-dim);font-size:var(--fs-2xs);font-family:inherit}
+.msg.note .note-text .mem-del:hover{border-color:var(--border-accent);color:var(--accent);background:var(--bg-sunken)}
 /* Not a table at all: four columns squeezed the description into a vertical
    wall of letters on a phone, and stacking turned out to read better on every
    width. Each file is a block — name on its own line, kind and source
@@ -1195,8 +1204,10 @@ input[type=range]{width:100%;accent-color:var(--accent);cursor:pointer}
 .media-models .mm b{color:var(--text-dim);font-weight:400}
 #imgResult{margin-top:14px}
 #imgResult img{max-width:100%;border-radius:var(--r-lg);border:1px solid var(--border);margin-top:10px}
-#imgResult.grid{display:flex;flex-wrap:wrap;gap:10px}
-#imgResult.grid img,#imgResult.grid .img-slot{width:calc(50% - 5px);margin-top:0}
+#imgResult.grid,.img-run.grid{display:flex;flex-wrap:wrap;gap:10px}
+#imgResult.grid img,#imgResult.grid .img-slot,.img-run.grid img,.img-run.grid .img-slot{width:calc(50% - 5px);margin-top:0}
+.img-run{margin-top:14px}
+.img-run:first-child{margin-top:0}
 .img-slot{min-height:120px;border:1px dashed var(--border);border-radius:var(--r-lg);margin-top:10px;display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-size:var(--fs-2xs)}
 .img-slot::after{content:'\2026'}
 #imgResult .status{color:var(--text-dim);font-size:var(--fs-md)}
@@ -1873,6 +1884,7 @@ body.dragging-image .hist-item{cursor:grabbing}
 <div class="settings-card-title">Presentation<span class="dirty-flag">needs save</span></div>
 <label class="setting"><span class="setting-text"><span class="setting-name">Minimum model count</span><small class="setting-help">Hide models served by fewer than this many hosts from the <code>/api/tags</code> and <code>/v1/models</code> listings that third-party apps read. 0 = show all. (The dashboard always shows everything.)</small></span><input type="number" id="setMinCount" min="0" step="1"></label>
 <label class="setting"><span class="setting-text"><span class="setting-name">Base path</span><small class="setting-help">Serve dyva under a secret URL path instead of the root. A path like <code>/some-path</code> moves the dashboard to <code>/some-path/</code> and the API to <code>/some-path/v1/models</code> — deterrence by obscurity: a scanner hitting the default paths (<code>/v1/models</code>, <code>/api/tags</code>) finds nothing. Blank = served at the root. <b>Takes effect on restart</b> (like the listen port); the <code>--base</code> flag overrides this.</small></span><input type="text" id="setBasePath" placeholder="/some-path" spellcheck="false" autocomplete="off"></label>
+<label class="setting"><span class="setting-text"><span class="setting-name">Hide dyva</span><small class="setting-help">Serve the web dashboard only to real browsers. When on, a remote non-browser request for a page &mdash; <code>curl server:11434/</code>, a scanner, a bot &mdash; gets an empty <code>404</code> instead of the UI, so a drive-by probe sees nothing. Browsers (any <code>Mozilla/</code> user-agent) and localhost always get through, and the <code>/v1</code> and <code>/api</code> endpoints stay reachable to non-browser API clients. Off by default.</small></span><input type="checkbox" id="setHideDyva"></label>
 <label class="setting"><span class="setting-text"><span class="setting-name">Gossiper</span><small class="setting-help">Share high-confidence signals &mdash; starting with smoke-test results (real endpoint vs honeypot) &mdash; with peer dyva instances, scoped by source, so you skip re-probing a host a peer just characterized. The signal set expands conservatively over time. A peer's honeypot flag is trusted: the host is skipped without contact (re-verifying it would mean sending the trap a request &mdash; the exact thing the flag spares you). Privacy-bounded: a sync only reaches peers who already hold the same source URL. <b>On by default</b>; untick to opt out entirely.</small></span><input type="checkbox" id="setGossiperEnabled"></label>
 <label class="setting"><span class="setting-text"><span class="setting-name">Gossiper endpoint</span><small class="setting-help">The gossiper server to sync with. Defaults to the public reference instance; point it at your own, or clear it to run without one. Keep the trailing slash (a POST to the slashless form gets redirected and dropped).</small></span><input type="text" id="setGossiperUrl" placeholder="https://9ol.es/dyva/gossiper/" spellcheck="false" autocomplete="off"></label>
 <label class="setting"><span class="setting-text"><span class="setting-name">Model list override</span><small class="setting-help">Advertise a fixed list of model names from <code>/api/tags</code> and <code>/v1/models</code> instead of the discovered catalog, for tools that make you pick one specific model id. Every dyva model name is a routing pattern, so one entry like <code>qwen3</code> covers every <code>qwen3:*</code> variant on every host. Tick <b>Enabled</b> and put one name per line in the box below (blank lines and <code>#comments</code> are ignored). Untick to go back to the real catalog — the list stays in the box so you can flip it back on. Names no host currently serves stay listed (count 0) so the menu can't shift under a tool that pinned one. <b>Minimum model count</b> doesn't apply to an explicit list.</small></span><input type="checkbox" id="setModelListOn"></label>
@@ -2296,8 +2308,8 @@ function updateModelPaneCounts(q){
     if(!list)return;
     var rows=list.querySelectorAll('.model-item'),hit=0,inst=0;
     for(var i=0;i<rows.length;i++){
-      var mid=rows[i].getAttribute('data-name');
-      if(matchModel(mid,q||'')&&(_facetSet===null||_facetSet.has(mid))){hit++;inst+=((modelAgg[mid]||{}).count||0);}
+      var mid=rows[i].getAttribute('data-name'),mlb=rows[i].getAttribute('data-label');
+      if((matchModel(mid,q||'')||(mlb&&matchModel(mlb,q||'')))&&(_facetSet===null||_facetSet.has(mid))){hit++;inst+=((modelAgg[mid]||{}).count||0);}
     }
     installs[t[0]]=inst;
     var el=document.getElementById(t[1]);
@@ -2364,8 +2376,8 @@ function _applyModelFilter(q){
   }
   refreshUseBtn();
   document.querySelectorAll('.modellist .model-item').forEach(function(el){
-    var n=el.getAttribute('data-name');
-    el.style.display=(matchModel(n,q)&&(_facetSet===null||_facetSet.has(n)))?'':'none';
+    var n=el.getAttribute('data-name'),l=el.getAttribute('data-label');
+    el.style.display=((matchModel(n,q)||(l&&matchModel(l,q)))&&(_facetSet===null||_facetSet.has(n)))?'':'none';
   });
   // Per group: the header count reflects how many models MATCH the query (not the
   // group total), and a group with no matches is hidden. Collapse is respected — a
@@ -2458,10 +2470,19 @@ function makeModelBar(mid){
   segs.forEach(function(s,i){if(w[i]>0){var el=document.createElement('i');el.className=s[0];el.style.width=w[i]+'px';bar.appendChild(el);}});
   return bar;
 }
-function makeModelRow(mid){var d=document.createElement('div');d.className='model-item';d.setAttribute('data-name',mid);d.title=mid;var n=document.createElement('span');n.className='model-name';n.textContent=mid;
+function makeModelRow(mid){var d=document.createElement('div');d.className='model-item';d.setAttribute('data-name',mid);var n=document.createElement('span');n.className='model-name';
+  // Collapsed rename-family with a curated base name: show the real name, keep the
+  // representative id under data-name for host lookup, and index the label for search.
+  var _lbl=(modelAgg[mid]||{}).label;
+  n.textContent=_lbl||mid;d.title=_lbl?(_lbl+'  ('+mid+')'):mid;
+  if(_lbl)d.setAttribute('data-label',_lbl);
   // NSFW label (image checkpoints only): informational, and a heads-up that dyva
   // won't auto-pick this for a plain request (name a model to use it anyway).
   if((modelAgg[mid]||{}).nsfw){var b=document.createElement('span');b.className='nsfw-badge';b.textContent='nsfw';b.title='NSFW-leaning — not auto-picked for a plain request; name it explicitly to use it';n.appendChild(document.createTextNode(' '));n.appendChild(b);}
+  // Rename-family row: N throwaway names (probe_zz_*, sysverify-*, …) share this
+  // model's GGUF and were folded into this one row. The ×N badge says how many.
+  var _ak=(modelAgg[mid]||{}).aka;
+  if(_ak>1){var ab=document.createElement('span');ab.className='aka-badge';ab.textContent='×'+_ak;ab.title=_ak+' aliases share this GGUF — collapsed into one row';n.appendChild(document.createTextNode(' '));n.appendChild(ab);}
   d.appendChild(n);d.appendChild(makeModelBar(mid));return d}
 // Sort cardinality: good + maybe_good + unknown, EXCLUDING failed/bad hosts — a model
 // served only by dead hosts shouldn't rank above a live one on raw host count.
@@ -2610,7 +2631,7 @@ function renderModels(models){
   modelAgg={};imageModels={};
   models.forEach(function(m){
     var id=m.id||'';if(!id)return;
-    modelAgg[id]={count:m.count||0,good:m.good||0,bad:m.bad||0,nsfw:!!m.nsfw};
+    modelAgg[id]={count:m.count||0,good:m.good||0,bad:m.bad||0,nsfw:!!m.nsfw,aka:m.aka||0,label:m.label||''};
     if(m.image||_isImageModelName(id)){imageModels[id]=1;var t=id.indexOf(' [');if(t>=0)imageModels[id.slice(0,t)]=1}
   });
   var ids=Object.keys(modelAgg).filter(function(id){return id.length&&!/[:-]cloud/.test(id)});
@@ -3740,6 +3761,56 @@ function _normalizeToolSequence(msgs){
   });
   return merged;
 }
+// ---- user memories ----
+// A global (per-origin) list the model builds with save_memory and the user
+// prunes from /list. Stored in localStorage so it outlives any one chat and is
+// shared across all of them — the whole point of a memory. Each: {id,text,ts}.
+// They reach the model by riding in on every system prompt (see buildSendMessages),
+// not via a read tool — the model writes, the prompt carries.
+function memGet(){
+  try{var v=JSON.parse(localStorage.getItem('dyva_memories')||'[]');return Array.isArray(v)?v:[]}catch(e){return []}
+}
+function memSet(list){
+  try{localStorage.setItem('dyva_memories',JSON.stringify(list||[]))}catch(e){}
+}
+function memAdd(text){
+  text=String(text||'').trim();
+  if(!text)return null;
+  var list=memGet();
+  // exact-duplicate guard: re-saving the same fact is a no-op, not a second row
+  for(var i=0;i<list.length;i++)if(list[i]&&list[i].text===text)return list[i];
+  var rec={id:'m'+Date.now().toString(36)+Math.random().toString(36).slice(2,7),text:text,ts:Date.now()};
+  list.push(rec);memSet(list);
+  return rec;
+}
+function memRemove(id){
+  var list=memGet().filter(function(m){return m&&m.id!==id});
+  memSet(list);
+  return list;
+}
+// The current moment in the user's local zone AND UTC/GMT, as one line — lifted from
+// the old get_date tool. Prepended to every system prompt so the model always has a
+// clock (it has none of its own), re-stamped on each send.
+function _nowStamp(){
+  var now=new Date(),WD=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+  var p=function(n){return ('0'+n).slice(-2)};
+  var loc=WD[now.getDay()]+' '+now.getFullYear()+'-'+p(now.getMonth()+1)+'-'+p(now.getDate())+' '+p(now.getHours())+':'+p(now.getMinutes());
+  var o=-now.getTimezoneOffset(),off='UTC'+(o<0?'-':'+')+p(Math.floor(Math.abs(o)/60))+':'+p(Math.abs(o)%60);
+  var tz='';try{tz=Intl.DateTimeFormat().resolvedOptions().timeZone||''}catch(e){}
+  var utc=WD[now.getUTCDay()]+' '+now.getUTCFullYear()+'-'+p(now.getUTCMonth()+1)+'-'+p(now.getUTCDate())+' '+p(now.getUTCHours())+':'+p(now.getUTCMinutes());
+  return 'Today is '+loc+(tz?' '+tz:'')+' ('+off+'); '+utc+' UTC.';
+}
+// The always-present preamble: the date/time, then the user's remembered facts.
+// Fronts every system prompt (ahead of the per-chat /system text, docs, assets).
+function _sysPreamble(){
+  var out=_nowStamp();
+  var mems=memGet();
+  if(mems.length){
+    out+='\n\nThings the user has asked you to remember (use save_memory to add more):\n'
+       + mems.map(function(m){return '- '+m.text}).join('\n');
+  }
+  return out;
+}
 function buildSendMessages(chat){
   function _stripMediaMd(txt){
     return String(txt||'')
@@ -3811,7 +3882,12 @@ function buildSendMessages(chat){
       return o;
     }).filter(Boolean);
   msgs=_cheapCompact(msgs);
+  // Front every system prompt with the date and the user's remembered facts, then the
+  // per-chat /system text. This replaces the old get_date tool: the clock now rides in
+  // on the prompt (re-stamped each send) rather than costing a tool round-trip.
+  var _pre=_sysPreamble();
   var sysMsg=chat.system||'';
+  sysMsg=sysMsg?(_pre+'\n\n'+sysMsg):_pre;
   if(docsOn)sysMsg=sysMsg?(sysMsg+'\n\n'+DOC_SYSTEM):DOC_SYSTEM;
   var _al=assetsOf(chat);
   if(_al.length){
@@ -4145,6 +4221,20 @@ function renderFiles(b,files){
   });
   b.appendChild(wrap);
 }
+// Every rendered link opens in a new tab. All markdown — chat bubbles (initial,
+// streaming AND finalized), notes, doc previews — flows through DOMPurify.sanitize,
+// so one afterSanitizeAttributes hook covers every render path instead of a per-site
+// DOM pass (the old _extLinks, which only reached notes). In-page '#' anchors are
+// left alone so hash routing still navigates in place.
+if(window.DOMPurify&&!window._dyvaLinkHook){
+  window._dyvaLinkHook=true;
+  window.DOMPurify.addHook('afterSanitizeAttributes',function(node){
+    if(node.tagName==='A'){
+      var href=node.getAttribute('href')||'';
+      if(href&&href.charAt(0)!=='#'){node.setAttribute('target','_blank');node.setAttribute('rel','noopener noreferrer');}
+    }
+  });
+}
 function mdRender(text){
   var out=String(text||'');
   var math=[];
@@ -4318,6 +4408,13 @@ function paintGen(gen){
   if(tb)tb.scrollTop=tb.scrollHeight;
   scrollChat();
   updateTokEst();
+}
+// highlight.js's common bundle ships `bash` (alias `sh`) but not `zsh`, so a
+// ```zsh block (and a .zsh doc preview) would fall through unhighlighted. Alias it
+// to bash — the syntax is close enough and it's what people mean.
+if(window.hljs&&window.hljs.registerAliases&&!window._dyvaZshAlias){
+  window._dyvaZshAlias=true;
+  try{window.hljs.registerAliases(['zsh','zshrc'],{languageName:'bash'});}catch(e){}
 }
 function highlightBlocks(scope){
   renderMermaid(scope);              // draw ```mermaid blocks before hljs touches them
@@ -4843,6 +4940,17 @@ function _extLinks(el){
     a.target='_blank';a.rel='noopener noreferrer';
   });
 }
+// Bind the remove buttons in a rendered /list memories section. DOMPurify keeps the
+// <button> and its data-mem-del but strips inline handlers, so we attach here after
+// render: delete from localStorage, then drop that card's DOM node (no full re-render).
+function _memBinds(el){
+  Array.prototype.forEach.call(el.querySelectorAll('button[data-mem-del]'),function(b){
+    b.addEventListener('click',function(){
+      memRemove(b.getAttribute('data-mem-del'));
+      var card=b.closest('.mem-card');if(card&&card.parentNode)card.parentNode.removeChild(card);
+    });
+  });
+}
 var TOOL_LABELS=[
   ['imageOn','Image'],['videoOn','Video'],
   ['speechOn','Speech'],['webOn','Web'],['hostOn','Host access'],['agentsOn','Sub-agents'],['docsOn','Documents']
@@ -4859,13 +4967,13 @@ function disabledToolNames(){
   var live=_toolFlags();
   return TOOL_LABELS.filter(function(p){return !live[p[0]]}).map(function(p){return p[1]});
 }
-// Tools with no toggle of their own, mirrored from buildTools(): ask_question is
-// always sent; calc + read_docs ride along whenever any opt-in tool is on;
-// list_assets / search_models come in with the media tools.
+// Tools with no toggle of their own, mirrored from buildTools(): ask_question and
+// save_memory are always sent; calc + read_docs ride along whenever any opt-in tool
+// is on; list_assets / search_models come in with the media tools.
 function alwaysOnToolNames(){
   var live=_toolFlags();
   var anyOpt=live.imageOn||live.videoOn||live.speechOn||live.webOn||live.agentsOn||live.docsOn;
-  var names=['ask_question'];
+  var names=['ask_question','save_memory'];
   if(anyOpt){names.push('calc');names.push('help');}
   if(live.imageOn||live.videoOn||live.speechOn||live.webOn)names.push('list_assets');
   if(live.imageOn||live.videoOn||live.speechOn)names.push('search_models');
@@ -4947,6 +5055,20 @@ function chatSummaryMd(){
              +(d.language?', '+escHtml(d.language):'')
              +', '+String(d.content||'').split('\n').length+' lines)');
   });
+  // Memories are global (localStorage), not per-chat, but /list is where the user
+  // sees and prunes them. Each card carries a data-mem-del button; the handler is
+  // bound after render (_memBinds), since DOMPurify strips inline onclick.
+  var mlist=memGet();
+  out.push('');
+  out.push('#### memories');
+  if(!mlist.length)out.push('> *(none — the model saves these with save_memory)*');
+  else{
+    out.push('');
+    mlist.forEach(function(m){
+      out.push('<div class="mem-card"><div class="mem-text">'+escHtml(m.text)+'</div>'
+               +'<button type="button" class="mem-del" data-mem-del="'+escHtml(m.id)+'">remove</button></div>');
+    });
+  }
   return out.join('\n');
 }
 // ---- completion popup ----
@@ -5080,14 +5202,14 @@ function handleSlashCommand(text){
     var b=document.createElement('div');b.className='body';
     var lbl=document.createElement('span');lbl.className='note-cmd';lbl.textContent='/'+cmd;
     var t=document.createElement('div');t.className='note-text';t.innerHTML=mdRender(msg);
-    _extLinks(t);_thumbFallbacks(t);
+    _extLinks(t);_thumbFallbacks(t);_memBinds(t);
     b.appendChild(lbl);b.appendChild(t);d.appendChild(b);
     chatLog.appendChild(d);scrollChat();
     highlightBlocks(t);
     return {set:function(msg2,kind2){
       d.className='msg note'+(kind2?' '+kind2:'');
       t.innerHTML=mdRender(msg2);
-      _extLinks(t);_thumbFallbacks(t);
+      _extLinks(t);_thumbFallbacks(t);_memBinds(t);
       highlightBlocks(t);
       scrollChat();
     }};
@@ -5790,6 +5912,18 @@ async function runStream(chatId,chatCreated,chatTitle,model,msgs,bubble,depth,ex
         var _tz='';try{_tz=Intl.DateTimeFormat().resolvedOptions().timeZone||''}catch(e){}
         var _utc=_WD[_now.getUTCDay()]+' '+_now.getUTCFullYear()+'-'+_p(_now.getUTCMonth()+1)+'-'+_p(_now.getUTCDate())+' '+_p(_now.getUTCHours())+':'+_p(_now.getUTCMinutes())+':'+_p(_now.getUTCSeconds());
         results.push({text:JSON.stringify({localtime:_loc+(_tz?' '+_tz:'')+' ('+_off+')',GMT:_utc+' UTC'}),md:'`get_date`'});
+      }else if(fn.name==='save_memory'){
+        // Client-executed, no network/permission: store the fact in localStorage so it
+        // rides back in on every later system prompt (see _sysPreamble). The user prunes
+        // these from /list; the model only adds.
+        var _mt=String(args.text||'').trim();
+        if(!_mt){
+          results.push({text:'save_memory needs a non-empty "text" — the fact to remember.',md:'`⚠ save_memory`'});
+        }else{
+          var _mr=memAdd(_mt);
+          results.push({text:JSON.stringify({saved:true,note:'Remembered. It will be shown to you at the start of every chat until the user removes it.'}),
+                        md:'`save_memory` — '+escHtml(_mt.slice(0,80))});
+        }
       }else if(fn.name==='convert_currency'){
         // Keyless, client-executed. Primary + mirror from the fawazahmed0 currency-api
         // (lowercase shape {date, <base>:{<tgt>:rate}}), then the independent er-api
@@ -6846,6 +6980,11 @@ var GET_SCREENSHOT_TOOL={type:'function',function:{name:'get_screenshot',descrip
 // No params, no network, no permission: computed in the browser from the user's clock.
 // Always offered (like ask_question) so the model always has a current date/time.
 var GET_DATE_TOOL={type:'function',function:{name:'get_date',description:'Get the current date and time. Returns the user’s local time (with day of week and time zone) and the equivalent UTC/GMT time. You have no clock of your own — call this whenever the current date, day, or time matters.',parameters:{type:'object',properties:{}}}};
+// Memory: a CLIENT-executed tool. The model asks, the browser stores the fact in
+// localStorage (survives across all chats), and it rides back in on every later
+// system prompt. Always offered (like ask_question) so the model can always choose
+// to remember. The user sees and prunes these from /list; the model only adds.
+var SAVE_MEMORY_TOOL={type:'function',function:{name:'save_memory',description:'Remember a durable fact about the user or their preferences for future conversations (e.g. their name, how they like answers formatted, an ongoing project). Saved on the user’s device and shown back to you at the start of every chat — so save only lasting facts worth carrying, not one-off task details. The user can see and delete what you save.',parameters:{type:'object',properties:{text:{type:'string',description:'The fact to remember, as a short self-contained sentence, e.g. "Prefers metric units." or "Is building a CLI called dyva."'}},required:['text']}}};
 var GET_LOCATION_TOOL={type:'function',function:{name:'get_location',description:'Get the user’s current location (latitude, longitude, accuracy in metres). Runs in the user’s browser, which asks their permission first — they may decline. Use it only when the task genuinely needs where they are (local weather, nearby places, their time zone). Returns coordinates, not a street address.',parameters:{type:'object',properties:{}}}};
 // Resolves to {ok,lat,lon,acc} or {ok:false,err}. The browser's own permission prompt is the
 // consent gate; never throws (a decline/unavailable is a normal tool result the model handles).
@@ -6860,7 +6999,7 @@ function _getLocation(){
 }
 var _ALL_TOOL_DEFS=[IMG_TOOL,EDIT_TOOL,VIDEO_TOOL,ASK_TOOL,SPEECH_TOOL,WEB_TOOL,
                     SPAWN_TOOL,CALC_TOOL,CONVERT_CURRENCY_TOOL,LIST_ASSETS_TOOL,SEARCH_MODELS_TOOL,
-                    GET_ASSET_TOOL,GET_SCREENSHOT_TOOL,GET_LOCATION_TOOL,GET_DATE_TOOL].concat(DOC_TOOLS);
+                    GET_ASSET_TOOL,GET_SCREENSHOT_TOOL,GET_LOCATION_TOOL,GET_DATE_TOOL,SAVE_MEMORY_TOOL].concat(DOC_TOOLS);
 var TOOL_DEFS={};_ALL_TOOL_DEFS.forEach(function(t){if(t&&t.function)TOOL_DEFS[t.function.name]=t.function});
 // The heavy tools: shipped with a BLANKED parameter schema (just the name + terse
 // description) to keep the biggest schemas off every turn's wire. The model guesses
@@ -6955,7 +7094,11 @@ function buildTools(){
   // ask_question has no toggle: clarifying a genuinely ambiguous request is core
   // assistant behaviour, not an opt-in capability, so it is always available.
   // Kept full (not tersed) — it is short and self-explanatory.
-  return out.concat([ASK_TOOL,GET_DATE_TOOL]);
+  // save_memory takes the always-on slot get_date used to hold. get_date is
+  // deprecated — the date now rides in on every system prompt (see _sysPreamble),
+  // so it is no longer offered. Its handler survives as a harmless fallback below
+  // in case a model invents the call.
+  return out.concat([ASK_TOOL,SAVE_MEMORY_TOOL]);
 }
 // wrench stays lit whenever any tool is enabled
 function paintTools(){
@@ -8097,7 +8240,7 @@ function applyModelRecipe(){
 // ComfyUI fallback) versus prompt-driven editing against an edit model
 // (Qwen-Image-Edit, Flux Kontext, ...), which takes zero or more references.
 // img2img is deliberately not offered — nobody uses it any more.
-var _imgMode='generate',_editFiles=[],_editSrc=null;
+var _imgMode='generate',_editFiles=[],_editSrc=null,_imgRuns=0;
 // Same rule the server applies: keep the aspect, stay on a 64px grid, stay
 // under the pixel budget. Models want dimensions on a grid and choke on a
 // 40MP phone photo. Only ever shrinks.
@@ -8362,7 +8505,7 @@ function _renderEditThumbs(){
 })();
 
 async function editImage(){
-  var btn=document.getElementById('imgGenerate'),result=document.getElementById('imgResult');
+  var result=document.getElementById('imgResult');
   var prompt=document.getElementById('posPrompt').value.trim();
   if(!prompt){result.innerHTML='<div class="error">a prompt is required</div>';return}
   var seed=parseInt(document.getElementById('imgSeed').value);if(isNaN(seed))seed=-1;
@@ -8388,8 +8531,12 @@ async function editImage(){
     _editFiles.forEach(function(f){fd.append('image',f,f.name)});
     return fd;
   }
-  btn.disabled=true;result.innerHTML='';result.classList.toggle('grid',qty>1);
-  var slots=[];for(var i=0;i<qty;i++){var ph=document.createElement('div');ph.className='img-slot';result.appendChild(ph);slots.push(ph);}
+  // Don't gate the button or wipe prior output: dyva is a worker pool, so a new
+  // job fans across more hosts in parallel. Each run gets its own block (newest
+  // on top), left to fill while earlier runs keep rendering.
+  var run=document.createElement('div');run.className='img-run'+(qty>1?' grid':'');
+  result.insertBefore(run,result.firstChild);_imgRuns++;
+  var slots=[];for(var i=0;i<qty;i++){var ph=document.createElement('div');ph.className='img-slot';run.appendChild(ph);slots.push(ph);}
   showSnack(qty>1?('editing '+qty+' images across hosts\u2026'):'finding an edit host\u2026');
   var st=snackStatus;activeImgStatus=st;var done=0,anyOk=false;
   function runOne(idx){
@@ -8413,12 +8560,11 @@ async function editImage(){
   }
   var tasks=[];for(var k=0;k<qty;k++)tasks.push(runOne(k));
   try{await Promise.all(tasks);if(anyOk)loadImgHistory();}
-  finally{btn.disabled=false;if(activeImgStatus===st)activeImgStatus=null;hideSnack();}
+  finally{if(activeImgStatus===st)activeImgStatus=null;if(--_imgRuns<=0){_imgRuns=0;hideSnack();}}
 }
 
 async function generateImage(){
   if(_imgMode==='edit')return editImage();
-  var btn=document.getElementById('imgGenerate');
   var result=document.getElementById('imgResult');
   var seed=parseInt(document.getElementById('imgSeed').value);
   if(isNaN(seed))seed=-1;
@@ -8441,11 +8587,13 @@ async function generateImage(){
     sampler_name:(document.getElementById('imgSampler').disabled?undefined:document.getElementById('imgSampler').value),
     allow_nsfw:!!(document.getElementById('imgNsfw')||{}).checked,
   };
-  btn.disabled=true;
-  result.innerHTML='';
-  result.classList.toggle('grid',qty>1);
+  // Don't gate the button or wipe prior output: dyva is a worker pool, so a new
+  // job fans across more hosts in parallel. Each run gets its own block (newest
+  // on top), left to fill while earlier runs keep rendering.
+  var run=document.createElement('div');run.className='img-run'+(qty>1?' grid':'');
+  result.insertBefore(run,result.firstChild);_imgRuns++;
   var slots=[];
-  for(var i=0;i<qty;i++){var ph=document.createElement('div');ph.className='img-slot';result.appendChild(ph);slots.push(ph);}
+  for(var i=0;i<qty;i++){var ph=document.createElement('div');ph.className='img-slot';run.appendChild(ph);slots.push(ph);}
   showSnack(qty>1?('generating '+qty+' images across hosts\u2026'):'finding a server\u2026');
   var st=snackStatus;activeImgStatus=st;
   var done=0,anyOk=false;
@@ -8471,7 +8619,7 @@ async function generateImage(){
   }
   var tasks=[];for(var k=0;k<qty;k++)tasks.push(runOne(k));
   try{await Promise.all(tasks);if(anyOk)loadImgHistory();}
-  finally{btn.disabled=false;if(activeImgStatus===st)activeImgStatus=null;hideSnack();}
+  finally{if(activeImgStatus===st)activeImgStatus=null;if(--_imgRuns<=0){_imgRuns=0;hideSnack();}}
 }
 document.getElementById('imgGenerate').addEventListener('click',generateImage);
 
@@ -9657,14 +9805,19 @@ function renderSourceStats(d){
     +'<th title="races won / lost">W/L</th><th>Quality</th></tr>';
   var body=rows.map(function(s){
     var q=Math.round((s.quality||0)*100);
+    // Counts here reach the hundreds of thousands (race W/L especially), so they
+    // follow the same unit ladder as the rest of the stats (_numU: grouped under
+    // 10k, then K/M/B/T with one decimal — "147,362" -> "147.4K"). A raw title
+    // keeps the exact figure a hover away.
+    function _c(n){n=n||0;return '<span title="'+NUM_FMT.format(n)+'">'+_numU(n)+'</span>';}
     return '<tr>'
       +'<td class="src-nm" title="'+escHtml(s.name)+'">'+escHtml(s.name)+'</td>'
-      +'<td>'+NUM_FMT.format(s.hosts||0)+'</td>'
-      +'<td class="src-live">'+NUM_FMT.format(s.live||0)+'</td>'
-      +'<td class="src-dead">'+NUM_FMT.format(s.dead||0)+'</td>'
-      +'<td class="src-dim">'+NUM_FMT.format(s.unknown||0)+'</td>'
-      +'<td class="'+(s.honeypots?'src-honey':'src-dim')+'">'+NUM_FMT.format(s.honeypots||0)+'</td>'
-      +'<td class="src-dim">'+NUM_FMT.format(s.won||0)+'/'+NUM_FMT.format(s.lost||0)+'</td>'
+      +'<td>'+_c(s.hosts)+'</td>'
+      +'<td class="src-live">'+_c(s.live)+'</td>'
+      +'<td class="src-dead">'+_c(s.dead)+'</td>'
+      +'<td class="src-dim">'+_c(s.unknown)+'</td>'
+      +'<td class="'+(s.honeypots?'src-honey':'src-dim')+'">'+_c(s.honeypots)+'</td>'
+      +'<td class="src-dim">'+_c(s.won)+'/'+_c(s.lost)+'</td>'
       +'<td><span class="src-q"><i style="width:'+q+'%"></i></span><span class="src-qn">'+q+'%</span></td>'
       +'</tr>';
   }).join('');
@@ -10153,6 +10306,7 @@ function populateSettings(s){
   setModelList(s.model_list||[],s.model_list_on);
   document.getElementById('setLocal').checked=!!s.local;
   document.getElementById('setExplore').checked=!!s.explore;
+  document.getElementById('setHideDyva').checked=!!s.hide_dyva;
   updateExploreLogo();
   setReasoningKeys(s.reasoning_keys);
   renderCloudSkip(s.cloudskip||[]);
@@ -10280,6 +10434,7 @@ function saveSettings(){
     model_list_on:document.getElementById('setModelListOn').checked,
     local:document.getElementById('setLocal').checked,
     explore:document.getElementById('setExplore').checked,
+    hide_dyva:document.getElementById('setHideDyva').checked,
     reasoning_keys:collectReasoningKeys(),
     cloudskip:_collectCloudSkip()
   };
@@ -10326,6 +10481,7 @@ function saveSettings(){
       setModelList(s.model_list||[],s.model_list_on);
       document.getElementById('setLocal').checked=!!s.local;
       document.getElementById('setExplore').checked=!!s.explore;
+      document.getElementById('setHideDyva').checked=!!s.hide_dyva;
       setReasoningKeys(s.reasoning_keys);
       renderCloudSkip(s.cloudskip||[]);
       setPwState(!!s.admin_pw_set);

@@ -508,56 +508,7 @@ With `"stream": true` the per-host results are streamed back to the issuer **as 
 
 ### Text-to-Image
 
-The `txt2img` CLI generates images via the proxy:
-
-```bash
-txt2img "a sunset over mountains" -o output.png
-txt2img --width 1024 --height 768 --steps 20 "cyberpunk city"
-txt2img -m                  # list available SD models
-txt2img -m "sd_v15" "a cat" # use a specific model
-```
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--host` | dyva proxy host | `127.0.0.1` |
-| `--port` | dyva proxy port | `11434` |
-| `--width` | Image width | `512` |
-| `--height` | Image height | `512` |
-| `--steps` | Sampling steps | `30` |
-| `-m`, `--model` | SD model name (use without value to list) | auto |
-| `-o`, `--output` | Output file (default: stdout as PNG) | — |
-
-The proxy first tries A1111 hosts, then falls back to ComfyUI hosts with a basic txt2img workflow.
-
-#### Library
-
-`dyva.imagegen` provides a reusable async/sync function:
-
-```python
-from dyva.imagegen import imagegen, imagegen_sync
-
-# async
-img_bytes = await imagegen(prompt="a sunset", width=1024, height=768)
-
-# sync
-img_bytes = imagegen_sync(prompt="a cat in a spacesuit")
-```
-
-Returns raw PNG bytes. All parameters are keyword-only:
-
-| Param | Default | Description |
-|-------|---------|-------------|
-| `prompt` | *(required)* | Text prompt |
-| `model` | `None` | SD model name to match |
-| `width` | `512` | Image width |
-| `height` | `512` | Image height |
-| `steps` | `30` | Sampling steps |
-| `cfg_scale` | `7` | CFG scale |
-| `sampler_name` | `"Euler"` | Sampler |
-| `negative_prompt` | `""` | Negative prompt |
-| `seed` | `-1` | Seed (-1 = random) |
-| `host` | `"127.0.0.1"` | dyva proxy host |
-| `port` | `11434` | dyva proxy port |
+Generate images through the proxy with `POST /sdapi/v1/txt2img` (the A1111 shape — see the API table above). The proxy first tries A1111 hosts, then falls back to ComfyUI hosts with a basic txt2img workflow.
 
 ### Image Editing
 
