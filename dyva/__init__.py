@@ -4281,6 +4281,53 @@ def load_gguf_labels():
     return _gguf_labels
 
 
+MODEL_PRICES_FILE = os.path.join(os.path.dirname(__file__), "model-prices.json")
+_model_prices = None
+
+
+def load_model_prices():
+    """Whimsical reference prices ($/Mtok) seeded from OpenRouter — see
+    model-prices.json. Returns {"default": {...}, "families": {fam: {...}}} with
+    float prompt/completion rates; empty/fail-safe if the file is missing or bad.
+    Nothing routes or bills on this — it only powers the Stats 'street value' line."""
+    global _model_prices
+    if _model_prices is None:
+        _model_prices = {"default": None, "families": {}}
+        try:
+            with open(MODEL_PRICES_FILE, encoding="utf-8") as f:
+                d = json.load(f)
+
+            def _rate(x):
+                if not isinstance(x, dict):
+                    return None
+                try:
+                    return {"prompt": float(x["prompt"]), "completion": float(x["completion"])}
+                except (KeyError, TypeError, ValueError):
+                    return None
+            if isinstance(d, dict):
+                _model_prices["default"] = _rate(d.get("_default"))
+                fams = d.get("families")
+                if isinstance(fams, dict):
+                    _model_prices["families"] = {k.lower(): r for k, v in fams.items()
+                                                 if isinstance(k, str) and (r := _rate(v))}
+        except (ValueError, OSError):
+            pass
+    return _model_prices
+
+
+def _price_of(name):
+    """Reference rate for a model NAME: the first family key that appears in the
+    lowercased name wins (so 'qwen2.5:7b' -> qwen), else the default. None if no
+    prices are loaded at all. Longest family key first, so 'ibm-granite' beats a
+    stray 'granite' substring match."""
+    pr = load_model_prices()
+    low = str(name or "").lower()
+    for fam in sorted(pr["families"], key=len, reverse=True):
+        if fam in low:
+            return pr["families"][fam]
+    return pr["default"]
+
+
 _SIZE_MULT = {"k": 1e3, "m": 1e6, "g": 1e9, "t": 1e12}
 _SIZE_RE = re.compile(r"([<>]=?)\s*([\d.]+)\s*([kmgt])b?\b", re.I)
 
@@ -5209,6 +5256,26 @@ def retry_later(detail=None):
     return Outcome(V_RETRY, None, "", detail)
 
 
+def _is_stale_model_format(text):
+    """True for Ollama's "was downloaded in a format that is no longer supported.
+    To re-download, run 'ollama pull X'" error. It's a host-side stale-weights
+    problem for THIS model (the operator must re-pull); the client can't act on it
+    and shouldn't see it, and the host still serves other models fine. So the race
+    SKIPs this (host,model) to the next server instead of surfacing it as the job's
+    error — same family as "does not support tools"."""
+    return "no longer supported" in (text or "").lower()
+
+
+def _is_no_tools(text):
+    """True for the host's "<model> does not support tools" 400 — a per-(host,model)
+    capability gap (the file's template/GGUF can't tool-call), identical at every
+    host serving that file. Not a bad host (plain chat works) and not the client's
+    problem, so both the real-request path and the screening probe record it via
+    mark_no_tools and SKIP (no reputation penalty) rather than surfacing or
+    condemning. One definition so both callers agree on what the error is."""
+    return "does not support tools" in (text or "").lower()
+
+
 def record_verdict(host, key, outcome, sticky_key=None):
     """The one place a race turns a verdict into reputation.
 
@@ -5451,13 +5518,27 @@ def _stats_aggregate(q=""):
         out.sort(key=lambda x: x["up"] + x["down"], reverse=True)
         return out
 
+    # Whimsical "street value": what these tokens WOULD have cost at a commercial
+    # provider (reference rates in model-prices.json, $/Mtok). Per-model so a family
+    # with no match falls back to the default rate; summed for the headline. Purely
+    # informational — you paid $0.
+    model_rows = _rows(models)
+    total_cost = 0.0
+    for r in model_rows:
+        rate = _price_of(r["name"])
+        if rate:
+            c = (r["up"] * rate["prompt"] + r["down"] * rate["completion"]) / 1e6
+            r["cost"] = round(c, 4)
+            total_cost += c
+
     return {
         "days": [days[k] for k in sorted(days)],
         "weeks": [weeks[k] for k in sorted(weeks)],
         "hours": [hours[k] for k in sorted(hours)],
-        "models": _rows(models),
+        "models": model_rows,
         "hosts": _rows(hosts),
-        "totals": {"up": (trow[0] or 0), "down": (trow[1] or 0), "reqs": (trow[2] or 0)},
+        "totals": {"up": (trow[0] or 0), "down": (trow[1] or 0), "reqs": (trow[2] or 0),
+                   "cost": round(total_cost, 2)},
     }
 
 
@@ -6882,7 +6963,10 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
                 raw = await resp.read()
                 body = raw.decode('utf-8', errors='replace')[:500]
                 log_upstream(code, host, ep, body, remote=remote)
-                await _collect_err(f"{host}: {body}")
+                # A stale-model-format error is a benign per-host skip (handled below),
+                # so keep it out of the surfaced errors — it must never be the job's error.
+                if not _is_stale_model_format(body):
+                    await _collect_err(f"{host}: {body}")
             except asyncio.CancelledError:
                 # a losing attempt cancelled mid-read must drop its connection,
                 # or it leaks out of the pool (CancelledError is BaseException,
@@ -6942,10 +7026,20 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
             # (no reputation penalty): find_servers now routes TOOL requests away from
             # this pair, so we stop doorknocking it for every tool call, while plain
             # chat still uses it.
-            if code == 400 and "does not support tools" in _blow:
+            if code == 400 and _is_no_tools(_blow):
                 mark_no_tools(host, full)
                 await broadcast_activity(host, model, "trial",
                     f"no tools: {host} for {model} - {full} does not support tool-calling",
+                    duration=dur, wid=wid)
+                return skip(detail)
+            # This host's copy of the model is an old GGUF the server can no longer load
+            # ("...no longer supported. To re-download, run 'ollama pull X'"). It's a
+            # host-side stale-weights fact for THIS model, not a bad host and not the
+            # client's problem — skip (no penalty) so the race fails over to the next
+            # server, and don't surface it as the job's error.
+            if _is_stale_model_format(body):
+                await broadcast_activity(host, model, "trial",
+                    f"stale model: {host} for {model} - {full} needs re-pull (old format)",
                     duration=dur, wid=wid)
                 return skip(detail)
             await broadcast_activity(host, model, "failed",
@@ -6982,10 +7076,17 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
                 data = openai_to_ollama(data, full)
             if "error" in data:
                 dur = time.time() - start
+                _emsg = str(data["error"])
+                # stale GGUF the host can't load -> skip to the next server, don't surface
+                if _is_stale_model_format(_emsg):
+                    await broadcast_activity(host, model, "trial",
+                        f"stale model: {host} for {model} - {full} needs re-pull (old format)",
+                        duration=dur, wid=wid)
+                    return skip(_emsg[:200])
                 await _collect_err(f"{host}: {data['error']}")
                 await broadcast_activity(host, model, "failed",
                     f"failure: {host} for {model} - error: {data['error']}", duration=dur, wid=wid)
-                return failed(str(data["error"]))
+                return failed(_emsg)
             dur = time.time() - start
             log.debug(f"  \u2713 {tag}")
             await broadcast_activity(host, model, "connected",
@@ -7040,10 +7141,17 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
             dur = time.time() - start
             await resp.release()
             resp = None
+            _emsg = str(first["error"])
+            # stale GGUF the host can't load -> skip to the next server, don't surface
+            if _is_stale_model_format(_emsg):
+                await broadcast_activity(host, model, "trial",
+                    f"stale model: {host} for {model} - {full} needs re-pull (old format)",
+                    duration=dur, wid=wid)
+                return skip(_emsg[:200])
             await _collect_err(f"{host}: {first['error']}")
             await broadcast_activity(host, model, "failed",
                 f"failure: {host} for {model} - error: {first['error']}", duration=dur, wid=wid)
-            return failed(str(first["error"]))
+            return failed(_emsg)
 
         if done.is_set():
             await resp.release()
@@ -8360,6 +8468,19 @@ async def _quick_probe(session, host, full, model_in, tools=None, grade=True, tr
         with contextlib.suppress(Exception):
             await resp.release()
         detail = f"status {resp.status}" + (f": {body}" if body else "")
+        # The model can't tool-call ("does not support tools"). The REAL request path
+        # records this and skips; the screening probe used to only read it as a benign
+        # 400 and return inconclusive WITHOUT recording — so the pair stayed "unknown"
+        # (empty caps = give-it-a-chance) and got re-probed/re-raced with tools on every
+        # request forever. Record it here too (mark_no_tools -> caps become 'completion',
+        # which find_servers routes tool requests away from) and return inconclusive with
+        # no reputation penalty, exactly like the real path.
+        if resp.status == 400 and _is_no_tools(body):
+            mark_no_tools(host, full)
+            await broadcast_activity(host, model_in, "trying",
+                f"quick test: {host} for {model_in} - {full} does not support tool-calling",
+                duration=time.time() - start, wid=wid)
+            return None, detail
         # Do NOT condemn the machine for a REQUEST-level rejection. A 400 is our own
         # payload or a model that won't load ("Invalid 'messages' in payload", "Failed
         # to load model", "No models loaded"); a 503 is a busy host; a 500 "loading
@@ -8395,6 +8516,15 @@ async def _quick_probe(session, host, full, model_in, tools=None, grade=True, tr
     dur = time.time() - start
     shown = content.strip()[:160]
     if "error" in data:
+        # Some hosts return 200 with the no-tools error in the body. Same capability
+        # gap as the 400 above: record it and skip (no penalty) instead of add_bad,
+        # which would wrongly condemn the whole host for a per-model tool limitation.
+        if _is_no_tools(str(data["error"])):
+            mark_no_tools(host, full)
+            await broadcast_activity(host, model_in, "trying",
+                f"quick test: {host} for {model_in} - {full} does not support tool-calling",
+                duration=dur, wid=wid)
+            return None, f"error: {str(data['error'])[:80]}"
         if grade:
             add_bad(host, full, reason=f"smoke error: {data['error']}")
         await broadcast_activity(host, model_in, "failed",
