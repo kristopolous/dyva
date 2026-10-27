@@ -295,6 +295,12 @@ def _clean_cookie(value):
 
 FOFA_COOKIE = os.getenv("FOFA_COOKIE", "")
 FOFA_WEB = "https://en.fofa.info/result"
+# Public root, fetched WITHOUT a cookie to tell "FOFA/network is down" apart from
+# "our session is bad". The login-button / daily-limit / access-denied checks only
+# catch auth trouble when FOFA returns a readable page; a stale cookie that instead
+# surfaces as timeouts/connection errors slips past them, so a liveness probe here
+# is the backstop (see _fofa_reachable).
+FOFA_ROOT = "https://en.fofa.info/"
 # Appended to the FOFA result URL to bias toward recently-seen (likelier-alive)
 # hosts. Trial — set to "" to back out. It does NOT affect the cache-file label
 # (which is built from the query axes), so a resumed session still skips pages it
@@ -1433,6 +1439,24 @@ def _shodan_path(label, run_ts, svc="any"):
     return os.path.join("/tmp/graflex", run_ts, "shodan", f"{svc}-{label}.txt")
 
 
+def _fofa_reachable():
+    """Probe FOFA's public root with NO cookie, to split "FOFA (or our network) is
+    down" from "our FOFA session is bad". A 200 means FOFA itself is up and
+    answering, so repeated failures on our authenticated search requests are almost
+    certainly an auth problem — a stale/expired FOFA_COOKIE — not an outage. Returns
+    True if the root is up, False if even the no-cookie root fails (genuinely down /
+    we're offline). Deliberately no cookie and a short timeout; never raises."""
+    import requests
+    try:
+        r = requests.get(
+            FOFA_ROOT, timeout=10, allow_redirects=True,
+            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                                   "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"})
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
 def _fetch_web(dry, service, combined, country=None, port=None, server=None, run_ts=None, curlify=False, label="", pname="any"):
     import base64
     import re
@@ -1550,6 +1574,20 @@ def _fetch_web(dry, service, combined, country=None, port=None, server=None, run
             waited = f", {timeouts} timeouts so far" if timeouts > 1 else ""
             log.warning(f"timeout ({type(e).__name__}) reading FOFA for query "
                         f"{combined!r} [{pname}]{waited}, retrying in {backoff}s")
+            # A stale cookie can surface as a read timeout rather than the logged-out
+            # page, so the login-button check never sees it and this branch would
+            # otherwise retry forever. After a couple of timeouts (and periodically
+            # after), probe FOFA's root with NO cookie: if the root is up, FOFA isn't
+            # down — our session is. That's a hard stop, same as the logged-out page.
+            if timeouts == 2 or (timeouts > 2 and timeouts % 8 == 0):
+                if _fofa_reachable():
+                    log.error(f"FOFA root responds (200) without a cookie but our "
+                              f"authenticated requests keep timing out — almost "
+                              f"certainly a stale FOFA_COOKIE, not an outage. Refresh "
+                              f"FOFA_COOKIE in .env, then resume with --id {run_ts}")
+                    raise SystemExit(3)
+                log.warning("FOFA root unreachable too — treating as a real outage, "
+                            "still retrying")
             time.sleep(backoff)
             backoff = min(int(backoff * 1.2), MAX_BACKOFF)
             continue
