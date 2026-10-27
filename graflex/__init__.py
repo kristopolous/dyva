@@ -4008,12 +4008,26 @@ def survey(run_ts=None):
             obs += 1
             sz = m.get("size")
             dg = m.get("digest")
+            # Record the GGUF digest INDEPENDENTLY of size. The digest is the
+            # model's IDENTITY (which real base a throwaway name actually is), and
+            # it's valid even when the snapshot reported a tiny/zero/absent size —
+            # which the size branch below (rightly) ignores. Coupling the two meant
+            # a junk name (probe_zz_*, cve-*, …free.pinggy…, rce.local/…) whose
+            # digest only ever arrived alongside a sub-1MB size was stored as
+            # digest-less, so the dashboard's digest-collapse could never fold it in
+            # with the rest of its family. Vote the MAJORITY sha digest here so a
+            # stray value can't win; `size` stays gated exactly as before.
+            if dg and _SHA.match(str(dg)):
+                dh = rec.setdefault("digests", {})
+                dk = str(dg)
+                dh[dk] = int(dh.get(dk) or 0) + 1
+                rec["digest"] = max(dh, key=lambda k: dh[k])
             # A size only counts from a real (sha256) entry that's plausibly
             # large (≥1MB — no real model is smaller). Each size bucket carries
             # its digest, so near-identical sizes that are really the same build
             # (metadata-layer noise) can be told apart from genuinely different
-            # weights. The reported `size`/`digest` is the MODE bucket, so a
-            # stray value can't beat the majority.
+            # weights. The reported `size` is the MODE bucket, so a stray value
+            # can't beat the majority.
             if isinstance(sz, (int, float)) and sz >= 1_000_000 and dg and _SHA.match(str(dg)):
                 hist = rec.setdefault("sizes", {})
                 key = str(int(sz))
@@ -4025,8 +4039,6 @@ def survey(run_ts=None):
                 b["digest"] = str(dg)
                 mode = max(hist, key=lambda k: hist[k].get("count", 0) if isinstance(hist[k], dict) else (hist[k] or 0))
                 rec["size"] = int(mode)
-                mb = hist.get(mode)
-                rec["digest"] = mb.get("digest") if isinstance(mb, dict) else rec.get("digest")
     os.makedirs(CACHE_DIR, exist_ok=True)
     _save_json_atomic(SURVEY_FILE, data)
     sized = sum(1 for r in data.values() if isinstance(r, dict) and r.get("size"))

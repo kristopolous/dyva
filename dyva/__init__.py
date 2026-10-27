@@ -2051,16 +2051,54 @@ def _is_cloud_tag(m):
     return s.endswith("-cloud") or s.endswith(":cloud") or ":cloud" in s
 
 
-# A model NAME that is really a host/URL or an attack path — never a real pull.
-# Catches the ransomware/exfil entries seen in the wild: 127.0.0.1:11434/test/model,
-# 8.8.4.4:9999/evil/model, localhost/attacker/leak_model, 127.0.0.1:8080/rce/payload.
-# hf.co/org/repo:tag stays legit (no IP, no localhost, no attack word).
+# A model NAME that is really a host/URL, an attack path, or a scanner-injected
+# throwaway family — never a real pull. Catches the ransomware/exfil entries seen
+# in the wild (127.0.0.1:11434/test/model, 8.8.4.4:9999/evil/model,
+# localhost/attacker/leak_model, 127.0.0.1:8080/rce/payload) AND the mass
+# scanner/honeypot name families that spray thousands of bogus /api/tags strings
+# across the real pool: rce.local/<rN_TS>/<fn>, cve-<...>, probe_zz_*, sysverify-*,
+# zzc_*, <...>.free.pinggy.net/..., lima-*-poc-<hex>. hf.co/org/repo:tag stays
+# legit (no IP, no localhost, no attack word, no scanner namespace).
 _JUNK_MODEL_RE = re.compile(
-    r'(?i)(\b\d{1,3}(?:\.\d{1,3}){3}\b|\blocalhost\b|/(?:evil|attacker|rce|payload|leak|exploit)\b|/test/model)')
+    r'(?i)('
+    r'\b\d{1,3}(?:\.\d{1,3}){3}\b'                                  # bare IPv4 in the name
+    r'|\blocalhost\b'
+    r'|/(?:evil|attacker|rce|payload|leak|exploit)\b|/test/model'   # attack paths
+    r'|\brce\.local\b'                                             # rce.local/<rN_TS>/<fn> probe spam
+    r'|(?:^|/)cve-'                                                # cve-<...> exploit-probe family
+    r'|\bprobe_zz'                                                 # probe_zz_* scanner names
+    r'|\bsysverify[-_]'                                            # sysverify-* scanner names
+    r'|\bzzc_'                                                     # zzc_* scanner names
+    r'|free\.pinggy'                                              # pinggy-tunnel exfil names
+    r'|\blima-\S*-poc-'                                            # lima-*-poc-<hex> PoC spam
+    r')')
 
 
 def _is_junk_model(m):
     return bool(_JUNK_MODEL_RE.search(str(m)))
+
+
+# A model NAME whose base is a closed commercial product (claude / chatgpt / gpt /
+# gemini) with NO open-base lineage anywhere in the string is a weightless spoof or
+# an `ollama cp` rename — never a real pull. The open-base guard is what KEEPS the
+# legitimate cases: gpt-oss and its quants/formats, and distillations that carry a
+# real base (claude-3.7-…-gemma3-12b, gpt-5-distill-qwen3-4b, Marco-o1). Brand-
+# anchored (^) and deliberately WITHOUT the short o1-o4 / dall-e / sora families —
+# a letter+digit like "o1" would collide with a future real "marco-1" / "o1-coder".
+# Complements the EXACT _FAKE_EXACT list (which stays for confirmed renames that DO
+# carry a real digest, e.g. tinyllama-as-claude-3-5-sonnet-20241022).
+_CLOSED_BRAND_RE = re.compile(r'^(?:claude|chatgpt|gpt|gemini)\b', re.I)
+_OPEN_BASE_RE = re.compile(
+    r'(?i)(llama|qwen|gemma|mistral|mixtral|phi-|phi3|phi\b|deepseek|gpt[-_ ]?oss'
+    r'|grok|alpaca|vicuna|command[-]?r|olmo|yi-|hermes|dolphin|distill|merged?|moe\b'
+    r'|qwq|marco|openchat|solar|smollm|tinyllama|orca|minicpm|internlm|baichuan'
+    r'|glm|aya|stablelm|exaone|nemotron|moondream|llava|falcon|starcoder|wizard'
+    r'|granite|kimi|ernie|jamba|dbrx|arctic|cohere|reka|xiaomi|minimax|stepfun'
+    r'|tencent|magistral|devstral|pixtral|codestral)')
+
+
+def _is_commercial_imposter(m):
+    return bool(_CLOSED_BRAND_RE.match(_model_base(m))) and not _OPEN_BASE_RE.search(str(m).lower())
 
 
 # NSFW image-checkpoint name signals (dyva/nsfw-models.json). A LABEL, not a gate:
@@ -2180,7 +2218,7 @@ def _cleanse_scan(records):
     for r in records:
         host = _host_of(r)
         for m in model_names(r):
-            if _is_fake_name(m):
+            if _is_fake_name(m) or _is_commercial_imposter(m):
                 reason = "fake_commercial_name"
             elif _is_cloud_tag(m):
                 reason = "cloud_proxy"
@@ -9738,6 +9776,27 @@ async def handle_dashboard_models(request):
         r = survey.get(name)
         return (r.get("digest") if isinstance(r, dict) else None) or None
 
+    # A sha256 GGUF digest is a model's IDENTITY; a REAL model reports a plausible
+    # (>=1MB) disk size under some name sharing that digest (survey records `size`
+    # only from >=1MB sightings). Byte-sized stubs that carry a digest but NEVER a
+    # real size at any name are exploit/honeypot artifacts — cve-*-probe:latest,
+    # ...free.pinggy.net/.../leak_model, .../ns/read (parameter_size "0"/"66K",
+    # sizes of a few bytes). They stay in the survey (signal about the host) but
+    # are NOT usable models, so we drop them from the listing. Guard: a model is
+    # dropped only if it has a digest AND that digest is never real anywhere;
+    # no-digest models (openai/vllm/llama.cpp backends report none) and any model
+    # ever >=1MB are always kept, so no real model is hidden — a junk NAME that
+    # merely re-registers a real digest is kept and collapses into the real row.
+    # (Needs survey.json rebuilt with the size-independent digest vote; on an older
+    # survey digest<->size are coupled, so this drops nothing — a safe no-op.)
+    real_digest = {str(r["digest"]).lower()
+                   for r in survey.values()
+                   if isinstance(r, dict) and r.get("size") and r.get("digest")}
+
+    def _is_stub(name):
+        dg = _model_digest(name)
+        return bool(dg) and str(dg).lower() not in real_digest
+
     agg = {}            # model id -> {"count": n, "image": bool}
     dig_members = {}    # gguf digest -> set of model names sharing it
     dig_hosts = {}      # gguf digest -> set of hosts serving any member
@@ -9748,6 +9807,15 @@ async def handle_dashboard_models(request):
         is_img = s.get("service") in ("a1111", "comfyui")
         for m in s.get("models") or []:
             if not m:
+                continue
+            # Hidden from the listing but kept in the pool/survey as host signal:
+            #   * byte-sized exploit/honeypot stubs (digest never >=1MB),
+            #   * scanner-injected junk namespaces (rce.local/, cve-, probe_zz_*,
+            #     sysverify-*, zzc_*, free.pinggy, lima-*-poc-*, IP/attack paths),
+            #   * commercial-name imposters (claude/gpt/gemini spoofs, no open base).
+            # None are usable models; listing them just buries the real pool.
+            if (_is_stub(m) or _is_junk_model(m) or _is_fake_name(m)
+                    or _is_commercial_imposter(m)):
                 continue
             a = agg.get(m)
             if a is None:
