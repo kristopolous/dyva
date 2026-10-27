@@ -9582,7 +9582,7 @@ function renderStats(d){
   var t=(d&&d.totals)||{};
   var tot=document.getElementById('statsTotals');
   // Whimsical "street value": what these free tokens would've cost elsewhere (t.cost, USD).
-  var _cost=(typeof t.cost==='number'&&t.cost>0)?(' · 💸 $'+t.cost.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})+" you didn't pay"):'';
+  var _cost=(typeof t.cost==='number'&&t.cost>0)?(' · $'+t.cost.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})+' saved'):'';
   if(tot)tot.textContent=_tokU((t.up||0)+(t.down||0))+' tokens · '+_numU(t.reqs||0)+' reqs'+_cost+((d&&d.q)?' · "'+d.q+'"':'');
   _statsData=d||{};
   _renderStatsChart();   // usage bars at the active granularity (hour / day / week)
