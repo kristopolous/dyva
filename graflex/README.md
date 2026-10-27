@@ -14,6 +14,10 @@ There's all inclusives for the services such as zoomeye or hunter.
 
 The RSS peaks out about 150MB and averages around 100 so the 512MB VPS can handle it. You can also `mkswap` on them to avoid the OOM if you run into problems. Also, you may be able to run this "serverless" depending on whatever a providers definition of that magical word is. Report in on your progress.
 
+Even using sshfs for the surveys (I use it with -C) the bandwidth will be nowhere near the limit, here's a real snapshot from my graflex vps.
+<img width="581" height="311" alt="breakdown" src="https://github.com/user-attachments/assets/135ab694-3ad2-4cc7-9533-bf99d4648cd9" />
+
+
 
 ## Disclaimer
 
