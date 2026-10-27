@@ -2057,8 +2057,12 @@ def _is_cloud_tag(m):
 # localhost/attacker/leak_model, 127.0.0.1:8080/rce/payload) AND the mass
 # scanner/honeypot name families that spray thousands of bogus /api/tags strings
 # across the real pool: rce.local/<rN_TS>/<fn>, cve-<...>, probe_zz_*, sysverify-*,
-# zzc_*, <...>.free.pinggy.net/..., lima-*-poc-<hex>. hf.co/org/repo:tag stays
-# legit (no IP, no localhost, no attack word, no scanner namespace).
+# zzc_*, <...>.free.pinggy.net/..., lima-*-poc-<hex>, fh-/fha-<hex>, <hex>arc,
+# deadbug-exec-*, cache2-<n>-<n>, sys_aux_<n>, llamacpp:<64hex>, svc<n>. The latter
+# families are generated grids of throwaway names (plain hex tails, or real-family
+# tokens dressed on a scanner prefix like fh-Qwen3.6-40B-Claude-4-<hex> for models
+# that don't exist). hf.co/org/repo:tag stays legit (no IP, no localhost, no attack
+# word, no scanner namespace).
 _JUNK_MODEL_RE = re.compile(
     r'(?i)('
     r'\b\d{1,3}(?:\.\d{1,3}){3}\b'                                  # bare IPv4 in the name
@@ -2071,6 +2075,13 @@ _JUNK_MODEL_RE = re.compile(
     r'|\bzzc_'                                                     # zzc_* scanner names
     r'|free\.pinggy'                                              # pinggy-tunnel exfil names
     r'|\blima-\S*-poc-'                                            # lima-*-poc-<hex> PoC spam
+    r'|^fha?-'                                                    # fh-/fha-<hex> probe grid
+    r'|^[0-9a-f]{6,}[abc]?arc$'                                    # <hex>arc generated grid
+    r'|^deadbug-'                                                 # deadbug-exec-* spam
+    r'|^cache2-\d'                                                # cache2-<n>-<n> scanner grid
+    r'|\bsys_aux_'                                                # sys_aux_<n> scanner grid
+    r'|^llamacpp:[0-9a-f]{64}'                                     # llamacpp:<64hex> generated
+    r'|^svc\d'                                                    # svc<n> scanner grid
     r')')
 
 
@@ -2079,18 +2090,22 @@ def _is_junk_model(m):
 
 
 # A model NAME whose base is a closed commercial product (claude / chatgpt / gpt /
-# gemini) with NO open-base lineage anywhere in the string is a weightless spoof or
-# an `ollama cp` rename — never a real pull. The open-base guard is what KEEPS the
-# legitimate cases: gpt-oss and its quants/formats, and distillations that carry a
-# real base (claude-3.7-…-gemma3-12b, gpt-5-distill-qwen3-4b, Marco-o1). Brand-
-# anchored (^) and deliberately WITHOUT the short o1-o4 / dall-e / sora families —
-# a letter+digit like "o1" would collide with a future real "marco-1" / "o1-coder".
-# Complements the EXACT _FAKE_EXACT list (which stays for confirmed renames that DO
-# carry a real digest, e.g. tinyllama-as-claude-3-5-sonnet-20241022).
-_CLOSED_BRAND_RE = re.compile(r'^(?:claude|chatgpt|gpt|gemini)\b', re.I)
+# gemini / grok / xai) with NO open-base lineage anywhere in the string is a
+# weightless spoof or an `ollama cp` rename — never a real pull. The open-base guard
+# is what KEEPS the legitimate cases: gpt-oss and its quants/formats, distillations
+# that carry a real base (claude-3.7-…-gemma3-12b, gpt-5-distill-qwen3-4b, Marco-o1,
+# grok-3-gemma3-12b-distilled), and grok-1 (the one Grok xAI actually open-sourced;
+# grok-2+ / "Grok 4.20 …" / xai-grok-* are closed API surface and get dropped).
+# Brand-anchored (^) and deliberately WITHOUT the short o1-o4 / dall-e / sora
+# families — a letter+digit like "o1" would collide with a future real "marco-1" /
+# "o1-coder". The ^ anchor also spares substring collisions (ngrok, flexai,
+# blackboxai, minimaxai). Complements the EXACT _FAKE_EXACT list (which stays for
+# confirmed renames that DO carry a real digest, e.g.
+# tinyllama-as-claude-3-5-sonnet-20241022).
+_CLOSED_BRAND_RE = re.compile(r'^(?:claude|chatgpt|gpt|gemini|grok|xai)\b', re.I)
 _OPEN_BASE_RE = re.compile(
     r'(?i)(llama|qwen|gemma|mistral|mixtral|phi-|phi3|phi\b|deepseek|gpt[-_ ]?oss'
-    r'|grok|alpaca|vicuna|command[-]?r|olmo|yi-|hermes|dolphin|distill|merged?|moe\b'
+    r'|grok[-_ ]?1\b|alpaca|vicuna|command[-]?r|olmo|yi-|hermes|dolphin|distill|merged?|moe\b'
     r'|qwq|marco|openchat|solar|smollm|tinyllama|orca|minicpm|internlm|baichuan'
     r'|glm|aya|stablelm|exaone|nemotron|moondream|llava|falcon|starcoder|wizard'
     r'|granite|kimi|ernie|jamba|dbrx|arctic|cohere|reka|xiaomi|minimax|stepfun'

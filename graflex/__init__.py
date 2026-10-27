@@ -1466,6 +1466,7 @@ def _fetch_web(dry, service, combined, country=None, port=None, server=None, run
 
     backoff = BACKOFF
     attempt = 0
+    timeouts = 0
     while True:
         try:
             resp = requests.get(url, headers=headers, timeout=30)
@@ -1499,55 +1500,61 @@ def _fetch_web(dry, service, combined, country=None, port=None, server=None, run
         except RuntimeError as e:
             msg = str(e)
             if msg == "network unstable":
-                log.warning(f"network unstable, retrying in {backoff}s")
+                log.warning(f"FOFA network unstable on query {combined!r} [{pname}], retrying in {backoff}s")
                 time.sleep(backoff)
                 backoff = int(backoff * 1.2)
                 continue
             else:
                 if attempt < 2:
-                    log.warning(f"rate limited, retrying in {backoff}s")
+                    log.warning(f"FOFA rate limited on query {combined!r} [{pname}], retrying in {backoff}s")
                     time.sleep(backoff)
                     backoff = int(backoff * 1.2)
                     attempt += 1
                 else:
-                    log.warning("rate limited")
+                    log.warning(f"FOFA rate limited on query {combined!r} [{pname}] — giving up")
                     return None
         except requests.exceptions.HTTPError as e:
             code = e.response.status_code if e.response is not None else "?"
             if code in (429, 403) and attempt < 2:
-                log.warning(f"rate limited ({code}), retrying in {backoff}s")
+                log.warning(f"FOFA rate limited ({code}) on query {combined!r} [{pname}], retrying in {backoff}s")
                 time.sleep(backoff)
                 backoff = int(backoff * 1.2)
                 attempt += 1
             else:
                 if code in (429, 403):
-                    log.warning(f"rate limited  ({code})")
+                    log.warning(f"FOFA rate limited ({code}) on query {combined!r} [{pname}] — giving up")
                 else:
-                    log.error(f"FOFA web request failed: {e}")
+                    log.error(f"FOFA web request failed ({code}) on query {combined!r} [{pname}]: {e}")
                 return None
         except requests.exceptions.ConnectionError as e:
             if _is_offline_error(e):
-                log.warning(f"offline ({e}); retrying in {backoff}s...")
+                log.warning(f"offline ({e}) on FOFA query {combined!r} [{pname}]; retrying in {backoff}s...")
                 time.sleep(backoff)
                 backoff = min(int(backoff * 1.2), MAX_BACKOFF)
                 continue
             if attempt < 2:
-                log.warning(f"connection error, retrying in {backoff}s")
+                log.warning(f"FOFA connection error on query {combined!r} [{pname}] ({e}), retrying in {backoff}s")
                 time.sleep(backoff)
                 backoff = int(backoff * 1.2)
                 attempt += 1
             else:
-                log.error(f"FOFA web request failed: {e}")
+                log.error(f"FOFA web request failed on query {combined!r} [{pname}]: {e}")
                 return None
         except requests.exceptions.Timeout as e:
             # Read/connect timeouts are transient network conditions — retry
-            # with backoff instead of silently dropping the query.
-            log.warning(f"timeout ({type(e).__name__}), retrying in {backoff}s")
+            # with backoff instead of silently dropping the query. This branch
+            # retries indefinitely (the run is resumable; dropping a query loses
+            # its hosts), so the message names the query and the running count so
+            # a single stuck query is distinguishable from cache progress.
+            timeouts += 1
+            waited = f", {timeouts} timeouts so far" if timeouts > 1 else ""
+            log.warning(f"timeout ({type(e).__name__}) reading FOFA for query "
+                        f"{combined!r} [{pname}]{waited}, retrying in {backoff}s")
             time.sleep(backoff)
             backoff = min(int(backoff * 1.2), MAX_BACKOFF)
             continue
         except Exception as e:
-            log.error(f"FOFA web request failed: {e}")
+            log.error(f"FOFA web request failed on query {combined!r} [{pname}]: {e}")
             return None
 
     tmp_dir = os.path.dirname(_fofa_path(label, run_ts, pname))

@@ -4899,16 +4899,16 @@ function stopChat(){
 // The commands offered in the composer. One list feeds the completion popup,
 // /help, and the dispatch in handleSlashCommand.
 var SLASH_COMMANDS=[
-  {cmd:'system',   arg:'[prompt]', desc:'set or show this chat’s system prompt'},
-  {cmd:'info',     arg:'',         desc:'show which host and model answered'},
-  {cmd:'next',     arg:'',         desc:'drop this model’s sticky host and move to the next one'},
-  {cmd:'test',     arg:'',         desc:'probe the hosts with the quick test and cull the bogus ones'},
-  {cmd:'test-all', arg:'',         desc:'sweep: probe every not-yet-verified host for this model and cull all the bogus ones'},
-  {cmd:'retitle',  arg:'',         desc:'regenerate the chat title'},
   {cmd:'compact',  arg:'[model]',  desc:'summarize the chat so far to free up context (optionally with a given model)'},
-  {cmd:'download', arg:'',         desc:'download this chat as JSON'},
   {cmd:'delete',   arg:'',         desc:'delete the current chat'},
-  {cmd:'list',     arg:'',         desc:'system prompt, tools, host and files for this chat'}
+  {cmd:'download', arg:'',         desc:'download this chat as JSON'},
+  {cmd:'info',     arg:'',         desc:'show which host and model answered'},
+  {cmd:'list',     arg:'',         desc:'system prompt, tools, host and files for this chat'},
+  {cmd:'next',     arg:'',         desc:'drop this model’s sticky host and move to the next one'},
+  {cmd:'retitle',  arg:'',         desc:'regenerate the chat title'},
+  {cmd:'system',   arg:'[prompt]', desc:'set or show this chat’s system prompt'},
+  {cmd:'test',     arg:'',         desc:'probe the hosts with the quick test and cull the bogus ones'},
+  {cmd:'test-all', arg:'',         desc:'sweep: probe every not-yet-verified host for this model and cull all the bogus ones'}
 ];
 // Everything a note links to opens in a new tab — a host, and equally a file
 // from the asset list, since neither is worth losing the chat over. In-page
