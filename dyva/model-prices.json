@@ -1,0 +1,110 @@
+{
+  "_comment": "Whimsical reference price in US$ per MILLION tokens, seeded from the OpenRouter catalog (median across self-hostable models per family). Used only to show a playful 'street value' of free usage in the Stats view; nothing routes or bills on it. Matched by model-name family (see _match_note); unmatched models use _default. Updating is handled out-of-band by a future bulk refresh (prices + sizes + classifications), not by dyva itself.",
+  "_match_note": "a dyva model name is lowercased and matched to the first family key that appears in it (e.g. 'qwen2.5:7b' -> 'qwen'); else _default.",
+  "_default": {
+    "prompt": 0.194,
+    "completion": 0.6
+  },
+  "families": {
+    "deepseek": {
+      "prompt": 0.25,
+      "completion": 0.647
+    },
+    "gemma": {
+      "prompt": 0.074,
+      "completion": 0.287
+    },
+    "glm": {
+      "prompt": 0.375,
+      "completion": 1.89
+    },
+    "ibm-granite": {
+      "prompt": 0.038,
+      "completion": 0.181
+    },
+    "inclusionai": {
+      "prompt": 0.04,
+      "completion": 0.121
+    },
+    "inference-net": {
+      "prompt": 0.04,
+      "completion": 0.19
+    },
+    "kimi": {
+      "prompt": 0.6,
+      "completion": 2.925
+    },
+    "liquid": {
+      "prompt": 0.2,
+      "completion": 0.6
+    },
+    "llama": {
+      "prompt": 0.14,
+      "completion": 0.325
+    },
+    "minimax": {
+      "prompt": 0.3,
+      "completion": 1.2
+    },
+    "mistral": {
+      "prompt": 0.1,
+      "completion": 0.2
+    },
+    "moondream": {
+      "prompt": 0.3,
+      "completion": 2.5
+    },
+    "nemotron": {
+      "prompt": 0.175,
+      "completion": 0.37
+    },
+    "nex-agi": {
+      "prompt": 0.05,
+      "completion": 0.175
+    },
+    "nousresearch": {
+      "prompt": 1.0,
+      "completion": 1.0
+    },
+    "openai": {
+      "prompt": 0.03,
+      "completion": 0.136
+    },
+    "poolside": {
+      "prompt": 0.075,
+      "completion": 0.15
+    },
+    "qwen": {
+      "prompt": 0.17,
+      "completion": 1.0
+    },
+    "rekaai": {
+      "prompt": 0.1,
+      "completion": 0.15
+    },
+    "sao10k": {
+      "prompt": 0.445,
+      "completion": 0.45
+    },
+    "stepfun": {
+      "prompt": 0.2,
+      "completion": 1.15
+    },
+    "tencent": {
+      "prompt": 0.132,
+      "completion": 0.528
+    },
+    "thedrummer": {
+      "prompt": 0.4,
+      "completion": 0.5
+    },
+    "thinkingmachines": {
+      "prompt": 0.725,
+      "completion": 2.625
+    },
+    "xiaomi": {
+      "prompt": 0.222,
+      "completion": 0.445
+    }
+  }
+}
