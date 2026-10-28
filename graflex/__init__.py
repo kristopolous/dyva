@@ -4251,8 +4251,15 @@ def main():
 
     if args.query and not args.name:
         parser.error("--query requires --name")
+    # Whole-pool rescans re-probe each service's own stored file and need no FOFA
+    # query, so omitting the service sensibly means "every service" rather than an
+    # error — e.g. `graflex -a check-working -i <ts>` sweeps them all (same as -s all).
+    _POOL_RESCANS = {"check-working", "check-zero", "check-everything", "check-all"}
+    _rescan_all = (args.action in _POOL_RESCANS
+                   and not args.service and not args.query and not args.name)
     if (not args.service and not args.query and not args.name
-            and not (args.action == "enrich" and args.enrich_args)):
+            and not (args.action == "enrich" and args.enrich_args)
+            and not _rescan_all):
         parser.error("either --service, --query, or --name is required")
     if args.site == "shodan":
         if args.fids:
@@ -4276,7 +4283,8 @@ def main():
     # for both spellings). Each service has its own query/ports/working file, so
     # this is just the single-service path run once per service, with name left
     # to each service's own defaults.
-    all_services = args.service == "all" or (args.name or "").strip().lower() == "all"
+    all_services = (args.service == "all" or (args.name or "").strip().lower() == "all"
+                    or _rescan_all)
     pipe_services = list(SERVICE_CONFIG) if all_services else [args.service]
     if args.query and all_services:
         parser.error("--query cannot be combined with 'all' services")
@@ -4326,7 +4334,8 @@ def main():
                               check_timeout=args.check_timeout, workers=args.workers,
                               session=args.session, only_zero=only_zero)
         except KeyboardInterrupt:
-            base = f"graflex -s {args.service}" if args.service else f"graflex -n {args.name or 'image-gen'}"
+            base = ("graflex" if _rescan_all else
+                    (f"graflex -s {args.service}" if args.service else f"graflex -n {args.name or 'image-gen'}"))
             ts = _RUN_TS or args.session
             hint = f"{base} -a {label}{f' -i {ts}' if ts else ''}"
             log.warning(f"\ninterrupted — tag snapshots are saved; resume with: {hint}")
@@ -4389,7 +4398,8 @@ def main():
     except SystemExit as e:
         sys.exit(e.code)
     except KeyboardInterrupt:
-        base = f"graflex -s {args.service}" if args.service else f"graflex -n {args.name or 'image-gen'}"
+        base = ("graflex" if _rescan_all else
+                (f"graflex -s {args.service}" if args.service else f"graflex -n {args.name or 'image-gen'}"))
         ts = _RUN_TS or args.session
         if args.action == "fetch-check":
             hint = f"{base} -a fetch-check{f' -i {ts}' if ts else ''}"
