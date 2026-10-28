@@ -9582,8 +9582,8 @@ function renderStats(d){
   var t=(d&&d.totals)||{};
   var tot=document.getElementById('statsTotals');
   // Whimsical "street value": what these free tokens would've cost elsewhere (t.cost, USD).
-  var _cost=(typeof t.cost==='number'&&t.cost>0)?(' · $'+t.cost.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})+' saved'):'';
-  if(tot)tot.textContent=_tokU((t.up||0)+(t.down||0))+' tokens · '+_numU(t.reqs||0)+' reqs'+_cost+((d&&d.q)?' · "'+d.q+'"':'');
+  var _cost=(typeof t.cost==='number'&&t.cost>0)?(' · ~$'+t.cost.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})):'';
+  if(tot)tot.textContent=_tokU((t.up||0)+(t.down||0))+' toks · '+_numU(t.reqs||0)+' reqs'+_cost+((d&&d.q)?' · "'+d.q+'"':'');
   _statsData=d||{};
   _renderStatsChart();   // usage bars at the active granularity (hour / day / week)
   _renderStatsTable();   // one table, driven by the active tab (model / family / host)
@@ -9591,7 +9591,7 @@ function renderStats(d){
   // UTC, matching the chart: the day buckets come from the server in UTC and the
   // window is built with toISOString(), so a local clock here read as a different
   // timezone from the graph beside it. Same trailing-Z form the activity feed uses.
-  if(as){var t=new Date();as.textContent='as of '+t.toISOString().slice(11,19)+'Z';
+  if(as){var t=new Date();as.textContent=t.toISOString().slice(11,19)+'Z';
          as.title='stats last fetched '+t.toISOString().replace('T',' ').slice(0,19)+' UTC';}
   if(d&&d.started)_serverStartTs=d.started;
   _tickUptime();
