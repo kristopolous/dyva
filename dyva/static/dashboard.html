@@ -6093,9 +6093,8 @@ async function runStream(chatId,chatCreated,chatTitle,model,msgs,bubble,depth,ex
     var _q=_queued[chatId]||[];
     if(_q.length&&results.length){
       var _last=results[results.length-1];
-      _last.text=(_last.text||'')+'\n\n[The user sent '+(_q.length>1?_q.length+' messages':'a message')
-              +' while you were working — take '+(_q.length>1?'them':'it')+' into account:\n'
-              +_q.map(function(m,i){return (i+1)+') '+m}).join('\n')+']';
+      _last.text=(_last.text||'')+'\n\n(Additionally the user has the following message'+(_q.length>1?'s':'')+':\n'
+              +_q.map(function(m,i){return (i+1)+') '+m}).join('\n')+')';
       delete _queued[chatId]; if(inView())renderQueue();
     }
     msgs.push({role:'assistant',content:full,tool_calls:toolCalls,_meta:{hidden:true}});
