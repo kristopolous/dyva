@@ -3479,7 +3479,7 @@ async def _check_working(service, name=None, check_timeout=60, workers=10, sessi
             rate = completed / el if el > 0 else 0
             eta = (len(working) - completed) / rate if rate > 0 else 0
             log.info(f"check-working: {completed}/{len(working)} probed "
-                     f"({el/60:.0f}m elapsed, ~{eta/60:.0f}m left at {rate:.1f}/s)")
+                     f"({_fmt_duration(el)} elapsed, ~{_fmt_duration(eta)} left at {rate:.1f}/s)")
 
     async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=INSECURE_SSL, force_close=True, limit=0), timeout=aiohttp.ClientTimeout(total=check_timeout + 5)) as session:
         _prog = asyncio.ensure_future(_progress())
