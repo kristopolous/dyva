@@ -22,10 +22,10 @@ uvx dyva
 
 Along with being so ollama-compatible the ollama client doesn't know the difference, dyva has a feature-rich front-end with chat that includes image generation, web search, sub-agents, documents, host drilldown and exploration, video generation, tts, stats, geomaps, and even graphically tweaking the routing algorithm.
 
-Memory footprint is under 1GB:
+Memory footprint is under 1GB. Has both light and dark mode:
 <div align="center">
-  <img width="45%" alt="ollama" src="https://github.com/user-attachments/assets/0d9d72bf-01b9-4349-a798-34cd944781d4" />
-  <img width="45%"  alt="algo" src="https://github.com/user-attachments/assets/ccd88d55-80cf-4c2e-960c-2d81eb11fb6c" />
+  <img width="45%" alt="sshot" src="https://github.com/user-attachments/assets/7e02db46-bf57-43fd-bacb-21c83c14d3ae" />
+  <img width="45%" alt="sshot" src="https://github.com/user-attachments/assets/5126f11a-5d08-4136-95cc-2cbfa37f49fa" />
 </div>
 
 ## Querying for models
