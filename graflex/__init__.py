@@ -3519,6 +3519,26 @@ def check_working(service, name=None, check_timeout=60, workers=10, session=None
     asyncio.run(_check_working(service, name, check_timeout, workers, session, only_zero))
 
 
+def _stdin_hostport(line):
+    """Normalize one check-stdin line to a bare host[:port] key. Accepts an optional
+    scheme and trailing path — http://h:p, https://h/, h:p, or bare h — and strips the
+    scheme and path. When a scheme is present but no explicit port is, the scheme's
+    default port is filled in (https->443, http->80) so the line still resolves to a
+    host:port store key; a schemeless, portless host is left bare for the per-service
+    default port to apply at probe time."""
+    s = line.strip()
+    scheme = None
+    if "://" in s:
+        scheme, s = s.split("://", 1)
+        scheme = scheme.lower()
+    s = s.split("/", 1)[0].strip()          # drop any path / trailing slash
+    if not s:
+        return ""
+    if scheme in ("http", "https") and ":" not in s:
+        s = f"{s}:{443 if scheme == 'https' else 80}"
+    return s
+
+
 def check_stdin(service=None, check_timeout=60, workers=10, session=None):
     """Re-probe an explicit newline-delimited host list read from stdin — the
     composable, open-ended member of the pool-rescan family (no FOFA query; just
@@ -3536,6 +3556,9 @@ def check_stdin(service=None, check_timeout=60, workers=10, session=None):
       - a host that resolves to no service and has no -s is warned and skipped, so a
         single stray line never kills the run.
 
+    Each line may carry an optional scheme and path (http://h:p, https://h/, h:p, or
+    bare h); the scheme and path are stripped to the host:port store key.
+
     Hosts probe exactly as `check` does: a box that answers as its service records
     working, anything else notworking+reason — soft-deleted (row + payload kept), so
     a transient failure self-heals on the next successful probe."""
@@ -3551,10 +3574,13 @@ def check_stdin(service=None, check_timeout=60, workers=10, session=None):
     hosts, _seen = [], set()
     for ln in _sys.stdin:
         ln = ln.strip()
-        if not ln or ln.startswith("#") or ln in _seen:
+        if not ln or ln.startswith("#"):
             continue
-        _seen.add(ln)
-        hosts.append(ln)
+        hp = _stdin_hostport(ln)          # accept http://h:p / https://h / h:p / h
+        if not hp or hp in _seen:
+            continue
+        _seen.add(hp)
+        hosts.append(hp)
     if not hosts:
         log.warning("check-stdin: no hosts on stdin")
         return
