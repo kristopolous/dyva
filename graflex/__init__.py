@@ -3504,6 +3504,80 @@ def check_working(service, name=None, check_timeout=60, workers=10, session=None
     asyncio.run(_check_working(service, name, check_timeout, workers, session, only_zero))
 
 
+def check_stdin(service=None, check_timeout=60, workers=10, session=None):
+    """Re-probe an explicit newline-delimited host list read from stdin — the
+    composable, open-ended member of the pool-rescan family (no FOFA query; just
+    probe-and-record). It is the clean form of the crude
+    `jq ... | xargs ollama pull | graflex -a check-stdin` fleet workflow: pick and
+    act on hosts however you like, then pipe them here to re-verify. The source of
+    the host set is the pipe; the stored rescans (check-working/zero) differ only in
+    taking their set from a stored file instead.
+
+      - with an explicit `service`, every stdin host is probed AS that service —
+        the new-host onboarding path (`echo host | graflex -a check-stdin -s ollama`);
+      - without one, each host's service is looked up in the store (the common case:
+        re-verify hosts already in the pool). Host keys carry the port, so a
+        well-formed host:port line resolves to exactly one service;
+      - a host that resolves to no service and has no -s is warned and skipped, so a
+        single stray line never kills the run.
+
+    Hosts probe exactly as `check` does: a box that answers as its service records
+    working, anything else notworking+reason — soft-deleted (row + payload kept), so
+    a transient failure self-heals on the next successful probe."""
+    import sys as _sys
+    global _RUN_TS
+    if session:
+        _RUN_TS = session
+    # Populate the DB from the json files BEFORE looking hosts up in it — a
+    # pre-migration store is empty, so without this every lookup would miss and every
+    # host fall through to "unknown". _check_hosts runs this too, but only later.
+    _import_if_empty()
+
+    hosts, _seen = [], set()
+    for ln in _sys.stdin:
+        ln = ln.strip()
+        if not ln or ln.startswith("#") or ln in _seen:
+            continue
+        _seen.add(ln)
+        hosts.append(ln)
+    if not hosts:
+        log.warning("check-stdin: no hosts on stdin")
+        return
+
+    svc_override = service if (service and service != "all") else None
+    by_service = {}
+    if svc_override:
+        by_service[svc_override] = list(hosts)
+    else:
+        # host -> service reverse index from the store.
+        index = {}
+        for svc in _hoststore.services(_store()):
+            for h in _hoststore.all_hosts(_store(), svc):
+                index.setdefault(h, svc)
+        unknown = []
+        for h in hosts:
+            svc = index.get(h)
+            if svc:
+                by_service.setdefault(svc, []).append(h)
+            else:
+                unknown.append(h)
+        if unknown:
+            shown = ", ".join(unknown[:10]) + (" ..." if len(unknown) > 10 else "")
+            log.warning(f"check-stdin: {len(unknown)} host(s) not in any service and no -s "
+                        f"given — skipped: {shown}")
+
+    if not by_service:
+        log.warning("check-stdin: nothing to probe")
+        return
+
+    for svc, hs in by_service.items():
+        log.info(f"--- check-stdin: {len(hs)} {svc} host(s) ---")
+        entries = [{"host": h} for h in hs]
+        asyncio.run(_check_hosts(entries, svc, _cache_file(svc, "working"),
+                                 _cache_file(svc, "notworking"), check_timeout, workers))
+        export(svc)   # flush the json view after the last probe (mid-run export is throttled)
+
+
 def reconstruct(name=None, session=None):
     """Rebuild <name>-working.json from a check session's cached probe snapshots.
 
@@ -4200,7 +4274,7 @@ def main():
     parser = argparse.ArgumentParser(description="Discover public image-generation hosts via FOFA")
     parser.add_argument("--ct", "--check-timeout", dest="check_timeout", type=int, default=60, help="per-host check timeout in seconds (default: 60)")
     parser.add_argument("--curlify", action="store_true", help="print curl command instead of executing")
-    parser.add_argument("-a", "--action", choices=["fetch", "check", "check-new", "check-everything", "check-all", "check-working", "check-zero", "fetch-check", "classify", "enrich", "survey", "reconstruct", "export", "score-bogus", "sample", "strip"], required=True, help="action to perform. check-new = this session's newly-fetched hosts (light); check-everything = re-probe the whole stored pool; check-all = the whole pool INCLUDING known-good. Bare 'check' is intentionally undefined (the big sweep must be asked for explicitly).")
+    parser.add_argument("-a", "--action", choices=["fetch", "check", "check-new", "check-everything", "check-all", "check-working", "check-zero", "check-stdin", "fetch-check", "classify", "enrich", "survey", "reconstruct", "export", "score-bogus", "sample", "strip"], required=True, help="action to perform. check-new = this session's newly-fetched hosts (light); check-everything = re-probe the whole stored pool; check-all = the whole pool INCLUDING known-good; check-stdin = re-probe a newline-delimited host list on stdin (per-host service looked up in the store, or forced with -s). Bare 'check' is intentionally undefined (the big sweep must be asked for explicitly).")
     parser.add_argument("-c", "--countries", help="comma-separated country codes to cycle (default: CN,US,CA,JP,KR)")
     parser.add_argument("-d", "--dry", action="store_true", help="report what fetch would do without saving")
     parser.add_argument("-e", "--servers", help="comma-separated server values to cycle (default: uvicorn,nginx)")
@@ -4259,6 +4333,7 @@ def main():
                    and not args.service and not args.query and not args.name)
     if (not args.service and not args.query and not args.name
             and not (args.action == "enrich" and args.enrich_args)
+            and args.action != "check-stdin"
             and not _rescan_all):
         parser.error("either --service, --query, or --name is required")
     if args.site == "shodan":
@@ -4315,6 +4390,17 @@ def main():
             s = _hoststore.stats(_store(), svc)
             log.info(f"{svc}: {s['working']} working, {s['notworking']} notworking "
                      f"({s['hosts']} hosts; host rows {s['host_rows']}, bad_hosts {s['bad_rows']})")
+        return
+
+    if args.action == "check-stdin":
+        log.info("--- check-stdin ---")
+        _svc = args.service if (args.service and args.service != "all") else None
+        try:
+            check_stdin(service=_svc, check_timeout=args.check_timeout,
+                        workers=args.workers, session=args.session)
+        except KeyboardInterrupt:
+            log.warning("\ninterrupted — probed hosts are already saved (soft, reversible)")
+            sys.exit(130)
         return
 
     if args.action in ("check-working", "check-zero"):
