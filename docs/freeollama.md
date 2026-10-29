@@ -129,6 +129,37 @@ $ free-ollama --host mistral:7b {0..20} | \
 
 For instance here I document how [LLMs have no sense of humor](https://github.com/kristopolous/humor-evals).
 
+### Slicing the host cache by field (host-slice)
+
+The main `free-ollama` tool slices by *model*. When you want to slice the
+host list itself — by `service`, `version`, `source`, `first_seen`, whatever
+key is in `~/.cache/free-ollama/free-ollama.json` — use the
+[`host-slice`](https://github.com/kristopolous/free-ollama/tree/main/examples/host-slice)
+example. It's the jq replacement, and it does **real semver math** on
+`version` (so `0.9.0 < 0.17.4`, prereleases sort before their release,
+and git-describe / 4-part / build-metadata forms are understood):
+
+```bash
+# all ollama hosts newer than 0.30.0, as a bare host:port list
+ursh gh:kristopolous/free-ollama/examples/host-slice service=ollama 'version>0.30.0' --field host
+
+# newest comfyui first, full JSON
+./examples/host-slice service=comfyui 'version>=0.35.0' --sort version --desc --json
+
+# how many machines have a qwen on them?
+./examples/host-slice 'models~qwen*' --count
+
+# a version range
+./examples/host-slice service=ollama 'version>0.30.0' 'version<0.33.0' --count
+```
+
+Predicates are `field OP value` and are ANDed together. `OP` is one of
+`=` `==` `!=` `>` `>=` `<` `<=` `~` (default `=`). `~` is a case-insensitive
+glob; on the `models` list it matches any element. Quote the value in bash
+when it contains `>` or `<` (it's a redirection otherwise). `--field` picks
+what to print (default `server`), `--json` prints whole records, `--count`
+prints just the number, `--sort FIELD [--desc]` orders the output.
+
 ---
 
 ## Testing Servers

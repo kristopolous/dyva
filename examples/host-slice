@@ -1,0 +1,268 @@
+#!/usr/bin/env python3
+"""
+host-slice — slice the free-ollama host cache by field predicates.
+
+The cache at ~/.cache/free-ollama/free-ollama.json is a JSON array of host
+records.  Each record looks roughly like:
+
+    {
+      "server":   "http://171.101.224.68:11434",
+      "host":     "171.101.224.68:11434",
+      "url":      "http://171.101.224.68:11434/",
+      "service":  "ollama",
+      "version":  "0.17.4",
+      "models":   ["qwen3:latest", ...],
+      "first_seen":"2026-10-21",
+      "checked":  "2026-09-12T13:43:46+00:00"
+    }
+
+This is the boring-but-necessary jq replacement.  Instead of writing
+
+    jq -r 'map(select(.service=="ollama" and (.version|...))) | .[].server'
+
+you just write the predicates:
+
+    host-slice service=ollama version>0.40.0
+    host-slice service=comfyui 'version>=0.35.0' --field host
+    host-slice models~qwen --count
+    host-slice service=vllm --sort version --desc --json
+
+Version predicates (>, >=, <, <=) use real semver math, not string
+comparison, so `0.9.0` < `0.17.4`, prereleases sort before their release
+(`0.26.1rc1` < `0.26.1`), and git-describe / 4-part / build-metadata forms
+are all understood.  Records whose version can't be parsed are dropped when
+a version comparison is in play.
+
+Filters are ANDed together.  Every filter is `field OP value` where OP is
+one of:  =  ==  !=  >  >=  <  <=  ~    (default `=`).
+
+  =   ==   equality (case-insensitive).  For the `models` list, "any model
+           equals value".
+  !=         not equal (for `models`, "no model equals value").
+  >  >=  <  <=  ordered.  Semver for version-like values, numeric when both
+                 sides are numbers, else case-insensitive string order
+                 (ISO dates sort correctly this way).
+  ~          substring/glob (fnmatch) match, case-insensitive.  For the
+                 `models` list, "any model matches".
+
+Options:
+  --db PATH        cache file (default ~/.cache/free-ollama/free-ollama.json)
+  --field NAME     which field to print per matching host (default: server).
+                   Use `models` to print the space-joined model list.
+  --json           print full JSON objects (one per line) instead of a field
+  --count          print only the number of matches
+  --sort FIELD     sort by FIELD (e.g. --sort version, --sort checked,
+                   --sort service)
+  --desc           sort descending (use with --sort)
+  -h, --help       this help
+"""
+import argparse
+import fnmatch
+import json
+import os
+import re
+import sys
+
+DEFAULT_DB = os.path.expanduser("~/.cache/free-ollama/free-ollama.json")
+
+# Operators, longest first so `>=` isn't split as `>` + `=`.
+_OPS = (">=", "<=", "!=", "==", ">", "<", "=", "~")
+
+
+def parse_filter(token):
+    """Split `field OP value` into (field, op, value)."""
+    best = None
+    for op in _OPS:
+        i = token.find(op)
+        if i > 0 and (best is None or i < best[0]):
+            best = (i, op)
+    if best is None:
+        raise SystemExit(f"error: filter needs an operator (= != > >= < <= ~): {token!r}")
+    i, op = best
+    field, value = token[:i], token[i + len(op):]
+    if not field or not value:
+        raise SystemExit(f"error: bad filter {token!r} (need field and value)")
+    return field, op, value
+
+
+# ---------------------------------------------------------------------------
+# Semver
+# ---------------------------------------------------------------------------
+#
+# Lenient enough for the real world: `0.17.4`, `v0.3.7-33-g6d1a3f7`,
+# `0.10.1.1`, `0.26.1rc1.dev920+g66e5414c6`.  Returns a comparable key, or
+# None when there's no leading numeric core (e.g. llama.cpp build ids).
+#
+# Precedence follows the semver spec for the parts that matter:
+#   * numeric core compared segment-by-segment (so 0.9.0 < 0.17.4)
+#   * a prerelease sorts BEFORE its release (0.26.1rc1 < 0.26.1)
+#   * prerelease identifiers: numeric < alphanumeric, numbers compared as ints
+_NUM_CORE = re.compile(r"^\d+(?:\.\d+)*")
+
+
+def _pre_ids(rest):
+    """Encode a prerelease string into a comparable tuple of identifiers."""
+    rest = rest.lstrip("-.")
+    if not rest:
+        return ()
+    ids = []
+    for part in rest.split("."):
+        if part.isdigit():
+            ids.append((0, int(part), ""))
+        else:
+            ids.append((1, 0, part))
+    return tuple(ids)
+
+
+def semver_key(s):
+    """Comparable key for a version string, or None if it has no numeric core."""
+    if not isinstance(s, str):
+        return None
+    t = s.strip()
+    if t[:1] in ("v", "V"):
+        t = t[1:]
+    t = t.split("+", 1)[0]                      # drop build metadata
+    m = _NUM_CORE.match(t)
+    if not m:
+        return None
+    core = tuple(int(x) for x in m.group(0).split("."))
+    rest = t[m.end():]
+    if rest:
+        return (core, 0, _pre_ids(rest))        # prerelease  (sorts first)
+    return (core, 1, ())                        # release
+
+
+def _to_number(s):
+    try:
+        return float(s)
+    except (TypeError, ValueError):
+        return None
+
+
+def compare(field, a, b):
+    """
+    Return -1/0/1 comparing values a, b for an ordered operator.
+    Version-like -> semver.  Both numeric -> numeric.  Else string (casefold).
+    """
+    if field == "version" or semver_key(a) and semver_key(b):
+        ka, kb = semver_key(a), semver_key(b)
+        if ka is None or kb is None:
+            return None                          # not comparable
+        return (ka > kb) - (ka < kb)
+    na, nb = _to_number(a), _to_number(b)
+    if na is not None and nb is not None:
+        return (na > nb) - (na < nb)
+    sa, sb = str(a).casefold(), str(b).casefold()
+    return (sa > sb) - (sa < sb)
+
+
+# ---------------------------------------------------------------------------
+# Field matching
+# ---------------------------------------------------------------------------
+
+def field_matches(rec, field, op, value):
+    raw = rec.get(field)
+
+    if field == "models" and isinstance(raw, list):
+        raw_l = [str(x).casefold() for x in raw]
+        v = value.casefold()
+        if op in ("=", "=="):
+            return any(x == v for x in raw_l)
+        if op == "!=":
+            return not any(x == v for x in raw_l)
+        if op == "~":
+            return any(fnmatch.fnmatch(x, v) for x in raw_l)
+        return False                             # ordered on a list: no
+
+    if raw is None:
+        return False
+
+    a, v = raw, value
+
+    if op in ("=", "=="):
+        return str(a).casefold() == str(v).casefold()
+    if op == "!=":
+        return str(a).casefold() != str(v).casefold()
+    if op == "~":
+        return fnmatch.fnmatch(str(a).casefold(), str(v).casefold())
+
+    # ordered operators
+    c = compare(field, a, v)
+    if c is None:
+        return False
+    return c > 0 if op == ">" else c >= 0 if op == ">=" else c < 0 if op == "<" else c <= 0
+
+
+def main():
+    p = argparse.ArgumentParser(
+        description="Slice the free-ollama host cache by field predicates.",
+        epilog="examples:\n"
+               "  host-slice service=ollama version>0.40.0\n"
+               "  host-slice service=comfyui version>=0.35.0 --field host\n"
+               "  host-slice models~qwen --count\n"
+               "  host-slice service=vllm --sort version --desc --json",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("filters", nargs="*", help="field OP value predicates (ANDed)")
+    p.add_argument("--db", default=DEFAULT_DB, help="cache file")
+    p.add_argument("--field", default="server", help="field to print (default: server)")
+    p.add_argument("--json", action="store_true", help="print full JSON objects")
+    p.add_argument("--count", action="store_true", help="print only the match count")
+    p.add_argument("--sort", help="sort by field")
+    p.add_argument("--desc", action="store_true", help="sort descending (with --sort)")
+    args = p.parse_args()
+
+    if not os.path.exists(args.db):
+        raise SystemExit(f"error: no cache at {args.db} (run `free-ollama --refresh`)")
+    with open(args.db) as f:
+        try:
+            records = json.load(f)
+        except json.JSONDecodeError as e:
+            raise SystemExit(f"error: {args.db} is not valid JSON: {e}")
+    if not isinstance(records, list):
+        raise SystemExit("error: cache is not a JSON array")
+
+    filters = [parse_filter(t) for t in args.filters]
+
+    out = [r for r in records if all(field_matches(r, *flt) for flt in filters)]
+
+    if args.sort:
+        key = args.sort
+
+        def sort_key(r):
+            v = r.get(key)
+            if key == "version":
+                k = semver_key(v)
+                # unparseable versions sink to the bottom (regardless of dir)
+                return (0, (k if k is not None else ()))
+            if isinstance(v, (int, float)):
+                return (1, v)
+            return (2, str(v).casefold())
+
+        out.sort(key=sort_key, reverse=args.desc)
+
+    if args.count:
+        print(len(out))
+        return
+
+    if args.json:
+        for r in out:
+            print(json.dumps(r, separators=(",", ":")))
+        return
+
+    for r in out:
+        v = r.get(args.field)
+        if isinstance(v, list):
+            v = " ".join(str(x) for x in v)
+        print("" if v is None else v)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BrokenPipeError:
+        # downstream (e.g. `| head`) closed the pipe; exit quietly
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)
