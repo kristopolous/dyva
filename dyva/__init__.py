@@ -3056,6 +3056,14 @@ _STRUCTURAL_FAIL_RE = re.compile(
     r"|no such model"
     r"|model [\"'].{0,80}?[\"'] not found"
     r"|does not exist"
+    # The model's backend subprocess died: llama.cpp / llama-swap reports "llama-server
+    # process has terminated: signal: killed" when the OS OOM-kills it because the model is
+    # too big to load on this host's RAM/VRAM. Permanent for THIS (host, model) pair — the
+    # box can't fit it — though the host is still fine for smaller models, so this excludes
+    # the PAIR (add_bad keys on host+model), not the machine, and stops re-probing it every
+    # request. A later success (e.g. after a hardware/quant change, re-probed by graflex)
+    # flips it back out of 'bad' automatically.
+    r"|process has terminated"
     # Auth-gated: a 401/403 means the host needs credentials we don't have — permanent for US, so
     # record once and hard-exclude instead of re-probing it every request. The quick-test phrases it
     # "status 401: …"; the comfy/a1111 image path phrases it "HTTP 401" (e.g. "/models/checkpoints
@@ -8579,7 +8587,12 @@ async def _quick_probe(session, host, full, model_in, tools=None, grade=True, tr
                 f"quick test: {host} for {model_in} - {full} does not support tool-calling",
                 duration=dur, wid=wid)
             return None, f"error: {str(data['error'])[:80]}"
-        if grade:
+        # A host may return the SAME permanent failure as a 200-with-error body instead of a
+        # non-200 (e.g. "llama-server process has terminated: signal: killed"). Record it even
+        # on the grade=False race probe when it's structural, exactly as the status!=200 branch
+        # does — once is enough, and load_incompatible() then hard-excludes the pair.
+        structural = bool(_STRUCTURAL_FAIL_RE.search(str(data["error"])))
+        if grade or structural:
             add_bad(host, full, reason=f"smoke error: {data['error']}")
         await broadcast_activity(host, model_in, "failed",
             f"quick test: {host} for {model_in} - error: {data['error']}", duration=dur, wid=wid)
