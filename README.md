@@ -20,6 +20,14 @@ Dyva supports unified workflows for stable diffusion, MiniMax H3, Z-image, LTX 2
 uvx dyva
 ```
 
+**No uv?** If you have `git` and Python 3.10+, one line clones it, builds a virtualenv, installs the deps, and starts it up:
+
+```
+curl -fsSL https://raw.githubusercontent.com/kristopolous/free-ollama/main/install.sh | bash
+```
+
+It installs to `~/free-ollama`; start it again anytime with `~/free-ollama/start.sh` (any dyva flags pass straight through). macOS note: the built-in `python3` is 3.9, which is too old — install a newer one first with `brew install python` or from [python.org](https://www.python.org/downloads/).
+
 Along with being so ollama-compatible the ollama client doesn't know the difference, dyva has a feature-rich front-end with chat that includes image generation, web search, sub-agents, documents, host drilldown and exploration, video generation, tts, stats, geomaps, and even graphically tweaking the routing algorithm.
 
 Memory footprint is under 1GB. Has both light and dark mode:
