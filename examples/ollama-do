@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
 set -x
-export OLLAMA_HOST="${@: -1}" 
-ollama "$2" ${@:1:$#-1} #| sed "s|^|$OLLAMA_HOST |g"
+export OLLAMA_HOST="$3"
+ollama "$1" "$2"
