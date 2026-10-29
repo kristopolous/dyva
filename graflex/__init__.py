@@ -4286,7 +4286,40 @@ def main():
     )
     _install_mem_dump()   # kill -USR1 <pid> for a live memory snapshot
 
-    parser = argparse.ArgumentParser(description="Discover public image-generation hosts via FOFA")
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="""\
+Discover and vet public inference hosts via FOFA (and Shodan/ZoomEye/Censys/hunter.how).
+
+A run is one --action (-a). The check-* actions all RE-PROBE hosts already in the store
+(no FOFA query is made); they differ only in WHICH hosts they pick:
+
+  check-new         the light pass right after a fetch: with -i <session>, this
+                    session's freshly-fetched hosts; without it, the never-recorded
+                    hosts in the store. Hosts already probed are skipped either way.
+  check-everything  re-probe the stored pool MINUS the currently-working and the
+                    hard-errored (404 / auth / bad-JSON) — i.e. the never-checked and
+                    the previously-unreachable, the hosts that might have come back.
+  check-all         re-probe EVERY host in the store, INCLUDING known-good. The full
+                    sweep, and the most expensive.
+  check-working     re-survey only the currently-working hosts: refresh their model
+                    lists and prune the dead. Gentle — only a timeout demotes (a 404 /
+                    auth / refused means the host answered, so it's left up). Skips
+                    hosts checked within the last hour (collision-safe). No -s, or
+                    -s all, sweeps every service in turn.
+  check-zero        re-probe ONLY the working hosts recorded with zero models (to
+                    correct erroneous zeros after a discovery fix); every non-empty
+                    host is preserved untouched.
+  check-stdin       re-probe a newline-delimited host:port list read from stdin. Each
+                    host's service is looked up in the store, or forced with -s (which
+                    doubles as new-host onboarding); a host in no service with no -s is
+                    warned and skipped. Pairs with jq | xargs/parallel fleet pipelines.
+
+  (bare 'check' is intentionally undefined: the big sweep must be named explicitly, so
+   you can't trigger a whole-pool probe with a slip of the keyboard.)
+
+Non-probe actions: fetch, fetch-check (fetch + interleaved check), classify, enrich,
+survey, reconstruct, export, score-bogus, sample, strip.""")
     parser.add_argument("--ct", "--check-timeout", dest="check_timeout", type=int, default=60, help="per-host check timeout in seconds (default: 60)")
     parser.add_argument("--curlify", action="store_true", help="print curl command instead of executing")
     parser.add_argument("-a", "--action", choices=["fetch", "check", "check-new", "check-everything", "check-all", "check-working", "check-zero", "check-stdin", "fetch-check", "classify", "enrich", "survey", "reconstruct", "export", "score-bogus", "sample", "strip"], required=True, help="action to perform. check-new = this session's newly-fetched hosts (light); check-everything = re-probe the whole stored pool; check-all = the whole pool INCLUDING known-good; check-stdin = re-probe a newline-delimited host list on stdin (per-host service looked up in the store, or forced with -s). Bare 'check' is intentionally undefined (the big sweep must be asked for explicitly).")
