@@ -52,17 +52,6 @@ That means [dyva](dyva) can sit on top of your own infrastructure as well as str
 
 There's also a [simple command line](docs/freeollama.md).
 
-## Slicing the host list
-
-The main tool slices by *model*. To slice the host list itself — by `service`, `version`, `source`, whatever's in the cache — there's the [host-slice](examples/host-slice) example, which does real semver math on versions (so `0.9.0 < 0.17.4` and prereleases sort before their release):
-
-```bash
-# all ollama hosts newer than 0.30.0, as a bare host:port list
-host-slice service=ollama 'version>0.30.0' --field host
-
-# newest comfyui first, full JSON
-host-slice service=comfyui 'version>=0.35.0' --sort version --desc --json
-```
 
 #### Notes
 

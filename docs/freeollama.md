@@ -51,6 +51,18 @@ For example, here's a stack of machines: the top 10 qwen3:latest and top 5 qwen2
 free-ollama qwen3:latest {0..10} qwen2:1.5 {0..5}
 ```
 
+## Slicing the host list
+
+To slice the host list itself — by `service`, `version`, `source`, whatever's in the cache — there's the [host-slice](examples/host-slice) example, which does real semver math on versions (so `0.9.0 < 0.17.4` and prereleases sort before their release):
+
+```bash
+# all ollama hosts newer than 0.30.0, as a bare host:port list
+host-slice service=ollama 'version>0.30.0' --field host
+
+# newest comfyui first, full JSON
+host-slice service=comfyui 'version>=0.35.0' --sort version --desc --json
+```
+
 
 ## Usage
 
