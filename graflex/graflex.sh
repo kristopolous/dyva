@@ -152,6 +152,7 @@ ENDL
     
   colibri)
     PORTS="8000"
+    ;;
 
   strata)
     PORTS="8080,8081"
