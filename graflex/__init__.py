@@ -503,6 +503,21 @@ SERVICE_CONFIG = {
         "fofa_query": 'title="strata" && fid="QgtTUGXb22z2rR2CCvnARw=="',
         "check_path": "/v1/models",
     },
+    "colibri": {
+        # Colibrì inference engine: page <title> "colibrì" and meta description
+        # "A local interface for the colibrì inference engine" (the FOFA body
+        # fingerprint). OpenAI dialect — /v1/models returns the standard
+        # {"object":"list","data":[{"id":...,"owned_by":"colibri"}]} shape and lands
+        # in the generic data[].id else branch of _check_host, like localai/strata.
+        # (It also carries a top-level `models` array, which that branch ignores.)
+        # Served behind nginx on the web ports (80/443), not a fixed API port, so
+        # sweep those. Some instances are API-key-gated and 401 on /v1/models
+        # (bucketed notworking, e.g. ai.banziger.ch); the open ones serve normally.
+        "port": 80,
+        "fofa_query": 'body="colibrì inference engine"',
+        "ports": "80,443,8080",
+        "check_path": "/v1/models",
+    },
 }
 
 # Named searches aren't services: they have a FOFA query but no probe/check
@@ -535,7 +550,7 @@ def _named_query(name):
 
 # Services that cache a raw model-list snapshot per host during check, so a
 # resume (-i) run can skip hosts already snapshotted this session.
-SNAPSHOT_SERVICES = {"ollama", "vllm", "lmstudio", "llama.cpp", "localai"}
+SNAPSHOT_SERVICES = {"ollama", "vllm", "lmstudio", "llama.cpp", "localai", "colibri"}
 
 
 def _load_json(path, silent=False):

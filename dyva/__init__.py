@@ -6084,7 +6084,8 @@ async def _race_hosts(entries, attempt, key, job_wid=None, workers=None, host_of
 # because it answered /api/tags but not /api/version, which is an ollama-shim
 # detail and says nothing about how you talk to it for inference.
 _OPENAI_SERVICES = {"lmstudio", "vllm", "llama.cpp", "llamacpp", "sglang",
-                    "tabby", "koboldcpp", "text-generation-webui", "openai", "ds4"}
+                    "tabby", "koboldcpp", "text-generation-webui", "openai", "ds4",
+                    "colibri"}
 _service_index = None
 
 
