@@ -4318,8 +4318,39 @@ A run is one --action (-a). The check-* actions all RE-PROBE hosts already in th
   (bare 'check' is intentionally undefined: the big sweep must be named explicitly, so
    you can't trigger a whole-pool probe with a slip of the keyboard.)
 
-Non-probe actions: fetch, fetch-check (fetch + interleaved check), classify, enrich,
-survey, reconstruct, export, score-bogus, sample, strip.""")
+The other actions find hosts, reshape the stores, or mine the snapshots:
+
+  fetch             scrape the search site (FOFA by default; -t for Shodan / ZoomEye /
+                    Censys / hunter.how) for hosts matching the service's query, cycling
+                    country / port / server / FID combos (-c / -p / -e / -f; -r to
+                    shuffle), and record each as discovered. -d dry-runs without saving;
+                    --curlify prints the request instead of sending it.
+  fetch-check       fetch and probe in one pass — each page's new hosts are checked as
+                    they are found, so results land while the sweep is still running.
+  classify          tag each host's models against the model-classifier taxonomy
+                    (comfyui by default); gradio hosts are bucketed by app purpose
+                    instead. Writes the labels back onto the working file.
+  enrich            stamp country / ASN / cloud-provider onto a service's working hosts
+                    (the feed dyva serves). Offline but for DB-IP's monthly download;
+                    idempotent — re-stamps only stale records. Also takes a bare FILE
+                    (see below) to enrich an arbitrary JSON file in place.
+  survey            mine the saved probe snapshots into survey.json — a per-model
+                    knowledge base (disk size, digest) built from real observations, not
+                    guessed from names. Accumulates: with -i it folds in one sweep,
+                    without it rebuilds from every session.
+  reconstruct       rebuild <name>-working.json OFFLINE from a check session's cached
+                    snapshots (-i <session> required) — recovery for a truncated pool,
+                    with no re-probing. Merges newest-wins; follow with check-working.
+  export            regenerate the <service>-{working,notworking,hosts}.json files from
+                    the store (the DB is the source of truth). -s all does every one.
+  score-bogus       stamp a per-host bogus_score onto the working file(s) from confirmed
+                    honeypot-clone fingerprints matched against a session's snapshots.
+                    Purely additive, recomputed every run; dyva routes bogus-ascending.
+  sample            draw the stratified sample platter into graflex-mini.json and exit
+                    (read-only over the survey files but for that one output).
+  strip             shrink ~/.cache/free-ollama/*.json by dropping trivially-rebuilt
+                    fields (derived geo; the redundant service / host in notworking
+                    files) — not data loss: geo re-derives with enrich.""")
     parser.add_argument("--ct", "--check-timeout", dest="check_timeout", type=int, default=60, help="per-host check timeout in seconds (default: 60)")
     parser.add_argument("--curlify", action="store_true", help="print curl command instead of executing")
     parser.add_argument("-a", "--action", choices=["fetch", "check", "check-new", "check-everything", "check-all", "check-working", "check-zero", "check-stdin", "fetch-check", "classify", "enrich", "survey", "reconstruct", "export", "score-bogus", "sample", "strip"], required=True, help="action to perform. check-new = this session's newly-fetched hosts (light); check-everything = re-probe the whole stored pool; check-all = the whole pool INCLUDING known-good; check-stdin = re-probe a newline-delimited host list on stdin (per-host service looked up in the store, or forced with -s). Bare 'check' is intentionally undefined (the big sweep must be asked for explicitly).")
