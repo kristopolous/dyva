@@ -72,9 +72,30 @@ if [ ! -x "$VENV/bin/python" ]; then
   "$PY" -m venv "$VENV" || \
     die "could not create a virtualenv. On macOS, make sure the full Python (not the CLT stub) is installed."
 fi
+
+# pip, but printing each package as it's handled so the install doesn't just
+# hang silently. We keep pip's real exit status (not the filter's), and dump
+# the full captured output only if it actually failed.
+pip_install() {
+  local log name rc
+  log="$(mktemp)"
+  "$VENV/bin/python" -m pip install "$@" 2>&1 | tee "$log" | while IFS= read -r line; do
+    case "$line" in
+      Collecting\ *)                      name="${line#Collecting }" ;;
+      "Requirement already satisfied: "*) name="${line#Requirement already satisfied: }" ;;
+      *) continue ;;
+    esac
+    printf '    \033[36m•\033[0m %s\n' "${name%% *}"
+  done
+  rc="${PIPESTATUS[0]}"
+  [ "$rc" -eq 0 ] || { warn "pip install failed:"; cat "$log" >&2; }
+  rm -f "$log"
+  return "$rc"
+}
+
 say "Installing dependencies (first run can take a minute)"
 "$VENV/bin/python" -m pip install --quiet --upgrade pip
-"$VENV/bin/python" -m pip install --quiet -e "$DIR"
+pip_install -e "$DIR"
 
 say "Installed. To start it again later, run:  $DIR/start.sh"
 
