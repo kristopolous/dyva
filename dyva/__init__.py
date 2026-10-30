@@ -3056,6 +3056,14 @@ _STRUCTURAL_FAIL_RE = re.compile(
     r"|no such model"
     r"|model [\"'].{0,80}?[\"'] not found"
     r"|does not exist"
+    # The model's backend subprocess died: llama.cpp / llama-swap reports "llama-server
+    # process has terminated: signal: killed" when the OS OOM-kills it because the model is
+    # too big to load on this host's RAM/VRAM. Permanent for THIS (host, model) pair — the
+    # box can't fit it — though the host is still fine for smaller models, so this excludes
+    # the PAIR (add_bad keys on host+model), not the machine, and stops re-probing it every
+    # request. A later success (e.g. after a hardware/quant change, re-probed by graflex)
+    # flips it back out of 'bad' automatically.
+    r"|process has terminated"
     # Auth-gated: a 401/403 means the host needs credentials we don't have — permanent for US, so
     # record once and hard-exclude instead of re-probing it every request. The quick-test phrases it
     # "status 401: …"; the comfy/a1111 image path phrases it "HTTP 401" (e.g. "/models/checkpoints
@@ -3801,6 +3809,17 @@ _session_skip_hosts = set()
 # exclusive — favoring discards a skip, skipping discards a favor).
 _session_prefer_hosts = set()
 
+# (norm-host, resolved-model) pairs that answered with ONLY reasoning — the whole reply
+# went into the `thinking` channel and `content` came back empty (an ollama/custom-GGUF
+# template bug: the model reasons but never emits the answer). think:false fixes it. We
+# learn this from the symptom (a done chunk with no content and no tool call), retry that
+# turn once with thinking off, and remember the pairing here so every later request to it
+# starts with think:false — no repeated wasted pass. Session-scoped and non-persistent ON
+# PURPOSE: the bug is versioned (service + ollama version + model), too messy to track
+# precisely, so a restart is the reset (the model may have been re-pulled/fixed). This is
+# NOT a reputation signal — the host answered fine; it never touches host-status.
+_session_no_think = set()
+
 
 def mark_honeypot(host, reason=None):
     """Condemn a whole MACHINE as a honeypot: it answered the smoke probe with a
@@ -4368,17 +4387,28 @@ def load_model_prices():
     return _model_prices
 
 
+def price_family_key(name, family_keys):
+    """The price family that governs a model NAME: the LONGEST family key that
+    appears in the lowercased name (so 'ibm-granite' beats a stray 'granite', and
+    'qwen2.5:7b' -> 'qwen'); None if none match. This is the SINGLE source of the
+    rule — both _price_of (the runtime lookup) and tools-side refresh_prices (which
+    buckets the OpenRouter catalog to regenerate the file) call it, so the refresher
+    groups models the exact way the live lookup will later match them."""
+    low = str(name or "").lower()
+    for fam in sorted(family_keys, key=len, reverse=True):
+        if fam in low:
+            return fam
+    return None
+
+
 def _price_of(name):
     """Reference rate for a model NAME: the first family key that appears in the
     lowercased name wins (so 'qwen2.5:7b' -> qwen), else the default. None if no
     prices are loaded at all. Longest family key first, so 'ibm-granite' beats a
     stray 'granite' substring match."""
     pr = load_model_prices()
-    low = str(name or "").lower()
-    for fam in sorted(pr["families"], key=len, reverse=True):
-        if fam in low:
-            return pr["families"][fam]
-    return pr["default"]
+    fam = price_family_key(name, pr["families"])
+    return pr["families"][fam] if fam is not None else pr["default"]
 
 
 _SIZE_MULT = {"k": 1e3, "m": 1e6, "g": 1e9, "t": 1e12}
@@ -6615,11 +6645,18 @@ async def _send_chat(session, host, full, payload, endpoint, do_stream, timeout=
         if payload.get("_dyva_continue"):
             p = _apply_continuation(p, payload["_dyva_continue"], host, attempt_oai)
             _cont_prefill = bool(p.get("continue_final_message"))
+        # Preemptive: a (host, model) we already caught answering with ONLY reasoning
+        # (empty content — the thinking-channel bug) starts every later request with
+        # thinking off, so we never pay the wasted first pass again this runtime. The
+        # caller's explicit think wins; this only fires when think wasn't set.
+        _think = payload.get("think")
+        if _think is None and (_norm_host(host), full) in _session_no_think:
+            _think = False
         # think:false has no universal off-switch, so STACK every known lever per
         # dialect (the way llcat's -nt does) — each backend ignores the ones it
         # doesn't recognise. The native `think` field is kept for Ollama but stripped
         # for OpenAI by openai_payload below, so a strict OpenAI host won't 400 on it.
-        if payload.get("think") is False:
+        if _think is False:
             p = _apply_no_think(p)                 # Qwen3 /no_think prompt token (rides in the text, any dialect)
             if attempt_oai:
                 p["reasoning_effort"] = "low"                          # OpenAI / LiteLLM
@@ -6873,7 +6910,7 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
         resp = None
         full = ms[0]
         await broadcast_activity(host, model, "trying",
-            f"trying: {host} for {model}", wid=wid)
+            f"trying: {host}@{model}", wid=wid)
 
         # One machine must not serve two jobs at once. With subagents fanning out,
         # several races run concurrently and the same good host can win all of them —
@@ -6963,50 +7000,67 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
         # wrong, the other dialect is tried once before writing the host off —
         # "Unexpected endpoint or method" is a labelling problem, not a broken
         # host, and 38% of the pool speaks OpenAI rather than Ollama.
-        try:
-            resp, oai, ep, why = await _send_chat(session, host, full, payload, endpoint, do_stream)
-        except (asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
-            dur = time.time() - start
-            # str(e) carries the real reason for connection/client errors
-            # ("Cannot connect to host ... Connect call failed"); TimeoutError's
-            # is empty, so fall back to the name.
-            detail = " ".join(str(e).split())[:200] or type(e).__name__
-            # A real TCP distinction the old code flattened into one "timeout":
-            #  - NO CONNECTION: a connector error (refused / DNS / no route) or a
-            #    timeout that fired in the CONNECT phase (~CONNECT_TIMEOUT, well
-            #    under TIMEOUT). The box is dead -> unreachable.
-            #  - CONNECTED BUT SLOW: a timeout at ~TIMEOUT means the host accepted
-            #    the socket and just didn't answer in time (cold start / slow
-            #    inference). It's alive, not dead -> a real timeout, shown amber.
-            no_socket = (isinstance(e, (aiohttp.ClientConnectorError, ConnectionRefusedError))
-                         or (isinstance(e, asyncio.TimeoutError) and dur < CONNECT_TIMEOUT + 2))
-            if no_socket:
+        # One immediate retry on a pre-response connection drop. A ServerDisconnected /
+        # ConnectionReset caught HERE (wrapping only _send_chat, before any response
+        # headers or tokens) is the classic stale keepalive-reuse race: we handed the
+        # request a pooled socket the server had already closed. These drops are fast
+        # and rare, and nothing was delivered downstream, so reconnect and go again
+        # right away rather than penalising the host. Only a SECOND consecutive drop is
+        # treated as a real fault. (A mid-STREAM drop is a different path entirely.)
+        for _reconnect in range(2):
+            try:
+                resp, oai, ep, why = await _send_chat(session, host, full, payload, endpoint, do_stream)
+                break
+            except (aiohttp.ServerDisconnectedError, aiohttp.ClientConnectionResetError, ConnectionResetError) as e:
+                if _reconnect == 0:
+                    continue                       # stale socket — reconnect and retry now
+                dur = time.time() - start
+                detail = " ".join(str(e).split())[:200] or type(e).__name__
                 await broadcast_activity(host, model, "failed",
-                    f"failure: {host} for {model} - no connection: {detail}", duration=dur, wid=wid)
-                # last_fail_reason gets the RAW exception text (str(e)), not our
-                # "no connection:" wrapper — so failures group cleanly. The feed
-                # line above keeps the human-readable prefix.
-                return unreachable_host(detail)
-            if isinstance(e, asyncio.TimeoutError):
-                # Connected but too slow to answer. It's alive, not dead — so NOT bad — but it
-                # DID fail to deliver this request, so SOFT-demote it (timed_out -> add_soft_fail:
-                # good -> maybe_good, never bad). That pulls it out of the winner circle (heavy
-                # requests prefer proven hosts) while keeping it usable for cheap ones and
-                # re-testable once warm. Also stamp the race visit so Explore stops re-fronting it.
-                msg = f"too slow — connected, no answer in {dur:.0f}s"
-                with contextlib.suppress(Exception):
-                    record_race(host, model, won=False)
-                await broadcast_activity(host, model, "warming",
-                    f"slow: {host} for {model} - {msg}", duration=dur, wid=wid)
-                return timed_out(msg)
-            # some other mid-connection error (disconnect, payload) — a real fault
-            await broadcast_activity(host, model, "failed",
-                f"failure: {host} for {model} - {detail}", duration=dur, wid=wid)
-            return failed(detail)
+                    f"failure: {host}@{model} - {detail}", duration=dur, wid=wid)
+                return failed(detail)
+            except (asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
+                dur = time.time() - start
+                # str(e) carries the real reason for connection/client errors
+                # ("Cannot connect to host ... Connect call failed"); TimeoutError's
+                # is empty, so fall back to the name.
+                detail = " ".join(str(e).split())[:200] or type(e).__name__
+                # A real TCP distinction the old code flattened into one "timeout":
+                #  - NO CONNECTION: a connector error (refused / DNS / no route) or a
+                #    timeout that fired in the CONNECT phase (~CONNECT_TIMEOUT, well
+                #    under TIMEOUT). The box is dead -> unreachable.
+                #  - CONNECTED BUT SLOW: a timeout at ~TIMEOUT means the host accepted
+                #    the socket and just didn't answer in time (cold start / slow
+                #    inference). It's alive, not dead -> a real timeout, shown amber.
+                no_socket = (isinstance(e, (aiohttp.ClientConnectorError, ConnectionRefusedError))
+                             or (isinstance(e, asyncio.TimeoutError) and dur < CONNECT_TIMEOUT + 2))
+                if no_socket:
+                    await broadcast_activity(host, model, "failed",
+                        f"failure: {host}@{model} - no connection: {detail}", duration=dur, wid=wid)
+                    # last_fail_reason gets the RAW exception text (str(e)), not our
+                    # "no connection:" wrapper — so failures group cleanly. The feed
+                    # line above keeps the human-readable prefix.
+                    return unreachable_host(detail)
+                if isinstance(e, asyncio.TimeoutError):
+                    # Connected but too slow to answer. It's alive, not dead — so NOT bad — but it
+                    # DID fail to deliver this request, so SOFT-demote it (timed_out -> add_soft_fail:
+                    # good -> maybe_good, never bad). That pulls it out of the winner circle (heavy
+                    # requests prefer proven hosts) while keeping it usable for cheap ones and
+                    # re-testable once warm. Also stamp the race visit so Explore stops re-fronting it.
+                    msg = f"too slow — connected, no answer in {dur:.0f}s"
+                    with contextlib.suppress(Exception):
+                        record_race(host, model, won=False)
+                    await broadcast_activity(host, model, "warming",
+                        f"slow: {host}@{model} - {msg}", duration=dur, wid=wid)
+                    return timed_out(msg)
+                # some other mid-connection error (payload etc.) — a real fault
+                await broadcast_activity(host, model, "failed",
+                    f"failure: {host}@{model} - {detail}", duration=dur, wid=wid)
+                return failed(detail)
         if resp is None:
             dur = time.time() - start
             await broadcast_activity(host, model, "failed",
-                f"failure: {host} for {model} - {why}", duration=dur, wid=wid)
+                f"failure: {host}@{model} - {why}", duration=dur, wid=wid)
             return unsuitable(why)
 
         if resp.status != 200:
@@ -7043,7 +7097,7 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
             # eligible once loaded; show it as a transient "warming", not red.
             if "loading model" in body.lower():
                 await broadcast_activity(host, model, "warming",
-                    f"warming up: {host} for {model} - model loading", duration=dur, wid=wid)
+                    f"warming up: {host}@{model} - model loading", duration=dur, wid=wid)
                 return retry_later(detail)
             # 503 Service Unavailable = the host is ALIVE but at capacity — a full
             # queue / llama.cpp's "maximum number of pending requests", vLLM's "no
@@ -7052,7 +7106,7 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
             # just busy", same family as the warm-up case.
             if code == 503:
                 await broadcast_activity(host, model, "warming",
-                    f"busy: {host} for {model} - {detail}", duration=dur, wid=wid)
+                    f"busy: {host}@{model} - {detail}", duration=dur, wid=wid)
                 return retry_later(detail)
             # The prompt is bigger than the window this host was LOADED with (LM Studio
             # "exceed_context_size_error", llama.cpp "exceeds the available context",
@@ -7071,7 +7125,7 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
                 # to the back of its tier (soft; cleared on a later success this big).
                 mark_ctx_limit(host, full, _parse_ctx_limit(body))
                 await broadcast_activity(host, model, "warming",
-                    f"won't fit: {host} for {model} - {detail}", duration=dur, wid=wid)
+                    f"won't fit: {host}@{model} - {detail}", duration=dur, wid=wid)
                 return skip(detail)
             # The model can't tool-call ("does not support tools") — a capability
             # mismatch every host serving this file rejects identically, not a bad
@@ -7083,7 +7137,7 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
             if code == 400 and _is_no_tools(_blow):
                 mark_no_tools(host, full)
                 await broadcast_activity(host, model, "trial",
-                    f"no tools: {host} for {model} - {full} does not support tool-calling",
+                    f"no tools: {host}@{model} - {full} does not support tool-calling",
                     duration=dur, wid=wid)
                 return skip(detail)
             # This host's copy of the model is an old GGUF the server can no longer load
@@ -7093,11 +7147,11 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
             # server, and don't surface it as the job's error.
             if _is_stale_model_format(body):
                 await broadcast_activity(host, model, "trial",
-                    f"stale model: {host} for {model} - {full} needs re-pull (old format)",
+                    f"stale model: {host}@{model} - {full} needs re-pull (old format)",
                     duration=dur, wid=wid)
                 return skip(detail)
             await broadcast_activity(host, model, "failed",
-                f"failure: {host} for {model} - {detail}", duration=dur, wid=wid)
+                f"failure: {host}@{model} - {detail}", duration=dur, wid=wid)
             return failed(detail)
 
         if not do_stream:
@@ -7116,14 +7170,14 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
                 await resp.release()
                 resp = None
                 await broadcast_activity(host, model, "failed",
-                    f"failure: {host} for {model} - timeout", duration=dur, wid=wid)
+                    f"failure: {host}@{model} - timeout", duration=dur, wid=wid)
                 return timed_out("read timeout")
             except json.JSONDecodeError:
                 dur = time.time() - start
                 await resp.release()
                 resp = None
                 await broadcast_activity(host, model, "failed",
-                    f"failure: {host} for {model} - bad response", duration=dur, wid=wid)
+                    f"failure: {host}@{model} - bad response", duration=dur, wid=wid)
                 return failed("bad response")
             await resp.release()
             if oai and "choices" in data:
@@ -7134,17 +7188,17 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
                 # stale GGUF the host can't load -> skip to the next server, don't surface
                 if _is_stale_model_format(_emsg):
                     await broadcast_activity(host, model, "trial",
-                        f"stale model: {host} for {model} - {full} needs re-pull (old format)",
+                        f"stale model: {host}@{model} - {full} needs re-pull (old format)",
                         duration=dur, wid=wid)
                     return skip(_emsg[:200])
                 await _collect_err(f"{host}: {data['error']}")
                 await broadcast_activity(host, model, "failed",
-                    f"failure: {host} for {model} - error: {data['error']}", duration=dur, wid=wid)
+                    f"failure: {host}@{model} - error: {data['error']}", duration=dur, wid=wid)
                 return failed(_emsg)
             dur = time.time() - start
             log.debug(f"  \u2713 {tag}")
             await broadcast_activity(host, model, "connected",
-                f"success: {host} for {model}", duration=dur, wid=wid, rmodel=full)
+                f"success: {host}@{model}", duration=dur, wid=wid, rmodel=full)
             return accepted(("ok", host, full, data), extra=full)
 
         try:
@@ -7178,7 +7232,7 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
             await resp.release()
             resp = None
             await broadcast_activity(host, model, "failed",
-                f"failure: {host} for {model} - empty response", duration=dur, wid=wid)
+                f"failure: {host}@{model} - empty response", duration=dur, wid=wid)
             return failed("empty response")
 
         try:
@@ -7188,7 +7242,7 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
             await resp.release()
             resp = None
             await broadcast_activity(host, model, "failed",
-                f"failure: {host} for {model} - bad response", duration=dur, wid=wid)
+                f"failure: {host}@{model} - bad response", duration=dur, wid=wid)
             return failed("bad response")
 
         if "error" in first:
@@ -7199,12 +7253,12 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
             # stale GGUF the host can't load -> skip to the next server, don't surface
             if _is_stale_model_format(_emsg):
                 await broadcast_activity(host, model, "trial",
-                    f"stale model: {host} for {model} - {full} needs re-pull (old format)",
+                    f"stale model: {host}@{model} - {full} needs re-pull (old format)",
                     duration=dur, wid=wid)
                 return skip(_emsg[:200])
             await _collect_err(f"{host}: {first['error']}")
             await broadcast_activity(host, model, "failed",
-                f"failure: {host} for {model} - error: {first['error']}", duration=dur, wid=wid)
+                f"failure: {host}@{model} - error: {first['error']}", duration=dur, wid=wid)
             return failed(_emsg)
 
         if done.is_set():
@@ -7215,7 +7269,7 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
         record_perf(host, full, ttft=dur)   # dur here IS time-to-first-token
         log.debug(f"  \u2713 {tag}")
         await broadcast_activity(host, model, "connected",
-            f"success: {host} for {model}", duration=dur, wid=wid, rmodel=full)
+            f"success: {host}@{model}", duration=dur, wid=wid, rmodel=full)
         return accepted(("ok_stream", host, full, resp, first_line, first, oai), extra=full)
 
     # Queueing theory: with several requests in flight for the SAME model, each
@@ -7510,6 +7564,14 @@ def _stream_deadline(started, worker_max):
     return started + worker_max
 
 
+def _is_empty_answer(partial):
+    """A completion that delivered NOTHING to the client — no content and no tool-call
+    args — which for a thinking model is the thinking-channel bug: the whole answer went
+    to `thinking` and `content` came back empty. A tool-only turn has partial[1] > 0 (not
+    empty); a normal answer has content (not empty)."""
+    return not (partial[0] or "").strip() and (len(partial) < 2 or partial[1] == 0)
+
+
 async def _pump_stream(response, resp, first_line, host, full, openai_format,
                        upstream_openai, wid, num_ctx, partial, cancel=None):
     """Forward ONE already-won upstream stream to the already-prepared client
@@ -7601,6 +7663,8 @@ async def _pump_stream(response, resp, first_line, host, full, openai_format,
             await account_tokens(wid, host, full, _fobj, num_ctx)
             if _fobj.get("done_reason") == "length":
                 return "length"
+            if _is_empty_answer(partial):
+                return "empty"      # answer went to the thinking channel — swallow done, let caller retry
             if openai_format:
                 fin = _fobj.get("done_reason") or "stop"
                 if tool_phase[0] and fin == "stop":
@@ -7706,6 +7770,8 @@ async def _pump_stream(response, resp, first_line, host, full, openai_format,
                 # client gets a finish with nothing. The native path already forwards the
                 # raw line, which includes it.
                 accum(obj)
+                if _is_empty_answer(partial):
+                    return "empty"      # answer went to the thinking channel — swallow done, let caller retry
                 if openai_format:
                     m = _openai_reasoning(dict((obj or {}).get("message", {})))
                     tcs = m.pop("tool_calls", None)
@@ -7764,8 +7830,15 @@ async def _forward_stream(request, response, resp, first_line, host, full, opena
         log.debug("Client disconnected before response headers sent")
         await resp.release()
         return
-    await _pump_stream(response, resp, first_line, host, full, openai_format,
-                       upstream_openai, wid, num_ctx, ["", 0])
+    # This path has no continue/retry machinery, so any status that SWALLOWED the
+    # upstream done ('length'/'truncated'/'capped'/'empty', or an operator 'stopped')
+    # would leave the client hanging. Close the stream with a terminal done unless it
+    # already ended cleanly ('done') or the client is gone ('client').
+    status = await _pump_stream(response, resp, first_line, host, full, openai_format,
+                                upstream_openai, wid, num_ctx, ["", 0])
+    if status not in ("done", "client"):
+        with contextlib.suppress(Exception):
+            await _write_terminal_done(response, full, openai_format)
 
 
 async def _write_terminal_done(response, full, openai_format):
@@ -7981,6 +8054,7 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
     payload = opayload
     dead = set()          # hosts that dropped the CONNECTION — don't retry those
     continues = 0
+    _no_think_retried = False   # one-shot: retry once with think:false on an empty (thinking-only) answer
     while True:
         mark_worker_found(job_wid, host, full)
         # Re-arm the manual-stop handle for THIS streaming leg. _race_hosts swaps in its
@@ -8016,6 +8090,36 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
                 await _write_terminal_done(response, full, openai_format)
             break
         if status in ("done", "client"):
+            break
+        if status == "empty":
+            # Finished cleanly but delivered NOTHING — the whole answer went into the
+            # thinking channel and content came back empty (the ollama/custom-GGUF
+            # thinking bug). think:false fixes it. The host ANSWERED, so it's not at
+            # fault — don't penalise it: learn the (host, model) for the session and
+            # retry the SAME pool once with thinking off. One shot — if it's still empty
+            # with think off, it genuinely produced nothing, so end cleanly.
+            if _no_think_retried:
+                with contextlib.suppress(Exception):
+                    await _write_terminal_done(response, full, openai_format)
+                break
+            _no_think_retried = True
+            _session_no_think.add((_norm_host(host), full))
+            payload = dict(payload, think=False)
+            partial = ["", 0]
+            await broadcast_activity(host, full, "warming",
+                f"{host}@{full} answered only in the thinking channel — retrying with thinking off",
+                wid=job_wid)
+            remaining = [s for s in servers if s[1] not in dead]
+            continues += 1
+            if continues <= MAX_STREAM_CONTINUES and remaining:
+                result2, _errs, _stopped = await _race_servers(
+                    session, model, remaining, payload, do_stream=True,
+                    remote=request.remote, caps=req_caps, job_wid=job_wid, hedge_delay=HEDGE_DELAY)
+                if result2:
+                    _, host, full, resp, first_line, _first, oai = result2
+                    continue
+            with contextlib.suppress(Exception):
+                await _write_terminal_done(response, full, openai_format)
             break
         made = len(partial[0]) + partial[1]   # real progress: content + tool-call args
         # Two kinds of mid-stream truncation, both continued on the SAME open client
@@ -8460,7 +8564,7 @@ async def _quick_probe(session, host, full, model_in, tools=None, grade=True, tr
     if tools:
         payload["tools"] = tools
     start = time.time()
-    await broadcast_activity(host, model_in, "trying", f"quick test: {host} for {model_in}", wid=wid)
+    await broadcast_activity(host, model_in, "trying", f"quick test: {host}@{model_in}", wid=wid)
     try:
         # Same send primitive as the real request path: the host's own dialect with a
         # fallback to the other (a probe that forced /api/chat culled every OpenAI host).
@@ -8471,8 +8575,15 @@ async def _quick_probe(session, host, full, model_in, tools=None, grade=True, tr
         # hosts the operator's longer timeout was meant to wait for, AND — since the TOTAL
         # was 10s — every timeout landed under CONNECT_TIMEOUT+2 and got mislabelled "no
         # connection", so the connected-but-slow→inconclusive branch below was dead code.
-        resp, oai, _ep, why = await _send_chat(session, host, full, payload, "/api/chat",
-                                               False)
+        for _reconnect in range(2):   # one immediate retry on a stale-keepalive drop
+            try:
+                resp, oai, _ep, why = await _send_chat(session, host, full, payload, "/api/chat",
+                                                       False)
+                break
+            except (aiohttp.ServerDisconnectedError, aiohttp.ClientConnectionResetError, ConnectionResetError):
+                if _reconnect == 0:
+                    continue              # pre-response drop — reconnect and retry right away
+                raise                     # second consecutive drop — fall to the handler below
     except (asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
         dur = time.time() - start
         detail = " ".join(str(e).split())[:200] or type(e).__name__
@@ -8487,14 +8598,14 @@ async def _quick_probe(session, host, full, model_in, tools=None, grade=True, tr
             # is why a chronically-slow host kept sitting in 'good' and getting raced first.)
             add_soft_fail(host, full, "timeout", reason=f"quick test too slow: no answer in {dur:.0f}s")
             await broadcast_activity(host, model_in, "warming",
-                f"quick test: {host} for {model_in} - too slow, connected (no answer in {dur:.0f}s)",
+                f"quick test: {host}@{model_in} - too slow, connected (no answer in {dur:.0f}s)",
                 duration=dur, wid=wid)
             return None, f"too slow — connected, no answer in {dur:.0f}s"
         msg = ("no connection: " + detail) if no_socket else detail
         if grade:
             add_bad(host, full, reason=f"smoke: {msg}")
         await broadcast_activity(host, model_in, "failed",
-            f"quick test: {host} for {model_in} - {msg}", duration=dur, wid=wid)
+            f"quick test: {host}@{model_in} - {msg}", duration=dur, wid=wid)
         return False, msg
     if resp is None:
         # Both dialects missed. A STRUCTURAL miss (the host lists a model it doesn't actually have —
@@ -8506,7 +8617,7 @@ async def _quick_probe(session, host, full, model_in, tools=None, grade=True, tr
         if grade or structural:
             add_bad(host, full, reason=f"smoke: {why}")
         await broadcast_activity(host, model_in, "failed",
-            f"quick test: {host} for {model_in} - {why}",
+            f"quick test: {host}@{model_in} - {why}",
             duration=time.time() - start, wid=wid)
         return False, why
     if resp.status != 200:
@@ -8532,7 +8643,7 @@ async def _quick_probe(session, host, full, model_in, tools=None, grade=True, tr
         if resp.status == 400 and _is_no_tools(body):
             mark_no_tools(host, full)
             await broadcast_activity(host, model_in, "trying",
-                f"quick test: {host} for {model_in} - {full} does not support tool-calling",
+                f"quick test: {host}@{model_in} - {full} does not support tool-calling",
                 duration=time.time() - start, wid=wid)
             return None, detail
         # Do NOT condemn the machine for a REQUEST-level rejection. A 400 is our own
@@ -8551,7 +8662,7 @@ async def _quick_probe(session, host, full, model_in, tools=None, grade=True, tr
         if not benign and (grade or structural):
             add_bad(host, full, reason=f"smoke: {detail}")
         await broadcast_activity(host, model_in, "warming" if benign else "failed",
-            f"quick test: {host} for {model_in} - {detail}",
+            f"quick test: {host}@{model_in} - {detail}",
             duration=time.time() - start, wid=wid)
         return (None if benign else False), detail
     try:
@@ -8561,7 +8672,7 @@ async def _quick_probe(session, host, full, model_in, tools=None, grade=True, tr
         if grade:
             add_bad(host, full, reason="smoke: bad response (JSON decode failed)")
         await broadcast_activity(host, model_in, "failed",
-            f"quick test: {host} for {model_in} - bad response", duration=time.time() - start, wid=wid)
+            f"quick test: {host}@{model_in} - bad response", duration=time.time() - start, wid=wid)
         return False, "bad response"
     await resp.release()
     if oai and "choices" in data:          # normalise the openai shape first
@@ -8576,13 +8687,18 @@ async def _quick_probe(session, host, full, model_in, tools=None, grade=True, tr
         if _is_no_tools(str(data["error"])):
             mark_no_tools(host, full)
             await broadcast_activity(host, model_in, "trying",
-                f"quick test: {host} for {model_in} - {full} does not support tool-calling",
+                f"quick test: {host}@{model_in} - {full} does not support tool-calling",
                 duration=dur, wid=wid)
             return None, f"error: {str(data['error'])[:80]}"
-        if grade:
+        # A host may return the SAME permanent failure as a 200-with-error body instead of a
+        # non-200 (e.g. "llama-server process has terminated: signal: killed"). Record it even
+        # on the grade=False race probe when it's structural, exactly as the status!=200 branch
+        # does — once is enough, and load_incompatible() then hard-excludes the pair.
+        structural = bool(_STRUCTURAL_FAIL_RE.search(str(data["error"])))
+        if grade or structural:
             add_bad(host, full, reason=f"smoke error: {data['error']}")
         await broadcast_activity(host, model_in, "failed",
-            f"quick test: {host} for {model_in} - error: {data['error']}", duration=dur, wid=wid)
+            f"quick test: {host}@{model_in} - error: {data['error']}", duration=dur, wid=wid)
         return False, f"error: {str(data['error'])[:80]}"
     # SPIDER-TRAP screen (only when we offered the bait — so we never look for tool calls when
     # we didn't ask for any). The colour question needs no tool; a host that CALLS one is
@@ -8600,12 +8716,12 @@ async def _quick_probe(session, host, full, model_in, tools=None, grade=True, tr
             mark_honeypot(host, reason=f"spider-trap: called {names}")
             log.warning(f"tool smoke SPIDER-TRAP (machine flagged) {host} ({full}): called {names}")
             await broadcast_activity(host, model_in, "failed",
-                f"tool smoke: {host} for {model_in} - SPIDER-TRAP, machine flagged: called {names}",
+                f"tool smoke: {host}@{model_in} - SPIDER-TRAP, machine flagged: called {names}",
                 duration=dur, wid=wid)
             return False, f"spider-trap: called {names}"
         mark_smoke_tools(host, full)
         await broadcast_activity(host, model_in, "trying",
-            f"tool smoke: {host} for {model_in} - clean (ignored the bait tools)", duration=dur, wid=wid)
+            f"tool smoke: {host}@{model_in} - clean (ignored the bait tools)", duration=dur, wid=wid)
         return True, "tool-safe"
     if not _quick_test_answer_ok(content):
         # A smoke fail is not automatically a honeypot. Classify the response:
@@ -8620,7 +8736,7 @@ async def _quick_probe(session, host, full, model_in, tools=None, grade=True, tr
             mark_honeypot(host, reason=shown)   # host-wide: drop the machine for every model
             log.warning(f"quick test HONEYPOT (machine flagged) {host} ({full}): {shown!r}")
             await broadcast_activity(host, model_in, "failed",
-                f"quick test: {host} for {model_in} - HONEYPOT, machine flagged: {shown!r}", duration=dur, wid=wid)
+                f"quick test: {host}@{model_in} - HONEYPOT, machine flagged: {shown!r}", duration=dur, wid=wid)
             return False, f"{shown}"
         # Failed, but NOT a recognized garbage reply (empty, gibberish, an off answer).
         # Record it as 'maybe' — data capture ONLY, no routing effect yet — so we can
@@ -8629,7 +8745,7 @@ async def _quick_probe(session, host, full, model_in, tools=None, grade=True, tr
             mark_maybe(host, full, reason=shown)
         log.info(f"quick test MAYBE (recorded, no routing effect) {host} ({full}): {shown!r}")
         await broadcast_activity(host, model_in, "warming",
-            f"quick test: {host} for {model_in} - unrecognized fail (maybe): {shown!r}", duration=dur, wid=wid)
+            f"quick test: {host}@{model_in} - unrecognized fail (maybe): {shown!r}", duration=dur, wid=wid)
         return False, f"{shown}"
     # It answered "black" (the #000000 probe discriminates — honeypots emit canned
     # filler, not "black"). We don't store a "passed" flag; we just update our LAST
@@ -8646,7 +8762,7 @@ async def _quick_probe(session, host, full, model_in, tools=None, grade=True, tr
     # real request path measures performance (see record_perf in the race attempt).
     log.info(f"quick test PASS {host} ({full}): answer={shown!r}")
     await broadcast_activity(host, model_in, "connected",
-        f"quick test PASSED: {host} for {model_in} answered {shown!r}", duration=dur, wid=wid)
+        f"quick test PASSED: {host}@{model_in} answered {shown!r}", duration=dur, wid=wid)
     return True, shown
 
 
@@ -8878,7 +8994,7 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                         record_verdict(host, full, timed_out("stream stalled"))
                         errors.append(f"{host}: stream stalled")
                         await broadcast_activity(host, model, "failed",
-                            f"stream stalled: {host} for {model} — no tokens for {TIMEOUT}s",
+                            f"stream stalled: {host}@{model} — no tokens for {TIMEOUT}s",
                             wid=job_wid)
                         _servers = [s for s in _servers if s[1] != host]
                         _set_worker_phase(job_wid, None)
@@ -11334,25 +11450,25 @@ async def handle_api_embeddings(request):
         _p, host, ms = item
         full = ms[0]
         t0 = time.time()
-        await broadcast_activity(host, model, "trying", f"trying: {host} for {model}", wid=wid)
+        await broadcast_activity(host, model, "trying", f"trying: {host}@{model}", wid=wid)
         try:
             vec = await _embed_one(session, host, full, text)
         except asyncio.TimeoutError:
             await broadcast_activity(host, model, "failed",
-                f"failure: {host} for {model} - timeout", duration=time.time() - t0, wid=wid)
+                f"failure: {host}@{model} - timeout", duration=time.time() - t0, wid=wid)
             return timed_out("read timeout")
         except (aiohttp.ClientError, OSError) as e:
             await broadcast_activity(host, model, "failed",
-                f"failure: {host} for {model} - {type(e).__name__}", duration=time.time() - t0, wid=wid)
+                f"failure: {host}@{model} - {type(e).__name__}", duration=time.time() - t0, wid=wid)
             return unreachable_host(type(e).__name__)
         if done.is_set():
             return skip("another host won")
         if vec:
             await broadcast_activity(host, model, "connected",
-                f"success: {host} for {model}", duration=time.time() - t0, wid=wid, rmodel=full)
+                f"success: {host}@{model}", duration=time.time() - t0, wid=wid, rmodel=full)
             return accepted({"embedding": vec}, extra=full)
         await broadcast_activity(host, model, "failed",
-            f"failure: {host} for {model} - no embedding", duration=time.time() - t0, wid=wid)
+            f"failure: {host}@{model} - no embedding", duration=time.time() - t0, wid=wid)
         return failed("no embedding")
 
     async with request.app["semaphore"]:
@@ -11455,7 +11571,7 @@ async def handle_systemone(request):
         payload = dict(body)
         payload["model"] = full              # forward the RESOLVED model name
         t0 = time.time()
-        await broadcast_activity(host, model, "trying", f"trying: {host} for {model}", wid=wid)
+        await broadcast_activity(host, model, "trying", f"trying: {host}@{model}", wid=wid)
         _to = aiohttp.ClientTimeout(total=TIMEOUT, sock_connect=CONNECT_TIMEOUT)
         try:
             async with session.post(f"{host}/v1/systemone", json=payload, timeout=_to) as r:
@@ -11463,11 +11579,11 @@ async def handle_systemone(request):
                 text = await r.text()
         except asyncio.TimeoutError:
             await broadcast_activity(host, model, "failed",
-                f"failure: {host} for {model} - timeout", duration=time.time() - t0, wid=wid)
+                f"failure: {host}@{model} - timeout", duration=time.time() - t0, wid=wid)
             return timed_out("read timeout")
         except (aiohttp.ClientError, OSError) as e:
             await broadcast_activity(host, model, "failed",
-                f"failure: {host} for {model} - {type(e).__name__}", duration=time.time() - t0, wid=wid)
+                f"failure: {host}@{model} - {type(e).__name__}", duration=time.time() - t0, wid=wid)
             return unreachable_host(type(e).__name__)
         if code == 503:                       # alive but busy — park and retry, no penalty
             return retry_later("busy (HTTP 503)")
@@ -11488,13 +11604,13 @@ async def handle_systemone(request):
                 mark_batch_limit(host, full, _blim)
             detail = f"HTTP {code}: {' '.join(text.split())[:160]}"
             await broadcast_activity(host, model, "failed",
-                f"failure: {host} for {model} - {detail}", duration=time.time() - t0, wid=wid)
+                f"failure: {host}@{model} - {detail}", duration=time.time() - t0, wid=wid)
             return failed(detail)
         try:
             data = json.loads(text)
         except (json.JSONDecodeError, ValueError):
             await broadcast_activity(host, model, "failed",
-                f"failure: {host} for {model} - bad response", duration=time.time() - t0, wid=wid)
+                f"failure: {host}@{model} - bad response", duration=time.time() - t0, wid=wid)
             return failed("bad response (not JSON)")
         if done.is_set():
             return skip("another host won")
@@ -11508,7 +11624,7 @@ async def handle_systemone(request):
         # why it never silently no-ops.
         await account_tokens(wid, host, full, _decision_acct(data, _intoks), None)
         await broadcast_activity(host, model, "connected",
-            f"success: {host} for {model}", duration=time.time() - t0, wid=wid, rmodel=full)
+            f"success: {host}@{model}", duration=time.time() - t0, wid=wid, rmodel=full)
         return accepted(data, extra=full)
 
     async with request.app["semaphore"]:
@@ -13054,7 +13170,7 @@ async def handle_txt2img(request):
             payload["override_settings_restore_afterwards"] = True
         log.debug(f"Reusing {last_host} for txt2img")
         await broadcast_activity(last_host, activity_label, "trying",
-            f"trying: {last_host} for {activity_label}")
+            f"trying: {last_host}@{activity_label}")
         try:
             async with session.post(
                 _host_url(last_host, "/sdapi/v1/txt2img"), json=payload,
@@ -13069,12 +13185,12 @@ async def handle_txt2img(request):
                                   f"{_resolve_sd_model(data, body)!r}, wanted "
                                   f"{model_filter!r}; not reusing")
                         await broadcast_activity(last_host, activity_label, "failed",
-                            f"failure: {last_host} for {activity_label} - wrong model")
+                            f"failure: {last_host}@{activity_label} - wrong model")
                     else:
                         data["_dyva_model"] = _resolve_sd_model(data, body) or requested_model
                         mark_worker_found(job_wid, last_host, data["_dyva_model"])
                         await broadcast_activity(last_host, activity_label, "connected",
-                            f"success: {last_host} for {activity_label}", duration=0)
+                            f"success: {last_host}@{activity_label}", duration=0)
                         _save_image_history(data, body, last_host, requested_model)
                         data["host"] = last_host
                         data["service"] = service_of(last_host)
@@ -13083,7 +13199,7 @@ async def handle_txt2img(request):
                 else:
                     add_bad(last_host, IMG_KEY, reason=f"a1111 img HTTP {r.status}")
                     await broadcast_activity(last_host, activity_label, "failed",
-                        f"failure: {last_host} for {activity_label} - HTTP {r.status}")
+                        f"failure: {last_host}@{activity_label} - HTTP {r.status}")
         except (asyncio.TimeoutError, aiohttp.ClientError, OSError) as _e:
             # A TIMEOUT on image gen is alive-but-slow (rendering is slow by nature) — SOFT-fail
             # (maybe_good, never bad). A connection error is the host being dead — that's a real
@@ -13092,7 +13208,7 @@ async def handle_txt2img(request):
             (add_soft_fail if isinstance(_e, asyncio.TimeoutError) else add_bad)(
                 last_host, IMG_KEY, reason=_reason)
             await broadcast_activity(last_host, activity_label, "failed",
-                f"failure: {last_host} for {activity_label} - {type(_e).__name__}")
+                f"failure: {last_host}@{activity_label} - {type(_e).__name__}")
 
     servers = load_servers()
     candidates = [s for s in servers if s.get("service") == "a1111"]
@@ -13124,7 +13240,7 @@ async def handle_txt2img(request):
     async def a1111_attempt(host, wid, done):
         t0 = time.time()
         await broadcast_activity(host, activity_label, "trying",
-            f"trying: {host} for {activity_label}", wid=wid)
+            f"trying: {host}@{activity_label}", wid=wid)
         ov = overrides.get(host)
         payload = ({**body, "override_settings": ov,
                     "override_settings_restore_afterwards": True} if ov else body)
@@ -13138,7 +13254,7 @@ async def handle_txt2img(request):
                     if _sd_model_mismatch(data, body, model_filter):
                         got = _resolve_sd_model(data, body)
                         await broadcast_activity(host, activity_label, "failed",
-                            f"failure: {host} for {activity_label} - rendered {got}, not {model_filter}", wid=wid)
+                            f"failure: {host}@{activity_label} - rendered {got}, not {model_filter}", wid=wid)
                         return unsuitable(f"wrong model: {got}")
                     data["_dyva_model"] = _resolve_sd_model(data, body)  # the actual model
                     # Stamp the RESOLVED model on the worker (not just the query),
@@ -13146,23 +13262,23 @@ async def handle_txt2img(request):
                     # rendered, not the sentinel/query it was routed on.
                     mark_worker_found(job_wid, host, data["_dyva_model"])
                     await broadcast_activity(host, activity_label, "connected",
-                        f"success: {host} for {activity_label}", duration=time.time() - t0, wid=wid,
+                        f"success: {host}@{activity_label}", duration=time.time() - t0, wid=wid,
                         rmodel=data["_dyva_model"])
                     data["_dyva_host"] = host
                     return accepted(data)
                 await broadcast_activity(host, activity_label, "failed",
-                    f"failure: {host} for {activity_label} - HTTP {r.status}", wid=wid)
+                    f"failure: {host}@{activity_label} - HTTP {r.status}", wid=wid)
                 return failed(f"HTTP {r.status}")
         except (asyncio.TimeoutError, aiohttp.ClientError, OSError) as _e:
             await broadcast_activity(host, activity_label, "failed",
-                f"failure: {host} for {activity_label} - {type(_e).__name__}", wid=wid)
+                f"failure: {host}@{activity_label} - {type(_e).__name__}", wid=wid)
             return (timed_out(type(_e).__name__) if isinstance(_e, asyncio.TimeoutError)
                     else unreachable_host(type(_e).__name__))
 
     async def comfy_attempt(host, wid, done):
         t0 = time.time()
         await broadcast_activity(host, activity_label, "trying",
-            f"trying: {host} for {activity_label} (comfyui)", wid=wid)
+            f"trying: {host}@{activity_label} (comfyui)", wid=wid)
         # one worker for the whole request (job_wid) — mark the render phase on
         # it rather than spawning a second card, and keep it visible to is_active
         mark_worker_found(job_wid, host)
@@ -13172,7 +13288,7 @@ async def handle_txt2img(request):
         except ComfyError as e:
             _set_worker_phase(job_wid, None)
             await broadcast_activity(host, activity_label, "failed",
-                f"failure: {host} for {activity_label} (comfyui) - {e}", wid=wid)
+                f"failure: {host}@{activity_label} (comfyui) - {e}", wid=wid)
             return failed(str(e))
         _set_worker_phase(job_wid, None)
         if data:
@@ -13182,12 +13298,12 @@ async def handle_txt2img(request):
             # actually rendered.
             mark_worker_found(job_wid, host, data.get("_dyva_model"))
             await broadcast_activity(host, activity_label, "connected",
-                f"success: {host} for {activity_label} (comfyui)",
+                f"success: {host}@{activity_label} (comfyui)",
                 duration=time.time() - t0, wid=wid, rmodel=data.get("_dyva_model"))
             data["_dyva_host"] = host
             return accepted(data)
         await broadcast_activity(host, activity_label, "failed",
-            f"failure: {host} for {activity_label} (comfyui) - no response", wid=wid)
+            f"failure: {host}@{activity_label} (comfyui) - no response", wid=wid)
         return failed("no response")
 
     # Keep the tally across all three phases. "all image-gen hosts failed" told
@@ -15272,7 +15388,7 @@ async def _run_chat_job(session, jid):
                         record_verdict(host, full, timed_out("stream dropped"))
                         errors.append(f"{host}: stream dropped mid-generation")
                         await broadcast_activity(host, full, "failed",
-                            f"stream dropped: {host} for {full} — ended with no completion", wid=job_wid)
+                            f"stream dropped: {host}@{full} — ended with no completion", wid=job_wid)
                         servers = [s for s in servers if s[1] != host]
                         if partial[0].strip():
                             opayload["_dyva_continue"] = (opayload.get("_dyva_continue") or "") + partial[0]
@@ -15447,7 +15563,7 @@ async def _run_video_job(session, jid):
                                      lambda: None, kind="video")
 
     async def attempt(host, wid, done):
-        await broadcast_activity(host, vkey, "trying", f"trying: {host} for {label}", wid=wid)
+        await broadcast_activity(host, vkey, "trying", f"trying: {host}@{label}", wid=wid)
         t0 = time.time()
         try:
             prompt_id, plan = await _submit_video_workflow(session, host, job)
@@ -15455,7 +15571,7 @@ async def _run_video_job(session, jid):
             err = str(e) or type(e).__name__
             errors.append(f"{host}: {err}")
             await broadcast_activity(host, vkey, "failed",
-                f"failure: {host} for {label} - {err}", duration=time.time() - t0, wid=wid)
+                f"failure: {host}@{label} - {err}", duration=time.time() - t0, wid=wid)
             if isinstance(e, (ComfyUnsuitable, _VideoError)):
                 return unsuitable(err)
             if isinstance(e, ComfyUnreachable):
@@ -15465,7 +15581,7 @@ async def _run_video_job(session, jid):
             if isinstance(e, (aiohttp.ClientError, OSError)):
                 return unreachable_host(err)
             return failed(err)
-        await broadcast_activity(host, vkey, "connected", f"success: {host} for {label}",
+        await broadcast_activity(host, vkey, "connected", f"success: {host}@{label}",
                                  duration=time.time() - t0, wid=wid, rmodel=plan.get("model"))
         return accepted((host, prompt_id, plan))
 
@@ -15552,7 +15668,7 @@ async def _run_video_job(session, jid):
             errors.append(f"{host}: skipped by user")
             log.info(f"video: {host}: render skipped by user")
             await broadcast_activity(host, vkey, "failed",
-                f"skipped: {host} for {label}")
+                f"skipped: {host}@{label}")
             _set_worker_phase(job_wid, None)
             continue                  # race the rest, minus this host
         except (_VideoError, ComfyError, asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
@@ -15562,7 +15678,7 @@ async def _run_video_job(session, jid):
             errors.append(f"{host}: {err} [{plan.get('family')} {plan.get('model')}]")
             log.warning(f"video: {host}: took the job then failed to render: {err}")
             await broadcast_activity(host, vkey, "failed",
-                f"failure: {host} for {label} - render: {err}")
+                f"failure: {host}@{label} - render: {err}")
             if outcome.verdict == V_UNSUITABLE and plan.get("model"):
                 bad_models.add(plan["model"])
                 # remember it past this request, so tomorrow's job doesn't
@@ -16947,7 +17063,7 @@ async def handle_tts_speech(request):
     # The race only has to get the job accepted somewhere.
     async def attempt(host, wid, done):
         await broadcast_activity(host, tkey, "trying",
-            f"trying: {host} for {label}", wid=wid)
+            f"trying: {host}@{label}", wid=wid)
         start = time.time()
         try:
             prompt_id, node = await _tts_submit(session, host, input_text, voice)
@@ -16956,7 +17072,7 @@ async def handle_tts_speech(request):
             dur = time.time() - start
             errors_list.append(f"{host}: {err}")
             await broadcast_activity(host, tkey, "failed",
-                f"failure: {host} for {label} - {err}", duration=dur, wid=wid)
+                f"failure: {host}@{label} - {err}", duration=dur, wid=wid)
             if isinstance(e, _TtsUnsuitable):
                 return unsuitable(err)
             if isinstance(e, ComfyUnreachable):
@@ -16968,7 +17084,7 @@ async def handle_tts_speech(request):
             return failed(err)
         dur = time.time() - start
         await broadcast_activity(host, tkey, "connected",
-            f"success: {host} for {label}", duration=dur, wid=wid, rmodel=node)
+            f"success: {host}@{label}", duration=dur, wid=wid, rmodel=node)
         return accepted((host, prompt_id, node))
 
     # A host that accepts the prompt and then can't render it is a verdict like
@@ -17013,7 +17129,7 @@ async def handle_tts_speech(request):
         except ComfyCancelled:
             stopped = True
             await broadcast_activity(host, tkey, "stopped",
-                f"stopped: {host} for {label}", wid=job_wid)
+                f"stopped: {host}@{label}", wid=job_wid)
             break
         except (ComfyError, asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
             outcome = render_verdict(e)
@@ -17023,7 +17139,7 @@ async def handle_tts_speech(request):
             errors_list.append(f"{host}: {err} [{node}]")
             log.warning(f"tts: {host}: took the job then failed to render: {err} [{node}]")
             await broadcast_activity(host, tkey, "failed",
-                f"failure: {host} for {label} - render: {err}")
+                f"failure: {host}@{label} - render: {err}")
             # The node is what failed, not necessarily the host — but we only
             # detect one node per host, so forget the detection and let the
             # next probe pick differently.
@@ -18196,7 +18312,7 @@ async def handle_image_edit(request):
 
     async def attempt(host, wid, done):
         await broadcast_activity(host, ekey, "trying",
-            f"trying: {host} for {label}", wid=wid)
+            f"trying: {host}@{label}", wid=wid)
         t0 = time.time()
         try:
             info = await comfy_object_info(session, host)
@@ -18218,12 +18334,12 @@ async def handle_image_edit(request):
                 # momentarily unavailable). Not a failure and not a bad host: park it and
                 # retry with no penalty, and log it as busy rather than a failure.
                 await broadcast_activity(host, ekey, "warming",
-                    f"busy: {host} for {label} - {err} (retrying)",
+                    f"busy: {host}@{label} - {err} (retrying)",
                     duration=time.time() - t0, wid=wid)
                 return retry_later(err)
             errors.append(f"{host}: {err}")
             await broadcast_activity(host, ekey, "failed",
-                f"failure: {host} for {label} - {err}",
+                f"failure: {host}@{label} - {err}",
                 duration=time.time() - t0, wid=wid)
             if isinstance(e, ComfyUnsuitable):
                 return unsuitable(err)
@@ -18235,7 +18351,7 @@ async def handle_image_edit(request):
                 return unreachable_host(err)
             return failed(err)
         await broadcast_activity(host, ekey, "connected",
-            f"success: {host} for {label}", duration=time.time() - t0, wid=wid,
+            f"success: {host}@{label}", duration=time.time() - t0, wid=wid,
             rmodel=plan["model"])
         return accepted((host, prompt_id, plan, workflow))
 
@@ -18286,7 +18402,7 @@ async def handle_image_edit(request):
             # Not a host fault — no verdict — so fall straight to cleanup.
             stopped = True
             await broadcast_activity(host, ekey, "stopped",
-                f"stopped: {host} for {label}", wid=job_wid)
+                f"stopped: {host}@{label}", wid=job_wid)
             break
         except (ComfyError, asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
             outcome = render_verdict(e)
@@ -18308,7 +18424,7 @@ async def handle_image_edit(request):
                         f"  plan: {rig}\n"
                         f"  graph: {json.dumps(workflow)[:2000]}")
             await broadcast_activity(host, ekey, "failed",
-                f"failure: {host} for {label} - render: {err} [{rig}]")
+                f"failure: {host}@{label} - render: {err} [{rig}]")
             _set_worker_phase(job_wid, None)
             continue
 
@@ -19328,6 +19444,7 @@ def main():
     parser.add_argument("-c", "--config",   type=str, default="", metavar="DIR", help="data/cache directory (default: ~/.cache/free-ollama). Override it to run more than one dyva on a box.")
     parser.add_argument("-r", "--refresh", nargs="?", const=True, default=False, metavar="SOURCE", help="refresh cache (and cleanse fake/junk hosts), optionally limited to one source name (e.g. graflex, forrany, spider, happyshua)")
     parser.add_argument("--refresh-only", nargs="?", const=True, default=False, metavar="SOURCE", help="like --refresh but do NOT cleanse — keep everything, including the fake/imposter/phantom hosts")
+    parser.add_argument("--refresh-reference", nargs="*", default=None, metavar="SOURCE", help="refresh the externally-sourced reference JSONs from upstream in one go (prices from OpenRouter, release dates from Artificial Analysis) and rewrite them for you to review/commit; nothing routes or bills on them. Name sources to limit it, e.g. --refresh-reference prices dates; bare = all.")
     parser.add_argument("--cleanse", nargs="*", metavar="TYPE", help="expunge fake MODEL entries from the pool (hosts are never removed; removals logged to free-ollama.cleansed.json): '--cleanse' dry-run report of all; '--cleanse fake|cloud|junk|all [apply]' to act on one type")
     parser.add_argument("-w", "--workers",  type=int, default=3, help="number of workers (default: 3)")
     parser.add_argument("-l", "--local",    action="store_true", help="restrict inference endpoints to localhost only")
@@ -19368,6 +19485,10 @@ def main():
         ok = refresh_cache(src, cleanse=cleanse)
         log.info(("Refreshed cache" + ("" if cleanse else " (no cleanse)")) if ok else "Refresh failed")
         sys.exit(0 if ok else 1)
+
+    if args.refresh_reference is not None:
+        from dyva import refresh              # lazy: only when the flag is used
+        sys.exit(refresh.run(only=args.refresh_reference or None))
 
     banner()
     if args.version:

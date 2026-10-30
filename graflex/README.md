@@ -128,6 +128,11 @@ graflex -s ollama -a check-new -n ollama
 # Check all hosts (recheck everything, ignore previous results)
 graflex -s ollama -a check-all -n ollama
 
+# Re-probe an explicit host list from stdin (service looked up in the store, or
+# forced with -s). Pairs with jq/xargs fleet pipelines; lines may include a scheme.
+jq -r '.[].host' ~/.cache/free-ollama/ollama-working.json | graflex -a check-stdin
+echo http://1.2.3.4:11434 | graflex -a check-stdin -s ollama   # also onboards a new host
+
 # Dry run — shows plaintext queries instead of hitting FOFA
 graflex -s a1111 -a fetch -d
 # Print curl commands instead of executing
@@ -291,12 +296,21 @@ Sources at `graflex/graflex.sh`. Fair warning: fetching the ollama takes about 1
 | Service | Default Port | Check Endpoint |
 |---------|-------------|----------------|
 | `a1111` | 7860 | `/sdapi/v1/sd-models` |
+| `fooocus` | 7865 | `/v1/engines/all-models` |
 | `comfyui` | 8188 | `/models/checkpoints` + `/models` traversal + `/api/system_stats` |
+| `sillytavern` | 8000 | `/` (liveness by `<title>`) |
+| `gradio` | 7860 | `/config` (manifest; see named queries) |
 | `ollama` | 11434 | `/api/tags` |
-| `llama.cpp` | 8080 | `/v1/models` |
+| `llama.cpp` | 8080 | `/v1/models` (+ `/props`) |
 | `vllm` | 8000 | `/v1/models` |
 | `lmstudio` | 1234 | `/v1/models` |
 | `ds4` | 8080 | `/v1/models` |
+| `localai` | 8080 | `/v1/models` |
+| `strata` | 8001 | `/v1/models` |
+| `colibri` | 80 | `/v1/models` (OpenAI dialect; served on web ports) |
+
+`-s all` runs the action across every service in turn (each gets its own
+`<service>-*.json` cache), for automating the full pipeline.
 
 ## Named queries
 
@@ -418,12 +432,21 @@ recorded.
 
 | Action | Behavior |
 |--------|----------|
-| `check` | Skips hosts already in the working file (including empty-model ollama hosts) and hosts with `result: "error"` in the not-working file. Rechecks `unreachable` hosts. |
-| `check-new` | Skips all hosts with any previous record (working or not-working). Only checks hosts never tested before. |
-| `check-all` | Rechecks every host regardless of previous status. |
-| `check-working` | Re-surveys only the currently-working hosts: refreshes each host's model list (operators keep downloading new models) and prunes hosts that no longer respond, dropping them from the working file and recording them as not-working. On a resumed run (`-i`), hosts already snapshotted this session are kept in the pool untouched, not re-probed — and not dropped. |
+| `check` | Intentionally **undefined** — a bare `check` errors out and steers you to one of the explicit modes below, so a whole-pool probe can't be triggered by a slip of the keyboard. |
+| `check-new` | Skips all hosts with any previous record (working or not-working). Only checks hosts never tested before. With `-i <session>` it probes that session's freshly-fetched hosts; without it, the never-recorded hosts in the store. |
+| `check-everything` | Re-probe the stored pool **minus** the currently-working and the hard-errored (404 / auth / bad-JSON) — i.e. the never-checked and the previously-unreachable, the hosts that might have come back. |
+| `check-all` | Rechecks every host regardless of previous status, **including** known-good. The full, most expensive sweep. |
+| `check-working` | Re-surveys only the currently-working hosts: refreshes each host's model list (operators keep downloading new models) and prunes hosts that no longer respond, dropping them from the working file and recording them as not-working. Gentle — only a timeout demotes (a 404 / auth / refused means it answered, so it's left up). Skips hosts checked within the last hour (collision-safe). On a resumed run (`-i`), hosts already snapshotted this session are kept in the pool untouched, not re-probed — and not dropped. No `-s` (or `-s all`) sweeps every service. |
+| `check-zero` | Re-probe **only** the currently-working hosts recorded with zero models (to correct erroneous zeros after a discovery fix); every non-empty host is preserved untouched. |
+| `check-stdin` | Re-probe a newline-delimited `host:port` list read from stdin. Each host's service is looked up in the store, or forced with `-s` (which doubles as new-host onboarding); a host in no service with no `-s` is warned and skipped. Lines may carry a scheme/path (`http://h:p`, `https://h/`), which is stripped to the store key. Pairs with `jq \| xargs/parallel` fleet pipelines. |
 | `reconstruct` | Rebuild `{name}-working.json` **offline** from a check session's cached probe snapshots (`-i <session>`), for recovering a pool that got truncated. See *Recovering a truncated working pool*. |
+| `export` | Regenerate the `<service>-{working,notworking,hosts}.json` files from the store (the DB is the source of truth). `-s all` does every one. |
 | `classify` | Bucket every model of every host in `{name}-working.json` by type. See below. |
+
+Other actions mine or reshape the stores rather than probe: `survey` (build the
+per-model knowledge base in `survey.json`), `score-bogus` (stamp honeypot-clone
+`bogus_score`s), `sample` (draw `graflex-mini.json`), `strip` (drop trivially-rebuilt
+fields to shrink the caches). Run `graflex --help` for the full breakdown.
 
 Working: `~/.cache/free-ollama/{name}-working.json` (default: `image-gen-working.json`)
 Failed:  `~/.cache/free-ollama/{name}-notworking.json` (default: `image-gen-notworking.json`)
@@ -526,8 +549,8 @@ the live, volatile thing (what node classes exist) to submit time.
 
 | Flag | Description |
 |------|-------------|
-| `-s`, `--service` | Service to search for (`a1111`, `comfyui`, `ollama`, `llama.cpp`, `vllm`, `lmstudio`, `ds4`) |
-| `-a`, `--action` | Action: `fetch`, `check`, `check-new`, `check-all`, `check-working`, `reconstruct`, `fetch-check`, or `classify` |
+| `-s`, `--service` | Service to search for (`a1111`, `fooocus`, `comfyui`, `sillytavern`, `gradio`, `ollama`, `llama.cpp`, `vllm`, `lmstudio`, `ds4`, `localai`, `strata`, `colibri`), or `all` to run every service in turn |
+| `-a`, `--action` | Action: `fetch`, `fetch-check`, `check-new`, `check-everything`, `check-all`, `check-working`, `check-zero`, `check-stdin`, `reconstruct`, `export`, `classify`, `enrich`, `survey`, `score-bogus`, `sample`, `strip` (bare `check` is intentionally undefined) |
 | `-d`, `--dry` | Print what would be done without making requests |
 | `--curlify` | Print curl command instead of executing (useful for debugging requests) |
 | `-q`, `--query` | Custom FOFA query (requires `--name`) |
@@ -541,7 +564,7 @@ the live, volatile thing (what node classes exist) to submit time.
 | `--ct`, `--check-timeout` | Per-host check timeout in seconds (default: 60) |
 | `-z`, `--sleep` | Seconds to sleep between requests (default: 4) |
 | `-r`, `--random` | Shuffle the combination list (countries × ports × servers plus the FID follow-ups) so the fetch cycles in random order |
-| `-t`, `--site` | Site to scrape: `fofa` (default), `shodan`, or `zoomeye`; recorded as `site` on each host entry |
+| `-t`, `--site` | Site to scrape: `fofa` (default), `shodan`, `zoomeye`, `censys`, or `hunter`; recorded as `site` on each host entry |
 
 ## Field notes: host exposure patterns
 

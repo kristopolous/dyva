@@ -3519,6 +3519,26 @@ def check_working(service, name=None, check_timeout=60, workers=10, session=None
     asyncio.run(_check_working(service, name, check_timeout, workers, session, only_zero))
 
 
+def _stdin_hostport(line):
+    """Normalize one check-stdin line to a bare host[:port] key. Accepts an optional
+    scheme and trailing path — http://h:p, https://h/, h:p, or bare h — and strips the
+    scheme and path. When a scheme is present but no explicit port is, the scheme's
+    default port is filled in (https->443, http->80) so the line still resolves to a
+    host:port store key; a schemeless, portless host is left bare for the per-service
+    default port to apply at probe time."""
+    s = line.strip()
+    scheme = None
+    if "://" in s:
+        scheme, s = s.split("://", 1)
+        scheme = scheme.lower()
+    s = s.split("/", 1)[0].strip()          # drop any path / trailing slash
+    if not s:
+        return ""
+    if scheme in ("http", "https") and ":" not in s:
+        s = f"{s}:{443 if scheme == 'https' else 80}"
+    return s
+
+
 def check_stdin(service=None, check_timeout=60, workers=10, session=None):
     """Re-probe an explicit newline-delimited host list read from stdin — the
     composable, open-ended member of the pool-rescan family (no FOFA query; just
@@ -3536,6 +3556,9 @@ def check_stdin(service=None, check_timeout=60, workers=10, session=None):
       - a host that resolves to no service and has no -s is warned and skipped, so a
         single stray line never kills the run.
 
+    Each line may carry an optional scheme and path (http://h:p, https://h/, h:p, or
+    bare h); the scheme and path are stripped to the host:port store key.
+
     Hosts probe exactly as `check` does: a box that answers as its service records
     working, anything else notworking+reason — soft-deleted (row + payload kept), so
     a transient failure self-heals on the next successful probe."""
@@ -3551,10 +3574,13 @@ def check_stdin(service=None, check_timeout=60, workers=10, session=None):
     hosts, _seen = [], set()
     for ln in _sys.stdin:
         ln = ln.strip()
-        if not ln or ln.startswith("#") or ln in _seen:
+        if not ln or ln.startswith("#"):
             continue
-        _seen.add(ln)
-        hosts.append(ln)
+        hp = _stdin_hostport(ln)          # accept http://h:p / https://h / h:p / h
+        if not hp or hp in _seen:
+            continue
+        _seen.add(hp)
+        hosts.append(hp)
     if not hosts:
         log.warning("check-stdin: no hosts on stdin")
         return
@@ -4286,7 +4312,71 @@ def main():
     )
     _install_mem_dump()   # kill -USR1 <pid> for a live memory snapshot
 
-    parser = argparse.ArgumentParser(description="Discover public image-generation hosts via FOFA")
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="""\
+Discover and vet public inference hosts via FOFA (and Shodan/ZoomEye/Censys/hunter.how).
+
+A run is one --action (-a). The check-* actions all RE-PROBE hosts already in the store
+(no FOFA query is made); they differ only in WHICH hosts they pick:
+
+  check-new         the light pass right after a fetch: with -i <session>, this
+                    session's freshly-fetched hosts; without it, the never-recorded
+                    hosts in the store. Hosts already probed are skipped either way.
+  check-everything  re-probe the stored pool MINUS the currently-working and the
+                    hard-errored (404 / auth / bad-JSON) — i.e. the never-checked and
+                    the previously-unreachable, the hosts that might have come back.
+  check-all         re-probe EVERY host in the store, INCLUDING known-good. The full
+                    sweep, and the most expensive.
+  check-working     re-survey only the currently-working hosts: refresh their model
+                    lists and prune the dead. Gentle — only a timeout demotes (a 404 /
+                    auth / refused means the host answered, so it's left up). Skips
+                    hosts checked within the last hour (collision-safe). No -s, or
+                    -s all, sweeps every service in turn.
+  check-zero        re-probe ONLY the working hosts recorded with zero models (to
+                    correct erroneous zeros after a discovery fix); every non-empty
+                    host is preserved untouched.
+  check-stdin       re-probe a newline-delimited host:port list read from stdin. Each
+                    host's service is looked up in the store, or forced with -s (which
+                    doubles as new-host onboarding); a host in no service with no -s is
+                    warned and skipped. Pairs with jq | xargs/parallel fleet pipelines.
+
+  (bare 'check' is intentionally undefined: the big sweep must be named explicitly, so
+   you can't trigger a whole-pool probe with a slip of the keyboard.)
+
+The other actions find hosts, reshape the stores, or mine the snapshots:
+
+  fetch             scrape the search site (FOFA by default; -t for Shodan / ZoomEye /
+                    Censys / hunter.how) for hosts matching the service's query, cycling
+                    country / port / server / FID combos (-c / -p / -e / -f; -r to
+                    shuffle), and record each as discovered. -d dry-runs without saving;
+                    --curlify prints the request instead of sending it.
+  fetch-check       fetch and probe in one pass — each page's new hosts are checked as
+                    they are found, so results land while the sweep is still running.
+  classify          tag each host's models against the model-classifier taxonomy
+                    (comfyui by default); gradio hosts are bucketed by app purpose
+                    instead. Writes the labels back onto the working file.
+  enrich            stamp country / ASN / cloud-provider onto a service's working hosts
+                    (the feed dyva serves). Offline but for DB-IP's monthly download;
+                    idempotent — re-stamps only stale records. Also takes a bare FILE
+                    (see below) to enrich an arbitrary JSON file in place.
+  survey            mine the saved probe snapshots into survey.json — a per-model
+                    knowledge base (disk size, digest) built from real observations, not
+                    guessed from names. Accumulates: with -i it folds in one sweep,
+                    without it rebuilds from every session.
+  reconstruct       rebuild <name>-working.json OFFLINE from a check session's cached
+                    snapshots (-i <session> required) — recovery for a truncated pool,
+                    with no re-probing. Merges newest-wins; follow with check-working.
+  export            regenerate the <service>-{working,notworking,hosts}.json files from
+                    the store (the DB is the source of truth). -s all does every one.
+  score-bogus       stamp a per-host bogus_score onto the working file(s) from confirmed
+                    honeypot-clone fingerprints matched against a session's snapshots.
+                    Purely additive, recomputed every run; dyva routes bogus-ascending.
+  sample            draw the stratified sample platter into graflex-mini.json and exit
+                    (read-only over the survey files but for that one output).
+  strip             shrink ~/.cache/free-ollama/*.json by dropping trivially-rebuilt
+                    fields (derived geo; the redundant service / host in notworking
+                    files) — not data loss: geo re-derives with enrich.""")
     parser.add_argument("--ct", "--check-timeout", dest="check_timeout", type=int, default=60, help="per-host check timeout in seconds (default: 60)")
     parser.add_argument("--curlify", action="store_true", help="print curl command instead of executing")
     parser.add_argument("-a", "--action", choices=["fetch", "check", "check-new", "check-everything", "check-all", "check-working", "check-zero", "check-stdin", "fetch-check", "classify", "enrich", "survey", "reconstruct", "export", "score-bogus", "sample", "strip"], required=True, help="action to perform. check-new = this session's newly-fetched hosts (light); check-everything = re-probe the whole stored pool; check-all = the whole pool INCLUDING known-good; check-stdin = re-probe a newline-delimited host list on stdin (per-host service looked up in the store, or forced with -s). Bare 'check' is intentionally undefined (the big sweep must be asked for explicitly).")
