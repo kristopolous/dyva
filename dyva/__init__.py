@@ -3809,6 +3809,17 @@ _session_skip_hosts = set()
 # exclusive — favoring discards a skip, skipping discards a favor).
 _session_prefer_hosts = set()
 
+# (norm-host, resolved-model) pairs that answered with ONLY reasoning — the whole reply
+# went into the `thinking` channel and `content` came back empty (an ollama/custom-GGUF
+# template bug: the model reasons but never emits the answer). think:false fixes it. We
+# learn this from the symptom (a done chunk with no content and no tool call), retry that
+# turn once with thinking off, and remember the pairing here so every later request to it
+# starts with think:false — no repeated wasted pass. Session-scoped and non-persistent ON
+# PURPOSE: the bug is versioned (service + ollama version + model), too messy to track
+# precisely, so a restart is the reset (the model may have been re-pulled/fixed). This is
+# NOT a reputation signal — the host answered fine; it never touches host-status.
+_session_no_think = set()
+
 
 def mark_honeypot(host, reason=None):
     """Condemn a whole MACHINE as a honeypot: it answered the smoke probe with a
@@ -4376,17 +4387,28 @@ def load_model_prices():
     return _model_prices
 
 
+def price_family_key(name, family_keys):
+    """The price family that governs a model NAME: the LONGEST family key that
+    appears in the lowercased name (so 'ibm-granite' beats a stray 'granite', and
+    'qwen2.5:7b' -> 'qwen'); None if none match. This is the SINGLE source of the
+    rule — both _price_of (the runtime lookup) and tools-side refresh_prices (which
+    buckets the OpenRouter catalog to regenerate the file) call it, so the refresher
+    groups models the exact way the live lookup will later match them."""
+    low = str(name or "").lower()
+    for fam in sorted(family_keys, key=len, reverse=True):
+        if fam in low:
+            return fam
+    return None
+
+
 def _price_of(name):
     """Reference rate for a model NAME: the first family key that appears in the
     lowercased name wins (so 'qwen2.5:7b' -> qwen), else the default. None if no
     prices are loaded at all. Longest family key first, so 'ibm-granite' beats a
     stray 'granite' substring match."""
     pr = load_model_prices()
-    low = str(name or "").lower()
-    for fam in sorted(pr["families"], key=len, reverse=True):
-        if fam in low:
-            return pr["families"][fam]
-    return pr["default"]
+    fam = price_family_key(name, pr["families"])
+    return pr["families"][fam] if fam is not None else pr["default"]
 
 
 _SIZE_MULT = {"k": 1e3, "m": 1e6, "g": 1e9, "t": 1e12}
@@ -6623,11 +6645,18 @@ async def _send_chat(session, host, full, payload, endpoint, do_stream, timeout=
         if payload.get("_dyva_continue"):
             p = _apply_continuation(p, payload["_dyva_continue"], host, attempt_oai)
             _cont_prefill = bool(p.get("continue_final_message"))
+        # Preemptive: a (host, model) we already caught answering with ONLY reasoning
+        # (empty content — the thinking-channel bug) starts every later request with
+        # thinking off, so we never pay the wasted first pass again this runtime. The
+        # caller's explicit think wins; this only fires when think wasn't set.
+        _think = payload.get("think")
+        if _think is None and (_norm_host(host), full) in _session_no_think:
+            _think = False
         # think:false has no universal off-switch, so STACK every known lever per
         # dialect (the way llcat's -nt does) — each backend ignores the ones it
         # doesn't recognise. The native `think` field is kept for Ollama but stripped
         # for OpenAI by openai_payload below, so a strict OpenAI host won't 400 on it.
-        if payload.get("think") is False:
+        if _think is False:
             p = _apply_no_think(p)                 # Qwen3 /no_think prompt token (rides in the text, any dialect)
             if attempt_oai:
                 p["reasoning_effort"] = "low"                          # OpenAI / LiteLLM
@@ -7535,6 +7564,14 @@ def _stream_deadline(started, worker_max):
     return started + worker_max
 
 
+def _is_empty_answer(partial):
+    """A completion that delivered NOTHING to the client — no content and no tool-call
+    args — which for a thinking model is the thinking-channel bug: the whole answer went
+    to `thinking` and `content` came back empty. A tool-only turn has partial[1] > 0 (not
+    empty); a normal answer has content (not empty)."""
+    return not (partial[0] or "").strip() and (len(partial) < 2 or partial[1] == 0)
+
+
 async def _pump_stream(response, resp, first_line, host, full, openai_format,
                        upstream_openai, wid, num_ctx, partial, cancel=None):
     """Forward ONE already-won upstream stream to the already-prepared client
@@ -7626,6 +7663,8 @@ async def _pump_stream(response, resp, first_line, host, full, openai_format,
             await account_tokens(wid, host, full, _fobj, num_ctx)
             if _fobj.get("done_reason") == "length":
                 return "length"
+            if _is_empty_answer(partial):
+                return "empty"      # answer went to the thinking channel — swallow done, let caller retry
             if openai_format:
                 fin = _fobj.get("done_reason") or "stop"
                 if tool_phase[0] and fin == "stop":
@@ -7731,6 +7770,8 @@ async def _pump_stream(response, resp, first_line, host, full, openai_format,
                 # client gets a finish with nothing. The native path already forwards the
                 # raw line, which includes it.
                 accum(obj)
+                if _is_empty_answer(partial):
+                    return "empty"      # answer went to the thinking channel — swallow done, let caller retry
                 if openai_format:
                     m = _openai_reasoning(dict((obj or {}).get("message", {})))
                     tcs = m.pop("tool_calls", None)
@@ -7789,8 +7830,15 @@ async def _forward_stream(request, response, resp, first_line, host, full, opena
         log.debug("Client disconnected before response headers sent")
         await resp.release()
         return
-    await _pump_stream(response, resp, first_line, host, full, openai_format,
-                       upstream_openai, wid, num_ctx, ["", 0])
+    # This path has no continue/retry machinery, so any status that SWALLOWED the
+    # upstream done ('length'/'truncated'/'capped'/'empty', or an operator 'stopped')
+    # would leave the client hanging. Close the stream with a terminal done unless it
+    # already ended cleanly ('done') or the client is gone ('client').
+    status = await _pump_stream(response, resp, first_line, host, full, openai_format,
+                                upstream_openai, wid, num_ctx, ["", 0])
+    if status not in ("done", "client"):
+        with contextlib.suppress(Exception):
+            await _write_terminal_done(response, full, openai_format)
 
 
 async def _write_terminal_done(response, full, openai_format):
@@ -8006,6 +8054,7 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
     payload = opayload
     dead = set()          # hosts that dropped the CONNECTION — don't retry those
     continues = 0
+    _no_think_retried = False   # one-shot: retry once with think:false on an empty (thinking-only) answer
     while True:
         mark_worker_found(job_wid, host, full)
         # Re-arm the manual-stop handle for THIS streaming leg. _race_hosts swaps in its
@@ -8041,6 +8090,36 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
                 await _write_terminal_done(response, full, openai_format)
             break
         if status in ("done", "client"):
+            break
+        if status == "empty":
+            # Finished cleanly but delivered NOTHING — the whole answer went into the
+            # thinking channel and content came back empty (the ollama/custom-GGUF
+            # thinking bug). think:false fixes it. The host ANSWERED, so it's not at
+            # fault — don't penalise it: learn the (host, model) for the session and
+            # retry the SAME pool once with thinking off. One shot — if it's still empty
+            # with think off, it genuinely produced nothing, so end cleanly.
+            if _no_think_retried:
+                with contextlib.suppress(Exception):
+                    await _write_terminal_done(response, full, openai_format)
+                break
+            _no_think_retried = True
+            _session_no_think.add((_norm_host(host), full))
+            payload = dict(payload, think=False)
+            partial = ["", 0]
+            await broadcast_activity(host, full, "warming",
+                f"{host}@{full} answered only in the thinking channel — retrying with thinking off",
+                wid=job_wid)
+            remaining = [s for s in servers if s[1] not in dead]
+            continues += 1
+            if continues <= MAX_STREAM_CONTINUES and remaining:
+                result2, _errs, _stopped = await _race_servers(
+                    session, model, remaining, payload, do_stream=True,
+                    remote=request.remote, caps=req_caps, job_wid=job_wid, hedge_delay=HEDGE_DELAY)
+                if result2:
+                    _, host, full, resp, first_line, _first, oai = result2
+                    continue
+            with contextlib.suppress(Exception):
+                await _write_terminal_done(response, full, openai_format)
             break
         made = len(partial[0]) + partial[1]   # real progress: content + tool-call args
         # Two kinds of mid-stream truncation, both continued on the SAME open client
@@ -19365,6 +19444,7 @@ def main():
     parser.add_argument("-c", "--config",   type=str, default="", metavar="DIR", help="data/cache directory (default: ~/.cache/free-ollama). Override it to run more than one dyva on a box.")
     parser.add_argument("-r", "--refresh", nargs="?", const=True, default=False, metavar="SOURCE", help="refresh cache (and cleanse fake/junk hosts), optionally limited to one source name (e.g. graflex, forrany, spider, happyshua)")
     parser.add_argument("--refresh-only", nargs="?", const=True, default=False, metavar="SOURCE", help="like --refresh but do NOT cleanse — keep everything, including the fake/imposter/phantom hosts")
+    parser.add_argument("--refresh-reference", nargs="*", default=None, metavar="SOURCE", help="refresh the externally-sourced reference JSONs from upstream in one go (prices from OpenRouter, release dates from Artificial Analysis) and rewrite them for you to review/commit; nothing routes or bills on them. Name sources to limit it, e.g. --refresh-reference prices dates; bare = all.")
     parser.add_argument("--cleanse", nargs="*", metavar="TYPE", help="expunge fake MODEL entries from the pool (hosts are never removed; removals logged to free-ollama.cleansed.json): '--cleanse' dry-run report of all; '--cleanse fake|cloud|junk|all [apply]' to act on one type")
     parser.add_argument("-w", "--workers",  type=int, default=3, help="number of workers (default: 3)")
     parser.add_argument("-l", "--local",    action="store_true", help="restrict inference endpoints to localhost only")
@@ -19405,6 +19485,10 @@ def main():
         ok = refresh_cache(src, cleanse=cleanse)
         log.info(("Refreshed cache" + ("" if cleanse else " (no cleanse)")) if ok else "Refresh failed")
         sys.exit(0 if ok else 1)
+
+    if args.refresh_reference is not None:
+        from dyva import refresh              # lazy: only when the flag is used
+        sys.exit(refresh.run(only=args.refresh_reference or None))
 
     banner()
     if args.version:

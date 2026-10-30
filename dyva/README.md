@@ -222,6 +222,30 @@ that comes back with more room re-earns its place automatically. This is the hos
 window; our *own* under-sized window is a different thing — that one is grown and
 the request reissued (see Context window).
 
+### Thinking-only answers (empty reply)
+
+Some reasoning models — typically a custom GGUF imported into Ollama (e.g.
+`hf.co/…/Nanbeige4.3-33B-GGUF`) — stream their **entire** answer into the `thinking`
+channel and leave `content` empty, so the reply renders blank even though the model
+clearly did work. It's a chat-template / thinking-parser bug in that
+*(service, version, model)* combination, not a host fault: the host answered fine, so
+it is **never** penalised, and the same model served by a different stack may be fine.
+
+`think:false` fixes it (the model then emits the answer directly, tool calls included).
+But you can't tell from a model's metadata that it will misbehave — plenty of models
+declare the `thinking` capability and work perfectly — so dyva keys off the **symptom**,
+not the cause: when a stream finishes with no content *and* no tool call, it retries the
+same host **once** with thinking turned off, on the same client connection. A tool-only
+turn or any real content is not "empty", so a healthy answer is never retried.
+
+Because the bug is versioned and the pool churns, that learning is **session-scoped and
+in-memory**: the `(host, model)` pairing is remembered only for the life of the process,
+so every *later* request to it starts with `think:false` and skips the wasted first pass —
+a one-time cost per runtime. A restart is the reset (the model may have been re-pulled or
+fixed); nothing is persisted, and none of this touches host reputation. (In practice
+dyva's `num_ctx` sizing — larger than Ollama's 4096 default — often sidesteps the bug on
+its own, so the retry fires less than you'd expect.)
+
 ### Deprioritise / favour (👎 / 👍)
 
 Reputation self-heals: a host that fails and later succeeds climbs back on its own.
