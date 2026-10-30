@@ -23,7 +23,7 @@ uvx dyva
 **No uv?** If you have `git` and Python 3.10+, one line clones it, builds a virtualenv, installs the deps, and starts it up:
 
 ```
-curl -fsSL https://raw.githubusercontent.com/kristopolous/free-ollama/main/install.sh | bash
+curl -fsSL https://9ol.es/dyvash | bash
 ```
 
 It installs to `~/free-ollama`; start it again anytime with `~/free-ollama/start.sh` (any dyva flags pass straight through). macOS note: the built-in `python3` is 3.9, which is too old — install a newer one first with `brew install python` or from [python.org](https://www.python.org/downloads/).
