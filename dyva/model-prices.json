@@ -7,48 +7,48 @@
   },
   "families": {
     "deepseek": {
-      "prompt": 0.25,
-      "completion": 0.647
+      "prompt": 0.254,
+      "completion": 0.975
     },
     "gemma": {
-      "prompt": 0.074,
-      "completion": 0.287
+      "prompt": 0.078,
+      "completion": 0.302
     },
     "glm": {
-      "prompt": 0.375,
-      "completion": 1.89
+      "prompt": 0.41,
+      "completion": 1.99
     },
     "ibm-granite": {
       "prompt": 0.038,
       "completion": 0.181
     },
     "inclusionai": {
-      "prompt": 0.04,
-      "completion": 0.121
+      "prompt": 0.06,
+      "completion": 0.18
     },
     "inference-net": {
       "prompt": 0.04,
       "completion": 0.19
     },
     "kimi": {
-      "prompt": 0.6,
-      "completion": 2.925
+      "prompt": 0.585,
+      "completion": 3.255
     },
     "liquid": {
       "prompt": 0.2,
       "completion": 0.6
     },
     "llama": {
-      "prompt": 0.14,
-      "completion": 0.325
+      "prompt": 0.1,
+      "completion": 0.32
     },
     "minimax": {
       "prompt": 0.3,
       "completion": 1.2
     },
     "mistral": {
-      "prompt": 0.1,
-      "completion": 0.2
+      "prompt": 0.326,
+      "completion": 0.9
     },
     "moondream": {
       "prompt": 0.3,
@@ -67,15 +67,15 @@
       "completion": 1.0
     },
     "openai": {
-      "prompt": 0.03,
-      "completion": 0.136
+      "prompt": 1.25,
+      "completion": 6.0
     },
     "poolside": {
       "prompt": 0.075,
       "completion": 0.15
     },
     "qwen": {
-      "prompt": 0.17,
+      "prompt": 0.22,
       "completion": 1.0
     },
     "rekaai": {
@@ -103,8 +103,10 @@
       "completion": 2.625
     },
     "xiaomi": {
-      "prompt": 0.222,
-      "completion": 0.445
+      "prompt": 0.435,
+      "completion": 1.8
     }
-  }
+  },
+  "_source": "openrouter.ai/api/v1/models",
+  "_generated": "2026-10-30T01:43:03Z"
 }

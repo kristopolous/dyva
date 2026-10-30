@@ -1,7 +1,7 @@
 {
-  "_count": 226,
-  "_generated": "2026-09-09T16:04:29",
-  "_source": "local ollama.com wget mirror",
+  "_count": 248,
+  "_generated": "2026-10-30T01:43:28Z",
+  "_source": "ollama.com/library (incremental, newest-first)",
   "models": {
     "alfred": {
       "latest": {
@@ -901,6 +901,162 @@
           "params_b": 0.567,
           "quant": "F16",
           "size_str": "1.2GB"
+        }
+      }
+    },
+    "bonsai-2": {
+      "latest": {
+        "bytes": 3200000000,
+        "digest": "c8b5462f8688",
+        "params_b": 9.0,
+        "size_str": "3.2GB"
+      },
+      "tags": {
+        "27b": {
+          "bytes": 8300000000,
+          "digest": "f3c4f4208659",
+          "params_b": 27.0,
+          "size_str": "8.3GB"
+        },
+        "27b-q2_0": {
+          "bytes": 8300000000,
+          "digest": "f3c4f4208659",
+          "params_b": 27.0,
+          "size_str": "8.3GB"
+        },
+        "2b": {
+          "bytes": 911000000,
+          "digest": "de2ccb4e7328",
+          "params_b": 2.0,
+          "size_str": "911MB"
+        },
+        "2b-q2_0": {
+          "bytes": 911000000,
+          "digest": "de2ccb4e7328",
+          "params_b": 2.0,
+          "size_str": "911MB"
+        },
+        "4b": {
+          "bytes": 1600000000,
+          "digest": "93edd652c932",
+          "params_b": 4.0,
+          "size_str": "1.6GB"
+        },
+        "4b-q2_0": {
+          "bytes": 1600000000,
+          "digest": "93edd652c932",
+          "params_b": 4.0,
+          "size_str": "1.6GB"
+        },
+        "9b": {
+          "bytes": 3200000000,
+          "digest": "c8b5462f8688",
+          "params_b": 9.0,
+          "size_str": "3.2GB"
+        },
+        "9b-q2_0": {
+          "bytes": 3200000000,
+          "digest": "c8b5462f8688",
+          "params_b": 9.0,
+          "size_str": "3.2GB"
+        },
+        "latest": {
+          "bytes": 3200000000,
+          "digest": "c8b5462f8688",
+          "params_b": 9.0,
+          "size_str": "3.2GB"
+        }
+      }
+    },
+    "clef": {
+      "latest": {
+        "bytes": 18000000000,
+        "digest": "fdd5939e1bd9",
+        "params_b": 27.0,
+        "size_str": "18GB"
+      },
+      "tags": {
+        "27b": {
+          "bytes": 18000000000,
+          "digest": "fdd5939e1bd9",
+          "params_b": 27.0,
+          "size_str": "18GB"
+        },
+        "27b-mlx-bf16": {
+          "bytes": 55000000000,
+          "digest": "3f0f84ddfcf6",
+          "params_b": 27.0,
+          "size_str": "55GB"
+        },
+        "27b-mxfp8": {
+          "bytes": 31000000000,
+          "digest": "7322db586141",
+          "params_b": 27.0,
+          "size_str": "31GB"
+        },
+        "27b-nvfp4": {
+          "bytes": 18000000000,
+          "digest": "d1f6eb2a43fa",
+          "params_b": 27.0,
+          "size_str": "18GB"
+        },
+        "27b-q4_K_M": {
+          "bytes": 20000000000,
+          "digest": "7885241a86db",
+          "params_b": 27.0,
+          "size_str": "20GB"
+        },
+        "27b-q8_0": {
+          "bytes": 30000000000,
+          "digest": "b3d9f9fe2a55",
+          "params_b": 27.0,
+          "size_str": "30GB"
+        },
+        "latest": {
+          "bytes": 18000000000,
+          "digest": "fdd5939e1bd9",
+          "params_b": 27.0,
+          "size_str": "18GB"
+        }
+      }
+    },
+    "clef-flash": {
+      "latest": {
+        "bytes": 11000000000,
+        "digest": "8f7e6863135c",
+        "params_b": 9.0,
+        "size_str": "11GB"
+      },
+      "tags": {
+        "9b": {
+          "bytes": 11000000000,
+          "digest": "8f7e6863135c",
+          "params_b": 9.0,
+          "size_str": "11GB"
+        },
+        "9b-mlx-bf16": {
+          "bytes": 19000000000,
+          "digest": "15dbbaceebaa",
+          "params_b": 9.0,
+          "size_str": "19GB"
+        },
+        "9b-mxfp8": {
+          "bytes": 12000000000,
+          "digest": "bc72638064ee",
+          "params_b": 9.0,
+          "size_str": "12GB"
+        },
+        "9b-q8_0": {
+          "bytes": 11000000000,
+          "digest": "73e026ff389b",
+          "params_b": 9.0,
+          "size_str": "11GB"
+        },
+        "latest": {
+          "bytes": 11000000000,
+          "digest": "8f7e6863135c",
+          "params_b": 9.0,
+          "size_str": "11GB"
         }
       }
     },
@@ -3575,6 +3731,222 @@
           "params_b": 8.03,
           "quant": "Q4_K_M",
           "size_str": "5.1GB"
+        }
+      }
+    },
+    "d1": {
+      "latest": {
+        "bytes": 3700000000,
+        "digest": "8c2d9ddae441",
+        "params_b": 3.0,
+        "size_str": "3.7GB"
+      },
+      "tags": {
+        "2b": {
+          "bytes": 3900000000,
+          "digest": "a3b89e90e6a3",
+          "params_b": 2.0,
+          "size_str": "3.9GB"
+        },
+        "2b-mlx-bf16": {
+          "bytes": 3900000000,
+          "digest": "a3b89e90e6a3",
+          "params_b": 2.0,
+          "size_str": "3.9GB"
+        },
+        "2b-mxfp8": {
+          "bytes": 2400000000,
+          "digest": "52dfb1fc6ba6",
+          "params_b": 2.0,
+          "size_str": "2.4GB"
+        },
+        "2b-nvfp4": {
+          "bytes": 1700000000,
+          "digest": "82c19b76395a",
+          "params_b": 2.0,
+          "size_str": "1.7GB"
+        },
+        "3b": {
+          "bytes": 3700000000,
+          "digest": "8c2d9ddae441",
+          "params_b": 3.0,
+          "size_str": "3.7GB"
+        },
+        "3b-q8_0": {
+          "bytes": 3700000000,
+          "digest": "8c2d9ddae441",
+          "params_b": 3.0,
+          "size_str": "3.7GB"
+        },
+        "latest": {
+          "bytes": 3700000000,
+          "digest": "8c2d9ddae441",
+          "params_b": 3.0,
+          "size_str": "3.7GB"
+        }
+      }
+    },
+    "d1-omni": {
+      "latest": {
+        "bytes": 850000000,
+        "digest": "1ba59f63e836",
+        "params_b": 0.6,
+        "size_str": "850MB"
+      },
+      "tags": {
+        "2b": {
+          "bytes": 4400000000,
+          "digest": "5f8373a90ed1",
+          "params_b": 2.0,
+          "size_str": "4.4GB"
+        },
+        "2b-mlx-bf16": {
+          "bytes": 4400000000,
+          "digest": "5f8373a90ed1",
+          "params_b": 2.0,
+          "size_str": "4.4GB"
+        },
+        "2b-mxfp8": {
+          "bytes": 2900000000,
+          "digest": "a1fa476acb76",
+          "params_b": 2.0,
+          "size_str": "2.9GB"
+        },
+        "2b-nvfp4": {
+          "bytes": 2200000000,
+          "digest": "c8f8b36e4c26",
+          "params_b": 2.0,
+          "size_str": "2.2GB"
+        },
+        "600m": {
+          "bytes": 850000000,
+          "digest": "1ba59f63e836",
+          "params_b": 0.6,
+          "size_str": "850MB"
+        },
+        "600m-bf16": {
+          "bytes": 1200000000,
+          "digest": "c1e95fce6627",
+          "params_b": 0.6,
+          "size_str": "1.2GB"
+        },
+        "600m-q8_0": {
+          "bytes": 850000000,
+          "digest": "1ba59f63e836",
+          "params_b": 0.6,
+          "size_str": "850MB"
+        },
+        "latest": {
+          "bytes": 850000000,
+          "digest": "1ba59f63e836",
+          "params_b": 0.6,
+          "size_str": "850MB"
+        }
+      }
+    },
+    "d3": {
+      "latest": {
+        "bytes": 5600000000,
+        "digest": "50e469b6b0e6",
+        "params_b": 4.0,
+        "size_str": "5.6GB"
+      },
+      "tags": {
+        "27b": {
+          "bytes": 29000000000,
+          "digest": "bc873824c9ed",
+          "params_b": 27.0,
+          "size_str": "29GB"
+        },
+        "27b-mxfp8": {
+          "bytes": 29000000000,
+          "digest": "d3388a380a7c",
+          "params_b": 27.0,
+          "size_str": "29GB"
+        },
+        "27b-nvfp4": {
+          "bytes": 17000000000,
+          "digest": "b93588ba7385",
+          "params_b": 27.0,
+          "size_str": "17GB"
+        },
+        "27b-q8_0": {
+          "bytes": 30000000000,
+          "digest": "bdde0a6212d6",
+          "params_b": 27.0,
+          "size_str": "30GB"
+        },
+        "2b": {
+          "bytes": 3100000000,
+          "digest": "b31336d5e0cc",
+          "params_b": 2.0,
+          "size_str": "3.1GB"
+        },
+        "2b-mxfp8": {
+          "bytes": 3100000000,
+          "digest": "dbf58974e0fe",
+          "params_b": 2.0,
+          "size_str": "3.1GB"
+        },
+        "2b-q8_0": {
+          "bytes": 3200000000,
+          "digest": "e1b3991aa480",
+          "params_b": 2.0,
+          "size_str": "3.2GB"
+        },
+        "4b": {
+          "bytes": 5600000000,
+          "digest": "50e469b6b0e6",
+          "params_b": 4.0,
+          "size_str": "5.6GB"
+        },
+        "4b-mxfp8": {
+          "bytes": 5600000000,
+          "digest": "9cd750f6fa24",
+          "params_b": 4.0,
+          "size_str": "5.6GB"
+        },
+        "4b-nvfp4": {
+          "bytes": 4000000000,
+          "digest": "de276ebc958a",
+          "params_b": 4.0,
+          "size_str": "4.0GB"
+        },
+        "4b-q8_0": {
+          "bytes": 5800000000,
+          "digest": "2c571f91caf6",
+          "params_b": 4.0,
+          "size_str": "5.8GB"
+        },
+        "9b": {
+          "bytes": 10000000000,
+          "digest": "6e6c5ab6ce3a",
+          "params_b": 9.0,
+          "size_str": "10GB"
+        },
+        "9b-mxfp8": {
+          "bytes": 10000000000,
+          "digest": "518acc51965d",
+          "params_b": 9.0,
+          "size_str": "10GB"
+        },
+        "9b-nvfp4": {
+          "bytes": 7700000000,
+          "digest": "9816d390dd1f",
+          "params_b": 9.0,
+          "size_str": "7.7GB"
+        },
+        "9b-q8_0": {
+          "bytes": 10000000000,
+          "digest": "0f459473f035",
+          "params_b": 9.0,
+          "size_str": "10GB"
+        },
+        "latest": {
+          "bytes": 5600000000,
+          "digest": "50e469b6b0e6",
+          "params_b": 4.0,
+          "size_str": "5.6GB"
         }
       }
     },
@@ -7481,6 +7853,142 @@
         }
       }
     },
+    "embeddinggemma-2": {
+      "latest": {
+        "bytes": 1300000000,
+        "digest": "1f30cabe5af7",
+        "params_b": 0.74,
+        "size_str": "1.3GB"
+      },
+      "tags": {
+        "270m": {
+          "bytes": 304000000,
+          "digest": "ff630aa67948",
+          "params_b": 0.27,
+          "size_str": "304MB"
+        },
+        "270m-bf16-text": {
+          "bytes": 574000000,
+          "digest": "afeb999480b2",
+          "params_b": 0.27,
+          "size_str": "574MB"
+        },
+        "270m-mxfp8-text": {
+          "bytes": 442000000,
+          "digest": "47c561d1a77f",
+          "params_b": 0.27,
+          "size_str": "442MB"
+        },
+        "270m-nvfp4-text": {
+          "bytes": 378000000,
+          "digest": "9e1df58d197e",
+          "params_b": 0.27,
+          "size_str": "378MB"
+        },
+        "270m-q8_0-text": {
+          "bytes": 304000000,
+          "digest": "c21dd30c1e38",
+          "params_b": 0.27,
+          "size_str": "304MB"
+        },
+        "440m": {
+          "bytes": 671000000,
+          "digest": "b750e83c282e",
+          "params_b": 0.44,
+          "size_str": "671MB"
+        },
+        "440m-bf16-text-vision": {
+          "bytes": 910000000,
+          "digest": "0a4a713f2700",
+          "params_b": 0.44,
+          "size_str": "910MB"
+        },
+        "440m-mxfp8-text-vision": {
+          "bytes": 778000000,
+          "digest": "fc94c176e27b",
+          "params_b": 0.44,
+          "size_str": "778MB"
+        },
+        "440m-nvfp4-text-vision": {
+          "bytes": 714000000,
+          "digest": "d302b84ce388",
+          "params_b": 0.44,
+          "size_str": "714MB"
+        },
+        "440m-q8_0-text-vision": {
+          "bytes": 671000000,
+          "digest": "7d8dc01c0a05",
+          "params_b": 0.44,
+          "size_str": "671MB"
+        },
+        "570m": {
+          "bytes": 918000000,
+          "digest": "74f652944b2b",
+          "params_b": 0.57,
+          "size_str": "918MB"
+        },
+        "570m-bf16-text-audio": {
+          "bytes": 1200000000,
+          "digest": "9c186596b19e",
+          "params_b": 0.57,
+          "size_str": "1.2GB"
+        },
+        "570m-mxfp8-text-audio": {
+          "bytes": 1100000000,
+          "digest": "4d64e128ff21",
+          "params_b": 0.57,
+          "size_str": "1.1GB"
+        },
+        "570m-nvfp4-text-audio": {
+          "bytes": 990000000,
+          "digest": "eaf989e4d334",
+          "params_b": 0.57,
+          "size_str": "990MB"
+        },
+        "570m-q8_0-text-audio": {
+          "bytes": 918000000,
+          "digest": "899c39804f83",
+          "params_b": 0.57,
+          "size_str": "918MB"
+        },
+        "740m": {
+          "bytes": 1300000000,
+          "digest": "1f30cabe5af7",
+          "params_b": 0.74,
+          "size_str": "1.3GB"
+        },
+        "740m-bf16": {
+          "bytes": 1500000000,
+          "digest": "54d809644cd8",
+          "params_b": 0.74,
+          "size_str": "1.5GB"
+        },
+        "740m-mxfp8": {
+          "bytes": 1400000000,
+          "digest": "a4efd357164f",
+          "params_b": 0.74,
+          "size_str": "1.4GB"
+        },
+        "740m-nvfp4": {
+          "bytes": 1300000000,
+          "digest": "969600645b52",
+          "params_b": 0.74,
+          "size_str": "1.3GB"
+        },
+        "740m-q8_0": {
+          "bytes": 1300000000,
+          "digest": "f4981a15b998",
+          "params_b": 0.74,
+          "size_str": "1.3GB"
+        },
+        "latest": {
+          "bytes": 1300000000,
+          "digest": "1f30cabe5af7",
+          "params_b": 0.74,
+          "size_str": "1.3GB"
+        }
+      }
+    },
     "everythinglm": {
       "latest": {
         "arch": "llama",
@@ -8326,6 +8834,58 @@
           "params_b": 70.6,
           "quant": "Q4_0",
           "size_str": "40GB"
+        }
+      }
+    },
+    "flint": {
+      "latest": {
+        "bytes": 23000000000,
+        "digest": "2a087bdb088a",
+        "params_b": 40.0,
+        "size_str": "23GB"
+      },
+      "tags": {
+        "40b": {
+          "bytes": 23000000000,
+          "digest": "2a087bdb088a",
+          "params_b": 40.0,
+          "size_str": "23GB"
+        },
+        "40b-a2b": {
+          "bytes": 23000000000,
+          "digest": "2a087bdb088a",
+          "params_b": 40.0,
+          "size_str": "23GB"
+        },
+        "40b-a2b-gguf-nvfp4": {
+          "bytes": 23000000000,
+          "digest": "9543f736310d",
+          "params_b": 40.0,
+          "size_str": "23GB"
+        },
+        "40b-a2b-mlx-bf16": {
+          "bytes": 80000000000,
+          "digest": "3d2f527c0ef3",
+          "params_b": 40.0,
+          "size_str": "80GB"
+        },
+        "40b-a2b-q4_1": {
+          "bytes": 26000000000,
+          "digest": "10f49bd042a0",
+          "params_b": 40.0,
+          "size_str": "26GB"
+        },
+        "40b-a2b-qat-int4": {
+          "bytes": 23000000000,
+          "digest": "9891844f06a2",
+          "params_b": 40.0,
+          "size_str": "23GB"
+        },
+        "latest": {
+          "bytes": 23000000000,
+          "digest": "2a087bdb088a",
+          "params_b": 40.0,
+          "size_str": "23GB"
         }
       }
     },
@@ -13762,6 +14322,110 @@
         }
       }
     },
+    "kev": {
+      "latest": {
+        "bytes": 5600000000,
+        "digest": "079f29347a00",
+        "size_str": "5.6GB"
+      },
+      "tags": {
+        "0.8b-bf16": {
+          "bytes": 1500000000,
+          "digest": "5ee097410a63",
+          "params_b": 0.8,
+          "size_str": "1.5GB"
+        },
+        "0.8b-mlx-bf16": {
+          "bytes": 1500000000,
+          "digest": "f8bb3dfed81d",
+          "params_b": 0.8,
+          "size_str": "1.5GB"
+        },
+        "0.8b-mxfp8": {
+          "bytes": 1000000000,
+          "digest": "e414a229c2b8",
+          "params_b": 0.8,
+          "size_str": "1.0GB"
+        },
+        "0.8b-q8_0": {
+          "bytes": 812000000,
+          "digest": "a2f47e09befb",
+          "params_b": 0.8,
+          "size_str": "812MB"
+        },
+        "27b-mlx-bf16": {
+          "bytes": 51000000000,
+          "digest": "b397feb9fd33",
+          "params_b": 27.0,
+          "size_str": "51GB"
+        },
+        "27b-nvfp4": {
+          "bytes": 19000000000,
+          "digest": "4f5575ee2df2",
+          "params_b": 27.0,
+          "size_str": "19GB"
+        },
+        "4b-bf16": {
+          "bytes": 8400000000,
+          "digest": "8406d8a74261",
+          "params_b": 4.0,
+          "size_str": "8.4GB"
+        },
+        "4b-mlx-bf16": {
+          "bytes": 8400000000,
+          "digest": "458360f7747d",
+          "params_b": 4.0,
+          "size_str": "8.4GB"
+        },
+        "4b-q4_K_M": {
+          "bytes": 2700000000,
+          "digest": "818b6cdb957c",
+          "params_b": 4.0,
+          "size_str": "2.7GB"
+        },
+        "4b-q8_0": {
+          "bytes": 4500000000,
+          "digest": "46203beabf65",
+          "params_b": 4.0,
+          "size_str": "4.5GB"
+        },
+        "9b-bf16": {
+          "bytes": 18000000000,
+          "digest": "925e229ef61d",
+          "params_b": 9.0,
+          "size_str": "18GB"
+        },
+        "9b-mlx-bf16": {
+          "bytes": 16000000000,
+          "digest": "7044de0996a2",
+          "params_b": 9.0,
+          "size_str": "16GB"
+        },
+        "9b-nvfp4": {
+          "bytes": 6700000000,
+          "digest": "d31165461ae8",
+          "params_b": 9.0,
+          "size_str": "6.7GB"
+        },
+        "9b-q4_K_M": {
+          "bytes": 5600000000,
+          "digest": "96375189a97f",
+          "params_b": 9.0,
+          "size_str": "5.6GB"
+        },
+        "9b-q8_0": {
+          "bytes": 9500000000,
+          "digest": "446718ead956",
+          "params_b": 9.0,
+          "size_str": "9.5GB"
+        },
+        "latest": {
+          "bytes": 5600000000,
+          "digest": "079f29347a00",
+          "size_str": "5.6GB"
+        }
+      }
+    },
     "laguna-s-2.1": {
       "latest": {
         "arch": "laguna",
@@ -13959,6 +14623,56 @@
         }
       }
     },
+    "laya": {
+      "latest": {
+        "bytes": 844000000,
+        "digest": "0175aca9f021",
+        "size_str": "844MB"
+      },
+      "tags": {
+        "322m-multilingual-bf16": {
+          "bytes": 658000000,
+          "digest": "c1242e4a83f0",
+          "params_b": 0.322,
+          "size_str": "658MB"
+        },
+        "322m-multilingual-mlx-fp16": {
+          "bytes": 678000000,
+          "digest": "63b6e37ecedb",
+          "params_b": 0.322,
+          "size_str": "678MB"
+        },
+        "421m-english-bf16": {
+          "bytes": 844000000,
+          "digest": "1f196b378202",
+          "params_b": 0.421,
+          "size_str": "844MB"
+        },
+        "421m-english-mlx-fp16": {
+          "bytes": 846000000,
+          "digest": "aaba5574a1e1",
+          "params_b": 0.421,
+          "size_str": "846MB"
+        },
+        "421m-typed-decisions-bf16": {
+          "bytes": 844000000,
+          "digest": "84a7be5dd978",
+          "params_b": 0.421,
+          "size_str": "844MB"
+        },
+        "421m-typed-decisions-mlx-fp16": {
+          "bytes": 846000000,
+          "digest": "c62bc110244c",
+          "params_b": 0.421,
+          "size_str": "846MB"
+        },
+        "latest": {
+          "bytes": 844000000,
+          "digest": "0175aca9f021",
+          "size_str": "844MB"
+        }
+      }
+    },
     "lfm2": {
       "latest": {
         "arch": "lfm2moe",
@@ -14099,6 +14813,250 @@
           "params_b": 1.17,
           "quant": "Q4_K_M",
           "size_str": "731MB"
+        }
+      }
+    },
+    "lfm3": {
+      "latest": {
+        "bytes": 1100000000,
+        "digest": "df5fd9016d22",
+        "params_b": 1.7,
+        "size_str": "1.1GB"
+      },
+      "tags": {
+        "1.7b": {
+          "bytes": 1100000000,
+          "digest": "df5fd9016d22",
+          "params_b": 1.7,
+          "size_str": "1.1GB"
+        },
+        "1.7b-bf16": {
+          "bytes": 3500000000,
+          "digest": "40476494244e",
+          "params_b": 1.7,
+          "size_str": "3.5GB"
+        },
+        "1.7b-mlx-bf16": {
+          "bytes": 3500000000,
+          "digest": "f39cc56813fb",
+          "params_b": 1.7,
+          "size_str": "3.5GB"
+        },
+        "1.7b-mxfp8": {
+          "bytes": 2100000000,
+          "digest": "4637931b9fcc",
+          "params_b": 1.7,
+          "size_str": "2.1GB"
+        },
+        "1.7b-nvfp4": {
+          "bytes": 1700000000,
+          "digest": "2012d88e202f",
+          "params_b": 1.7,
+          "size_str": "1.7GB"
+        },
+        "1.7b-q4_K_M": {
+          "bytes": 1100000000,
+          "digest": "b36a103fe2f8",
+          "params_b": 1.7,
+          "size_str": "1.1GB"
+        },
+        "1.7b-q8_0": {
+          "bytes": 1800000000,
+          "digest": "a329e3b38ec2",
+          "params_b": 1.7,
+          "size_str": "1.8GB"
+        },
+        "1.7b-qad-q4_0": {
+          "bytes": 1000000000,
+          "digest": "765f7bd04f18",
+          "params_b": 1.7,
+          "size_str": "1.0GB"
+        },
+        "latest": {
+          "bytes": 1100000000,
+          "digest": "df5fd9016d22",
+          "params_b": 1.7,
+          "size_str": "1.1GB"
+        }
+      }
+    },
+    "lfm3-audio": {
+      "latest": {
+        "bytes": 1700000000,
+        "digest": "3cc080be117a",
+        "params_b": 2.0,
+        "size_str": "1.7GB"
+      },
+      "tags": {
+        "2b": {
+          "bytes": 1700000000,
+          "digest": "3cc080be117a",
+          "params_b": 2.0,
+          "size_str": "1.7GB"
+        },
+        "2b-bf16": {
+          "bytes": 4000000000,
+          "digest": "0697269928c0",
+          "params_b": 2.0,
+          "size_str": "4.0GB"
+        },
+        "2b-mlx-bf16": {
+          "bytes": 4200000000,
+          "digest": "d950f68bfdd8",
+          "params_b": 2.0,
+          "size_str": "4.2GB"
+        },
+        "2b-mxfp8": {
+          "bytes": 2700000000,
+          "digest": "1a6cacf52d02",
+          "params_b": 2.0,
+          "size_str": "2.7GB"
+        },
+        "2b-nvfp4": {
+          "bytes": 2100000000,
+          "digest": "ecfcfb300186",
+          "params_b": 2.0,
+          "size_str": "2.1GB"
+        },
+        "2b-q4_K_M": {
+          "bytes": 1700000000,
+          "digest": "3327c1a06755",
+          "params_b": 2.0,
+          "size_str": "1.7GB"
+        },
+        "2b-q8_0": {
+          "bytes": 2400000000,
+          "digest": "d0ae0cb67fb9",
+          "params_b": 2.0,
+          "size_str": "2.4GB"
+        },
+        "latest": {
+          "bytes": 1700000000,
+          "digest": "3cc080be117a",
+          "params_b": 2.0,
+          "size_str": "1.7GB"
+        }
+      }
+    },
+    "lfm3-omni": {
+      "latest": {
+        "bytes": 2000000000,
+        "digest": "b6e3243f2821",
+        "params_b": 2.0,
+        "size_str": "2.0GB"
+      },
+      "tags": {
+        "2b": {
+          "bytes": 2000000000,
+          "digest": "b6e3243f2821",
+          "params_b": 2.0,
+          "size_str": "2.0GB"
+        },
+        "2b-bf16": {
+          "bytes": 4400000000,
+          "digest": "a70fbe8cf5a4",
+          "params_b": 2.0,
+          "size_str": "4.4GB"
+        },
+        "2b-mlx-bf16": {
+          "bytes": 4500000000,
+          "digest": "a3eb4ae57b32",
+          "params_b": 2.0,
+          "size_str": "4.5GB"
+        },
+        "2b-mxfp8": {
+          "bytes": 3100000000,
+          "digest": "6836661470a1",
+          "params_b": 2.0,
+          "size_str": "3.1GB"
+        },
+        "2b-nvfp4": {
+          "bytes": 2400000000,
+          "digest": "8c2f5a2d126d",
+          "params_b": 2.0,
+          "size_str": "2.4GB"
+        },
+        "2b-q4_K_M": {
+          "bytes": 2000000000,
+          "digest": "4c0ee9400634",
+          "params_b": 2.0,
+          "size_str": "2.0GB"
+        },
+        "2b-q8_0": {
+          "bytes": 2800000000,
+          "digest": "9d1124550b95",
+          "params_b": 2.0,
+          "size_str": "2.8GB"
+        },
+        "latest": {
+          "bytes": 2000000000,
+          "digest": "b6e3243f2821",
+          "params_b": 2.0,
+          "size_str": "2.0GB"
+        }
+      }
+    },
+    "lfm3-vl": {
+      "latest": {
+        "bytes": 1500000000,
+        "digest": "b663c9779257",
+        "params_b": 2.0,
+        "size_str": "1.5GB"
+      },
+      "tags": {
+        "2b": {
+          "bytes": 1500000000,
+          "digest": "b663c9779257",
+          "params_b": 2.0,
+          "size_str": "1.5GB"
+        },
+        "2b-bf16": {
+          "bytes": 3800000000,
+          "digest": "dd69080d181a",
+          "params_b": 2.0,
+          "size_str": "3.8GB"
+        },
+        "2b-mlx-bf16": {
+          "bytes": 3900000000,
+          "digest": "2f90d817ad16",
+          "params_b": 2.0,
+          "size_str": "3.9GB"
+        },
+        "2b-mxfp8": {
+          "bytes": 2400000000,
+          "digest": "08ced5a01d25",
+          "params_b": 2.0,
+          "size_str": "2.4GB"
+        },
+        "2b-nvfp4": {
+          "bytes": 1700000000,
+          "digest": "280791ff33bb",
+          "params_b": 2.0,
+          "size_str": "1.7GB"
+        },
+        "2b-q4_K_M": {
+          "bytes": 1500000000,
+          "digest": "00ca45bf65a5",
+          "params_b": 2.0,
+          "size_str": "1.5GB"
+        },
+        "2b-q8_0": {
+          "bytes": 2200000000,
+          "digest": "e2be50ac28b2",
+          "params_b": 2.0,
+          "size_str": "2.2GB"
+        },
+        "2b-qad-q4_0": {
+          "bytes": 1400000000,
+          "digest": "eefca5a1a2dc",
+          "params_b": 2.0,
+          "size_str": "1.4GB"
+        },
+        "latest": {
+          "bytes": 1500000000,
+          "digest": "b663c9779257",
+          "params_b": 2.0,
+          "size_str": "1.5GB"
         }
       }
     },
@@ -21730,6 +22688,76 @@
         }
       }
     },
+    "nemotron-3.5-bolt": {
+      "latest": {
+        "bytes": 25000000000,
+        "digest": "d6d3deeca271",
+        "params_b": 74.0,
+        "size_str": "25GB"
+      },
+      "tags": {
+        "74b-a9b": {
+          "bytes": 25000000000,
+          "digest": "d6d3deeca271",
+          "params_b": 74.0,
+          "size_str": "25GB"
+        },
+        "74b-a9b-iq2": {
+          "bytes": 25000000000,
+          "digest": "d6d3deeca271",
+          "params_b": 74.0,
+          "size_str": "25GB"
+        },
+        "e4b": {
+          "bytes": 7200000000,
+          "digest": "4354fecbfc04",
+          "params_b": 4.0,
+          "size_str": "7.2GB"
+        },
+        "e4b-bf16": {
+          "bytes": 17000000000,
+          "digest": "99fcad567609",
+          "params_b": 4.0,
+          "size_str": "17GB"
+        },
+        "e4b-mlx-bf16": {
+          "bytes": 17000000000,
+          "digest": "49e1dd266141",
+          "params_b": 4.0,
+          "size_str": "17GB"
+        },
+        "e4b-mxfp8": {
+          "bytes": 12000000000,
+          "digest": "0ee41f6e46b9",
+          "params_b": 4.0,
+          "size_str": "12GB"
+        },
+        "e4b-nvfp4": {
+          "bytes": 7200000000,
+          "digest": "f1cd13dbf8c8",
+          "params_b": 4.0,
+          "size_str": "7.2GB"
+        },
+        "e4b-q4_K_M": {
+          "bytes": 7900000000,
+          "digest": "69f2be39b309",
+          "params_b": 4.0,
+          "size_str": "7.9GB"
+        },
+        "e4b-q8_0": {
+          "bytes": 9800000000,
+          "digest": "667121e303ea",
+          "params_b": 4.0,
+          "size_str": "9.8GB"
+        },
+        "latest": {
+          "bytes": 25000000000,
+          "digest": "d6d3deeca271",
+          "params_b": 74.0,
+          "size_str": "25GB"
+        }
+      }
+    },
     "nemotron-3.5-lightning": {
       "latest": {
         "arch": "nemotron_h_moe",
@@ -21803,6 +22831,70 @@
           "params_b": 32.9,
           "quant": "Q4_K_M",
           "size_str": "25GB"
+        }
+      }
+    },
+    "nemotron-3.5-super": {
+      "latest": {
+        "bytes": 80000000000,
+        "digest": "d84f81c512c4",
+        "params_b": 120.0,
+        "size_str": "80GB"
+      },
+      "tags": {
+        "120b": {
+          "bytes": 80000000000,
+          "digest": "d84f81c512c4",
+          "params_b": 120.0,
+          "size_str": "80GB"
+        },
+        "120b-a12b": {
+          "bytes": 80000000000,
+          "digest": "d84f81c512c4",
+          "params_b": 120.0,
+          "size_str": "80GB"
+        },
+        "120b-a12b-bf16": {
+          "bytes": 249000000000,
+          "digest": "45c225544aa0",
+          "params_b": 120.0,
+          "size_str": "249GB"
+        },
+        "120b-a12b-mlx-bf16": {
+          "bytes": 249000000000,
+          "digest": "93aa29b11e26",
+          "params_b": 120.0,
+          "size_str": "249GB"
+        },
+        "120b-a12b-mxfp8": {
+          "bytes": 130000000000,
+          "digest": "dda000e80902",
+          "params_b": 120.0,
+          "size_str": "130GB"
+        },
+        "120b-a12b-nvfp4": {
+          "bytes": 80000000000,
+          "digest": "aba4cee1e75e",
+          "params_b": 120.0,
+          "size_str": "80GB"
+        },
+        "120b-a12b-q4_K_M": {
+          "bytes": 90000000000,
+          "digest": "8a58f3e60082",
+          "params_b": 120.0,
+          "size_str": "90GB"
+        },
+        "120b-a12b-q8_0": {
+          "bytes": 133000000000,
+          "digest": "b8269ff2e3e0",
+          "params_b": 120.0,
+          "size_str": "133GB"
+        },
+        "latest": {
+          "bytes": 80000000000,
+          "digest": "d84f81c512c4",
+          "params_b": 120.0,
+          "size_str": "80GB"
         }
       }
     },
@@ -22425,6 +23517,122 @@
           "params_b": 13.0,
           "quant": "Q4_0",
           "size_str": "7.4GB"
+        }
+      }
+    },
+    "nimble": {
+      "latest": {
+        "bytes": 9300000000,
+        "digest": "5745f025fbe6",
+        "params_b": 9.0,
+        "size_str": "9.3GB"
+      },
+      "tags": {
+        "9b": {
+          "bytes": 9300000000,
+          "digest": "5745f025fbe6",
+          "params_b": 9.0,
+          "size_str": "9.3GB"
+        },
+        "9b-bf16": {
+          "bytes": 18000000000,
+          "digest": "8c5f1ee46d2b",
+          "params_b": 9.0,
+          "size_str": "18GB"
+        },
+        "9b-mlx-bf16": {
+          "bytes": 18000000000,
+          "digest": "a12dea71dc46",
+          "params_b": 9.0,
+          "size_str": "18GB"
+        },
+        "9b-mxfp8": {
+          "bytes": 9300000000,
+          "digest": "8bed6c1082ed",
+          "params_b": 9.0,
+          "size_str": "9.3GB"
+        },
+        "9b-nvfp4": {
+          "bytes": 6900000000,
+          "digest": "7a1e5d2a7666",
+          "params_b": 9.0,
+          "size_str": "6.9GB"
+        },
+        "9b-q4_K_M": {
+          "bytes": 5600000000,
+          "digest": "d99f22c363ce",
+          "params_b": 9.0,
+          "size_str": "5.6GB"
+        },
+        "9b-q8_0": {
+          "bytes": 9500000000,
+          "digest": "6aa3fde96874",
+          "params_b": 9.0,
+          "size_str": "9.5GB"
+        },
+        "latest": {
+          "bytes": 9300000000,
+          "digest": "5745f025fbe6",
+          "params_b": 9.0,
+          "size_str": "9.3GB"
+        }
+      }
+    },
+    "nimble-v3": {
+      "latest": {
+        "bytes": 9300000000,
+        "digest": "4f30b1db22d3",
+        "params_b": 9.0,
+        "size_str": "9.3GB"
+      },
+      "tags": {
+        "9b": {
+          "bytes": 9300000000,
+          "digest": "4f30b1db22d3",
+          "params_b": 9.0,
+          "size_str": "9.3GB"
+        },
+        "9b-bf16": {
+          "bytes": 18000000000,
+          "digest": "1873ffdc0e99",
+          "params_b": 9.0,
+          "size_str": "18GB"
+        },
+        "9b-mlx-bf16": {
+          "bytes": 18000000000,
+          "digest": "11dce4c7532f",
+          "params_b": 9.0,
+          "size_str": "18GB"
+        },
+        "9b-mxfp8": {
+          "bytes": 9300000000,
+          "digest": "d14c05dc038c",
+          "params_b": 9.0,
+          "size_str": "9.3GB"
+        },
+        "9b-nvfp4": {
+          "bytes": 6900000000,
+          "digest": "a11fb440f1e6",
+          "params_b": 9.0,
+          "size_str": "6.9GB"
+        },
+        "9b-q4_K_M": {
+          "bytes": 5600000000,
+          "digest": "88cbbd22b816",
+          "params_b": 9.0,
+          "size_str": "5.6GB"
+        },
+        "9b-q8_0": {
+          "bytes": 9500000000,
+          "digest": "6f0e87f39800",
+          "params_b": 9.0,
+          "size_str": "9.5GB"
+        },
+        "latest": {
+          "bytes": 9300000000,
+          "digest": "4f30b1db22d3",
+          "params_b": 9.0,
+          "size_str": "9.3GB"
         }
       }
     },
@@ -26671,6 +27879,138 @@
           "params_b": 33.7,
           "quant": "Q4_0",
           "size_str": "19GB"
+        }
+      }
+    },
+    "phonon": {
+      "latest": {
+        "bytes": 113000000,
+        "digest": "58f58601e4e8",
+        "size_str": "113MB"
+      },
+      "tags": {
+        "31m-en": {
+          "bytes": 104000000,
+          "digest": "6667dd188d2e",
+          "params_b": 0.031,
+          "size_str": "104MB"
+        },
+        "40m-de": {
+          "bytes": 126000000,
+          "digest": "024449ea0a54",
+          "params_b": 0.04,
+          "size_str": "126MB"
+        },
+        "40m-en": {
+          "bytes": 132000000,
+          "digest": "b74a4edf2fe2",
+          "params_b": 0.04,
+          "size_str": "132MB"
+        },
+        "40m-es": {
+          "bytes": 129000000,
+          "digest": "446893b2a1fd",
+          "params_b": 0.04,
+          "size_str": "129MB"
+        },
+        "40m-fr": {
+          "bytes": 126000000,
+          "digest": "eef1ed69574a",
+          "params_b": 0.04,
+          "size_str": "126MB"
+        },
+        "40m-multilingual": {
+          "bytes": 148000000,
+          "digest": "4b69007b5c79",
+          "params_b": 0.04,
+          "size_str": "148MB"
+        },
+        "40m-pt": {
+          "bytes": 125000000,
+          "digest": "c640b8b12b63",
+          "params_b": 0.04,
+          "size_str": "125MB"
+        },
+        "de": {
+          "bytes": 123000000,
+          "digest": "6ef2680491eb",
+          "size_str": "123MB"
+        },
+        "en": {
+          "bytes": 104000000,
+          "digest": "6667dd188d2e",
+          "size_str": "104MB"
+        },
+        "es": {
+          "bytes": 123000000,
+          "digest": "d5df2ae8bc2d",
+          "size_str": "123MB"
+        },
+        "fr": {
+          "bytes": 123000000,
+          "digest": "da29147f2cba",
+          "size_str": "123MB"
+        },
+        "latest": {
+          "bytes": 113000000,
+          "digest": "58f58601e4e8",
+          "size_str": "113MB"
+        },
+        "multilingual": {
+          "bytes": 123000000,
+          "digest": "eda44c0f4703",
+          "size_str": "123MB"
+        },
+        "pt": {
+          "bytes": 123000000,
+          "digest": "e8fb87dea0cd",
+          "size_str": "123MB"
+        }
+      }
+    },
+    "pplx-decider": {
+      "latest": {
+        "bytes": 17000000000,
+        "digest": "733585a9ebb6",
+        "params_b": 27.0,
+        "size_str": "17GB"
+      },
+      "tags": {
+        "27b": {
+          "bytes": 17000000000,
+          "digest": "733585a9ebb6",
+          "params_b": 27.0,
+          "size_str": "17GB"
+        },
+        "27b-mlx-bf16": {
+          "bytes": 52000000000,
+          "digest": "74a118a0fe81",
+          "params_b": 27.0,
+          "size_str": "52GB"
+        },
+        "27b-mxfp8": {
+          "bytes": 29000000000,
+          "digest": "3bc5ea1dd54b",
+          "params_b": 27.0,
+          "size_str": "29GB"
+        },
+        "27b-nvfp4": {
+          "bytes": 19000000000,
+          "digest": "3cc88dab60b5",
+          "params_b": 27.0,
+          "size_str": "19GB"
+        },
+        "27b-q4_K_M": {
+          "bytes": 17000000000,
+          "digest": "733585a9ebb6",
+          "params_b": 27.0,
+          "size_str": "17GB"
+        },
+        "latest": {
+          "bytes": 17000000000,
+          "digest": "733585a9ebb6",
+          "params_b": 27.0,
+          "size_str": "17GB"
         }
       }
     },
@@ -37641,6 +38981,134 @@
           "params_b": 7.24,
           "quant": "Q4_0",
           "size_str": "4.1GB"
+        }
+      }
+    },
+    "strands-decider": {
+      "latest": {
+        "bytes": 2000000000,
+        "digest": "fd88a2b3ab3f",
+        "params_b": 2.0,
+        "size_str": "2.0GB"
+      },
+      "tags": {
+        "2b": {
+          "bytes": 2000000000,
+          "digest": "fd88a2b3ab3f",
+          "params_b": 2.0,
+          "size_str": "2.0GB"
+        },
+        "2b-mlx-bf16": {
+          "bytes": 3800000000,
+          "digest": "d7afa63135f6",
+          "params_b": 2.0,
+          "size_str": "3.8GB"
+        },
+        "2b-mxfp8": {
+          "bytes": 2000000000,
+          "digest": "fd88a2b3ab3f",
+          "params_b": 2.0,
+          "size_str": "2.0GB"
+        },
+        "2b-nvfp4": {
+          "bytes": 1300000000,
+          "digest": "c92a6f466917",
+          "params_b": 2.0,
+          "size_str": "1.3GB"
+        },
+        "latest": {
+          "bytes": 2000000000,
+          "digest": "fd88a2b3ab3f",
+          "params_b": 2.0,
+          "size_str": "2.0GB"
+        }
+      }
+    },
+    "tev1": {
+      "latest": {
+        "bytes": 4400000000,
+        "digest": "3ea3be2f2026",
+        "params_b": 4.0,
+        "size_str": "4.4GB"
+      },
+      "tags": {
+        "0.8b": {
+          "bytes": 834000000,
+          "digest": "cb16f3186b07",
+          "params_b": 0.8,
+          "size_str": "834MB"
+        },
+        "0.8b-bf16": {
+          "bytes": 1600000000,
+          "digest": "e3e061c8b4e6",
+          "params_b": 0.8,
+          "size_str": "1.6GB"
+        },
+        "0.8b-mlx-bf16": {
+          "bytes": 1500000000,
+          "digest": "9ea18bade940",
+          "params_b": 0.8,
+          "size_str": "1.5GB"
+        },
+        "0.8b-mxfp8": {
+          "bytes": 797000000,
+          "digest": "c96262240cf8",
+          "params_b": 0.8,
+          "size_str": "797MB"
+        },
+        "0.8b-q8_0": {
+          "bytes": 834000000,
+          "digest": "abc31fdb0bf5",
+          "params_b": 0.8,
+          "size_str": "834MB"
+        },
+        "4b": {
+          "bytes": 4400000000,
+          "digest": "3ea3be2f2026",
+          "params_b": 4.0,
+          "size_str": "4.4GB"
+        },
+        "4b-bf16": {
+          "bytes": 8700000000,
+          "digest": "4eb03a01d788",
+          "params_b": 4.0,
+          "size_str": "8.7GB"
+        },
+        "4b-mlx-bf16": {
+          "bytes": 8400000000,
+          "digest": "b6cc5c8eef21",
+          "params_b": 4.0,
+          "size_str": "8.4GB"
+        },
+        "4b-mxfp8": {
+          "bytes": 4400000000,
+          "digest": "2a76e0606594",
+          "params_b": 4.0,
+          "size_str": "4.4GB"
+        },
+        "4b-nvfp4": {
+          "bytes": 3100000000,
+          "digest": "1b15f25c13a0",
+          "params_b": 4.0,
+          "size_str": "3.1GB"
+        },
+        "4b-q4_K_M": {
+          "bytes": 2800000000,
+          "digest": "608e3a13eec3",
+          "params_b": 4.0,
+          "size_str": "2.8GB"
+        },
+        "4b-q8_0": {
+          "bytes": 4600000000,
+          "digest": "7954dce22bc6",
+          "params_b": 4.0,
+          "size_str": "4.6GB"
+        },
+        "latest": {
+          "bytes": 4400000000,
+          "digest": "3ea3be2f2026",
+          "params_b": 4.0,
+          "size_str": "4.4GB"
         }
       }
     },
