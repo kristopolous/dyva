@@ -668,7 +668,7 @@ def model_modalities(model):
 def load_settings():
     """Apply persisted runtime settings (workers/timeout/min_count/local) over
     the CLI defaults, so changes made in the dashboard survive restarts."""
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, SESSION_STICKY, SESSION_TTL, SESSION_ALLOW_REPIN
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA
     if not os.path.exists(SETTINGS_FILE):
         return
     try:
@@ -723,12 +723,7 @@ def load_settings():
         GOSSIPER_URL = s["gossiper_url"].strip()
     if isinstance(s.get("gossiper_enabled"), bool):
         GOSSIPER_ENABLED = s["gossiper_enabled"]
-    if isinstance(s.get("session_sticky"), bool):
-        SESSION_STICKY = s["session_sticky"]
-    if isinstance(s.get("session_ttl"), (int, float)) and s["session_ttl"] > 0:
-        SESSION_TTL = int(s["session_ttl"])
-    if isinstance(s.get("session_allow_repin"), bool):
-        SESSION_ALLOW_REPIN = s["session_allow_repin"]
+    _apply_session_setting_keys(s)
 
 
 def save_settings(extra=None):
@@ -4129,6 +4124,76 @@ def _apply_session_headers(resp, sid, host=None, full=None, rebind=False):
             "X-Dyva-Host, X-Dyva-Model, X-Dyva-Service, " + extra)
 
 
+def _session_commit(sid, sess, host, full, query, messages, resp, rebind=False):
+    """Pin (host, model), store transcript, stamp response headers.
+
+    Shared by the SSE/ndjson stream binds and the non-stream completion path so
+    those three call sites don't restate the same sequence. Returns (rebind, sess).
+    """
+    if not sid:
+        return rebind, sess
+    prev = (sess or {}).get("host")
+    if prev and prev != host:
+        rebind = True
+    session_touch(sid, host=host, full=full, query=query)
+    session_set_messages(sid, list(messages or []))
+    _apply_session_headers(resp, sid, host, full, rebind)
+    return rebind, session_get(sid)
+
+
+
+async def _keepalive_then_stream(racer, request, session, model, servers, opayload, req_caps,
+                                 job_wid, openai_format, cancel, hedge_delay, sid, sess,
+                                 session_rebind, query):
+    """Race under keepalive, pin the sticky session on a win, then stream.
+
+    Shared by the SSE and ndjson branches of _proxy_chat so those call sites
+    stay one-liners. Returns (response, None, stopped) after a successful stream,
+    or (ka_resp, error_msg, stopped) when no host answered — the caller writes
+    its dialect-specific in-stream error onto ka_resp.
+    """
+    ka_resp, result, errors, stopped = await racer(
+        request, session, model, servers, opayload, req_caps, job_wid,
+        hedge_delay=hedge_delay)
+    if result:
+        if sid:
+            _session_commit(sid, sess, result[1], result[2], query,
+                            opayload.get("messages"), ka_resp, session_rebind)
+        out = await _stream_chat_failover(
+            request, session, model, servers, opayload,
+            openai_format, req_caps, job_wid, result, cancel, response=ka_resp,
+            sid=sid)
+        return out, None, stopped
+    msg = "worker manually stopped" if stopped else "all servers failed"
+    if errors:
+        msg += ": " + "; ".join(dict.fromkeys(errors))
+    return ka_resp, msg, stopped
+
+
+def session_append_assistant(sid, content, host=None, full=None):
+    """Append one assistant turn to the session transcript (stream completion)."""
+    if not sid or not content:
+        return
+    session_touch(sid, host=host, full=full)
+    entry = session_get(sid)
+    base = list((entry or {}).get("messages") or [])
+    if not (base and base[-1].get("role") == "assistant"
+            and base[-1].get("content") == content):
+        base.append({"role": "assistant", "content": content})
+    session_set_messages(sid, base)
+
+
+def _apply_session_setting_keys(src):
+    """Copy session_* keys from a settings/body dict onto module globals."""
+    global SESSION_STICKY, SESSION_TTL, SESSION_ALLOW_REPIN
+    if isinstance(src.get("session_sticky"), bool):
+        SESSION_STICKY = src["session_sticky"]
+    if isinstance(src.get("session_ttl"), (int, float)) and src["session_ttl"] > 0:
+        SESSION_TTL = int(src["session_ttl"])
+    if isinstance(src.get("session_allow_repin"), bool):
+        SESSION_ALLOW_REPIN = src["session_allow_repin"]
+
+
 def match_model(model_name, pattern):
     # A trailing "$" (borrowed from regex) anchors the END of the name: "qwen3.8:27b$"
     # matches that name exactly and NOT "...:27b-abliterated" or other quant/finetune
@@ -5029,19 +5094,13 @@ def _find_servers_raw(sub, caps=None):
         ms = [m for m in models if match_model(m, sub)]
         if not ms:
             continue
-        # Embedding models can't chat, so a plain text query ("qwen3") must not
-        # sweep in "qwen3-embedding:0.6b" just because the name contains the
-        # pattern. Routing is symmetric on the "embed" substring: ask for embed
-        # and you get embedders; don't, and they're dropped. Per-MODEL (not
-        # whole-host) — a host may serve qwen3:8b AND qwen3-embedding:0.6b, both
-        # matching "qwen3"; keep the chat one, drop the embedder.
-        if "embed" not in sub:
-            ms = [m for m in ms if "embed" not in m.lower()]
-            if not ms:
-                continue
-        # Same shape as embed: drop OCR / reranker / ASR / TTS unless the query
-        # itself asks for them (VL/vision chat models are unaffected — no token hit).
-        for _tok in _NON_CHAT_TOKENS:
+        # Specialty non-chat models can't answer a plain text query. Routing is
+        # symmetric on each name token: ask for it and you keep those models;
+        # don't, and they're dropped. Per-MODEL (not whole-host) — a host may
+        # serve qwen3:8b AND qwen3-embedding / an OCR GGUF; keep the chat one.
+        # VL/vision chat models are unaffected (no token hit). "embed" kept first
+        # for the historical contract; OCR/rerank/ASR/TTS follow.
+        for _tok in ("embed",) + _NON_CHAT_TOKENS:
             if _tok not in sub:
                 ms = [m for m in ms if _tok not in m.lower()]
         if not ms:
@@ -8356,20 +8415,9 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
     if (len(partial[0]) + partial[1]) > 0:
         with contextlib.suppress(Exception):
             _banker.served(model, host)
-    # Sticky-session transcript: non-stream path records the assistant turn after
-    # drain; the stream path previously only stored the request messages, so a
-    # later re-pin had nothing to replay. Capture the full streamed assistant
-    # text (and refresh the pin to the host that finished) when a session is on.
-    if sid and partial[0]:
-        with contextlib.suppress(Exception):
-            session_touch(sid, host=host, full=full)
-            entry = session_get(sid)
-            base = list((entry or {}).get("messages") or [])
-            # Avoid double-appending if a caller already stored the same turn.
-            if not (base and base[-1].get("role") == "assistant"
-                    and base[-1].get("content") == partial[0]):
-                base.append({"role": "assistant", "content": partial[0]})
-            session_set_messages(sid, base)
+    # Sticky-session transcript: capture streamed assistant text for re-pin replay.
+    with contextlib.suppress(Exception):
+        session_append_assistant(sid, partial[0], host=host, full=full)
     return response
 
 
@@ -9130,25 +9178,12 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                 # short idle timeout doesn't bail while dyva is still finding a host. This
                 # prepares the response early, so a no-host outcome is written in-stream
                 # (the 200 is already committed) rather than returned as a 502.
-                ka_resp, result, errors, stopped = await _race_sse_keepalive(
-                    request, session, model, _servers, opayload, req_caps, job_wid,
-                    hedge_delay=pin_hedge)
-                if result:
-                    if sid:
-                        _rhost, _rfull = result[1], result[2]
-                        prev = (sess or {}).get("host")
-                        if prev and prev != _rhost:
-                            session_rebind = True
-                        session_touch(sid, host=_rhost, full=_rfull, query=model_list[0])
-                        session_set_messages(sid, list(opayload.get("messages") or []))
-                        _apply_session_headers(ka_resp, sid, _rhost, _rfull, session_rebind)
-                    return await _stream_chat_failover(
-                        request, session, model, _servers, opayload,
-                        openai_format, req_caps, job_wid, result, cancel, response=ka_resp,
-                        sid=sid)
-                msg = "worker manually stopped" if stopped else "all servers failed"
-                if errors:
-                    msg += ": " + "; ".join(dict.fromkeys(errors))
+                ka_resp, msg, stopped = await _keepalive_then_stream(
+                    _race_sse_keepalive, request, session, model, _servers, opayload, req_caps,
+                    job_wid, openai_format, cancel, pin_hedge, sid, sess,
+                    session_rebind, model_list[0])
+                if msg is None:
+                    return ka_resp
                 with contextlib.suppress(Exception):
                     # OpenAI-shaped error object ({"error":{"message":...}}) — a raw
                     # {"error":"string"} fails strict clients' schema (opencode rejects it
@@ -9164,25 +9199,12 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                 # than returned as a 502. Like SSE, a no-host on a non-last fallback model is
                 # reported here instead of falling through to the next model; single-model
                 # queries (the common case) are unaffected. Opens no upstream connection.
-                ka_resp, result, errors, stopped = await _race_ndjson_keepalive(
-                    request, session, model, _servers, opayload, req_caps, job_wid,
-                    hedge_delay=pin_hedge)
-                if result:
-                    if sid:
-                        _rhost, _rfull = result[1], result[2]
-                        prev = (sess or {}).get("host")
-                        if prev and prev != _rhost:
-                            session_rebind = True
-                        session_touch(sid, host=_rhost, full=_rfull, query=model_list[0])
-                        session_set_messages(sid, list(opayload.get("messages") or []))
-                        _apply_session_headers(ka_resp, sid, _rhost, _rfull, session_rebind)
-                    return await _stream_chat_failover(
-                        request, session, model, _servers, opayload,
-                        openai_format, req_caps, job_wid, result, cancel, response=ka_resp,
-                        sid=sid)
-                msg = "worker manually stopped" if stopped else "all servers failed"
-                if errors:
-                    msg += ": " + "; ".join(dict.fromkeys(errors))
+                ka_resp, msg, stopped = await _keepalive_then_stream(
+                    _race_ndjson_keepalive, request, session, model, _servers, opayload, req_caps,
+                    job_wid, openai_format, cancel, pin_hedge, sid, sess,
+                    session_rebind, model_list[0])
+                if msg is None:
+                    return ka_resp
                 with contextlib.suppress(Exception):
                     await ka_resp.write((json.dumps({"model": model, "created_at": _now_iso(),
                         "error": msg}) + "\n").encode())
@@ -9253,19 +9275,16 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                     out.headers["X-Dyva-Service"] = service_of(host)
                     out.headers["Access-Control-Expose-Headers"] = "X-Dyva-Host, X-Dyva-Model, X-Dyva-Service"
                     if sid:
-                        prev = (sess or {}).get("host")
-                        if prev and prev != host:
-                            session_rebind = True
-                        session_touch(sid, host=host, full=full, query=model_list[0])
                         asst = data.get("message")
                         if not isinstance(asst, dict):
                             asst = {"role": "assistant", "content": data.get("response") or ""}
                         else:
                             asst = {"role": asst.get("role") or "assistant",
                                     "content": asst.get("content") or ""}
-                        session_set_messages(sid, list(send_payload.get("messages") or []) + [asst])
-                        _apply_session_headers(out, sid, host, full, session_rebind)
-                        sess = session_get(sid)
+                        session_rebind, sess = _session_commit(
+                            sid, sess, host, full, model_list[0],
+                            list(send_payload.get("messages") or []) + [asst],
+                            out, session_rebind)
                     return out
 
         msg = "worker manually stopped" if stopped else "all servers failed"
@@ -10620,7 +10639,7 @@ async def handle_settings_post(request):
       '200':
         description: Updated settings
     """
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, SESSION_STICKY, SESSION_TTL, SESSION_ALLOW_REPIN
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA
     resp = await _check_local(request) or _check_admin(request)
     if resp:
         return resp
@@ -10684,12 +10703,7 @@ async def handle_settings_post(request):
         GOSSIPER_URL = body["gossiper_url"].strip()
     if isinstance(body.get("gossiper_enabled"), bool):
         GOSSIPER_ENABLED = body["gossiper_enabled"]
-    if isinstance(body.get("session_sticky"), bool):
-        SESSION_STICKY = body["session_sticky"]
-    if isinstance(body.get("session_ttl"), (int, float)) and body["session_ttl"] > 0:
-        SESSION_TTL = int(body["session_ttl"])
-    if isinstance(body.get("session_allow_repin"), bool):
-        SESSION_ALLOW_REPIN = body["session_allow_repin"]
+    _apply_session_setting_keys(body)
     # admin_pw: only when the key is present. A non-empty value sets/changes the
     # password (stored hashed); an explicit empty string clears protection. The
     # plaintext is never stored or echoed back.
