@@ -413,6 +413,14 @@ CONTINUATION_HEDGE_PROBE = 45
 # host is probably cold/evicted (prompt cache gone, maybe the box rebooted), so the
 # hedge's reason to prefer it is stale — drop the stickiness and race normally.
 STICKY_TTL = 2 * 3600   # 2 hours
+# Opt-in CLIENT-session pinning. Distinct from STICKY_TTL / get_last (query-keyed
+# last-good shared across clients). Header X-Dyva-Session or body dyva_session
+# pins resolved (host, full) for SESSION_TTL with a local transcript for re-seed.
+# SESSION_STICKY auto-mints an id when omitted. Default False = unchanged routing.
+SESSION_STICKY = False
+SESSION_TTL = 3600
+SESSION_MSG_CAP = 200
+_sessions = {}
 MIN_COUNT = 0   # hide models served by fewer than this many hosts (0/1 = show all)
 EXPLORE_MODE = False   # route UNKNOWN/unvisited hosts first to map more of the pool (slower)
 # "Hide dyva": when on, a remote bot/curl GET of a WEB PAGE (the dashboard/HTML, not
@@ -656,7 +664,7 @@ def model_modalities(model):
 def load_settings():
     """Apply persisted runtime settings (workers/timeout/min_count/local) over
     the CLI defaults, so changes made in the dashboard survive restarts."""
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, SESSION_STICKY, SESSION_TTL
     if not os.path.exists(SETTINGS_FILE):
         return
     try:
@@ -711,6 +719,10 @@ def load_settings():
         GOSSIPER_URL = s["gossiper_url"].strip()
     if isinstance(s.get("gossiper_enabled"), bool):
         GOSSIPER_ENABLED = s["gossiper_enabled"]
+    if isinstance(s.get("session_sticky"), bool):
+        SESSION_STICKY = s["session_sticky"]
+    if isinstance(s.get("session_ttl"), (int, float)) and s["session_ttl"] > 0:
+        SESSION_TTL = int(s["session_ttl"])
 
 
 def save_settings(extra=None):
@@ -730,7 +742,8 @@ def save_settings(extra=None):
                  "min_count": MIN_COUNT, "local": _LOCAL, "explore": EXPLORE_MODE, "hide_dyva": HIDE_DYVA,
                  "admin_pw": ADMIN_PW, "model_list": MODEL_LIST, "model_list_on": MODEL_LIST_ON,
                  "cloudskip": sorted(CLOUD_SKIP), "base_path": BASE_PATH,
-                 "gossiper_url": GOSSIPER_URL, "gossiper_enabled": GOSSIPER_ENABLED})
+                 "gossiper_url": GOSSIPER_URL, "gossiper_enabled": GOSSIPER_ENABLED,
+                 "session_sticky": SESSION_STICKY, "session_ttl": SESSION_TTL})
     if isinstance(extra, dict):
         data.update(extra)
     try:
@@ -3997,6 +4010,116 @@ def clear_last(host, full=None):
         del _last_cache[q]
     if stale:
         save_last()
+
+
+
+def _session_expired(entry):
+    return (not entry) or (time.time() - entry.get("atime", 0) > SESSION_TTL)
+
+
+def session_get(sid):
+    if not sid:
+        return None
+    entry = _sessions.get(sid)
+    if _session_expired(entry):
+        _sessions.pop(sid, None)
+        return None
+    return entry
+
+
+def session_touch(sid, host=None, full=None, query=None):
+    """Create/update a session entry. host/full/query are optional overlays."""
+    now = time.time()
+    entry = _sessions.get(sid)
+    if entry is None or _session_expired(entry):
+        entry = {
+            "host": None, "full": None, "query": query or "",
+            "ctime": now, "atime": now, "messages": [], "rebinds": 0,
+        }
+    if host is not None:
+        prev = entry.get("host")
+        if prev and prev != host:
+            entry["rebinds"] = entry.get("rebinds", 0) + 1
+        entry["host"] = host
+    if full is not None:
+        entry["full"] = full
+    if query is not None:
+        entry["query"] = query
+    entry["atime"] = now
+    _sessions[sid] = entry
+    return entry
+
+
+def session_clear_pin(sid):
+    entry = _sessions.get(sid)
+    if not entry:
+        return
+    entry["host"] = None
+    entry["full"] = None
+    entry["atime"] = time.time()
+
+
+def session_set_messages(sid, messages):
+    """Replace the local transcript with `messages` (capped)."""
+    entry = session_get(sid) or session_touch(sid)
+    msgs = list(messages or [])
+    if len(msgs) > SESSION_MSG_CAP:
+        msgs = msgs[-SESSION_MSG_CAP:]
+    entry["messages"] = msgs
+    entry["atime"] = time.time()
+    return entry
+
+
+def session_merge_messages(stored, incoming):
+    """Prefer client-supplied history when it already covers us; else extend."""
+    stored = list(stored or [])
+    incoming = list(incoming or [])
+    if not stored:
+        return incoming
+    if not incoming:
+        return stored
+    if len(incoming) >= len(stored) and incoming[:len(stored)] == stored:
+        return incoming
+    n = 0
+    for a, b in zip(stored, incoming):
+        if a != b:
+            break
+        n += 1
+    if n == 0:
+        return stored + incoming
+    return stored + incoming[n:]
+
+
+def _session_headers(sid, host=None, full=None, rebind=False):
+    h = {"X-Dyva-Session": sid}
+    if host:
+        h["X-Dyva-Session-Host"] = re.sub(r"^https?://", "", host)
+    if full:
+        h["X-Dyva-Session-Model"] = full
+    if rebind:
+        h["X-Dyva-Session-Rebind"] = "1"
+    return h
+
+
+def _apply_session_headers(resp, sid, host=None, full=None, rebind=False):
+    if not sid or resp is None:
+        return
+    for k, v in _session_headers(sid, host, full, rebind).items():
+        resp.headers[k] = v
+    expose = resp.headers.get("Access-Control-Expose-Headers", "")
+    extra = "X-Dyva-Session, X-Dyva-Session-Host, X-Dyva-Session-Model, X-Dyva-Session-Rebind"
+    if expose:
+        parts = [p.strip() for p in (expose + ", " + extra).split(",") if p.strip()]
+        seen, out = set(), []
+        for p in parts:
+            pl = p.lower()
+            if pl not in seen:
+                seen.add(pl)
+                out.append(p)
+        resp.headers["Access-Control-Expose-Headers"] = ", ".join(out)
+    else:
+        resp.headers["Access-Control-Expose-Headers"] = (
+            "X-Dyva-Host, X-Dyva-Model, X-Dyva-Service, " + extra)
 
 
 def match_model(model_name, pattern):
@@ -7935,7 +8058,7 @@ def _resume_dropped_stream(tool_arg_chars, tool_resume=None):
     return tool_arg_chars <= 0 or bool(tool_resume)
 
 
-async def _race_sse_keepalive(request, session, model, servers, payload, req_caps, job_wid):
+async def _race_sse_keepalive(request, session, model, servers, payload, req_caps, job_wid, hedge_delay=None):
     """Race for a host while keeping a streaming SSE client's connection warm.
 
     dyva adds pre-first-token latency raw ollama doesn't (the race, hedge delay,
@@ -7959,7 +8082,8 @@ async def _race_sse_keepalive(request, session, model, servers, payload, req_cap
         return response, None, [], False
     task = asyncio.ensure_future(_race_servers(
         session, model, servers, payload, do_stream=True,
-        remote=request.remote, caps=req_caps, job_wid=job_wid, hedge_delay=HEDGE_DELAY))
+        remote=request.remote, caps=req_caps, job_wid=job_wid,
+        hedge_delay=HEDGE_DELAY if hedge_delay is None else hedge_delay))
     while True:
         done_set, _pending = await asyncio.wait({task}, timeout=KEEPALIVE_INTERVAL)
         if done_set:
@@ -7979,7 +8103,7 @@ async def _race_sse_keepalive(request, session, model, servers, payload, req_cap
     return response, result, errors, stopped
 
 
-async def _race_ndjson_keepalive(request, session, model, servers, payload, req_caps, job_wid):
+async def _race_ndjson_keepalive(request, session, model, servers, payload, req_caps, job_wid, hedge_delay=None):
     """ndjson (/api/chat) twin of _race_sse_keepalive: keep an ollama-dialect streaming client
     warm during the pre-first-token wait (race + hedge + warming + prefill) so its idle timeout
     doesn't bail before the first token. The keepalive is an EMPTY assistant chunk
@@ -7997,7 +8121,8 @@ async def _race_ndjson_keepalive(request, session, model, servers, payload, req_
         return response, None, [], False
     task = asyncio.ensure_future(_race_servers(
         session, model, servers, payload, do_stream=True,
-        remote=request.remote, caps=req_caps, job_wid=job_wid, hedge_delay=HEDGE_DELAY))
+        remote=request.remote, caps=req_caps, job_wid=job_wid,
+        hedge_delay=HEDGE_DELAY if hedge_delay is None else hedge_delay))
     ka = (json.dumps({"model": model, "created_at": _now_iso(),
                       "message": {"role": "assistant", "content": ""}, "done": False}) + "\n").encode()
     while True:
@@ -8892,7 +9017,53 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
             return web.json_response(err_obj(f"no available servers for '{model_in}'", "model_not_found"), status=404)
         return _info_response(model_list[0], info, do_stream=do_stream, openai_format=openai_format)
 
+    # --- Opt-in sticky session (X-Dyva-Session / body dyva_session) ---
+    # No sid => identical to historical routing. Header presence alone activates
+    # pinning even when SESSION_STICKY (auto-mint) is False.
+    sid = request.headers.get("X-Dyva-Session")
+    if not sid and isinstance(opayload, dict):
+        _body_sid = opayload.pop("dyva_session", None)
+        if isinstance(_body_sid, str) and _body_sid.strip():
+            sid = _body_sid.strip()
+    if isinstance(sid, str):
+        sid = sid.strip() or None
+    if not sid and SESSION_STICKY:
+        sid = uuid.uuid4().hex
+    sess = session_get(sid) if sid else None
+    session_rebind = False
+
+    # Force re-pin hook: clear pin and skip the previous host for this process so
+    # the race cannot immediately reselect it (used by local failover tests).
+    if sid and request.headers.get("X-Dyva-Session-Repin", "").strip().lower() in ("1", "true", "yes"):
+        if sess and sess.get("host"):
+            _session_skip_hosts.add(_norm_host(sess["host"]))
+            log.info("session %s: force-repin, skipping host %s", sid, sess.get("host"))
+        session_clear_pin(sid)
+        sess = session_get(sid)
+        session_rebind = True
+
+    if sess and isinstance(opayload.get("messages"), list):
+        opayload = dict(opayload, messages=session_merge_messages(
+            sess.get("messages"), opayload["messages"]))
+
     _servers = find_servers(model_in, req_caps)
+    pin_hedge = HEDGE_DELAY
+    if sess and sess.get("host"):
+        match = next((s for s in _servers if s[1] == sess["host"]), None)
+        if match:
+            _prio, _host, ms = match
+            full_pin = sess.get("full")
+            if full_pin and full_pin in ms:
+                ms = [full_pin] + [m for m in ms if m != full_pin]
+            _servers = [(TIER_PREFER, _host, ms)] + [s for s in _servers if s[1] != _host]
+            pin_hedge = CONTINUATION_HEDGE
+            log.debug("session %s: pinned to %s / %s", sid, _host, full_pin)
+        else:
+            session_clear_pin(sid)
+            sess = session_get(sid)
+            session_rebind = True
+            log.info("session %s: pin missed pool — will rebind", sid)
+
     total = len(_servers)
     cancel = asyncio.Event()   # manual-stop signal; armed onto the worker for the stream
     job_wid = await _register_worker(model_list[0], total, cancel.set, kind="text",
@@ -8919,8 +9090,17 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                 # prepares the response early, so a no-host outcome is written in-stream
                 # (the 200 is already committed) rather than returned as a 502.
                 ka_resp, result, errors, stopped = await _race_sse_keepalive(
-                    request, session, model, _servers, opayload, req_caps, job_wid)
+                    request, session, model, _servers, opayload, req_caps, job_wid,
+                    hedge_delay=pin_hedge)
                 if result:
+                    if sid:
+                        _rhost, _rfull = result[1], result[2]
+                        prev = (sess or {}).get("host")
+                        if prev and prev != _rhost:
+                            session_rebind = True
+                        session_touch(sid, host=_rhost, full=_rfull, query=model_list[0])
+                        session_set_messages(sid, list(opayload.get("messages") or []))
+                        _apply_session_headers(ka_resp, sid, _rhost, _rfull, session_rebind)
                     return await _stream_chat_failover(
                         request, session, model, _servers, opayload,
                         openai_format, req_caps, job_wid, result, cancel, response=ka_resp)
@@ -8943,8 +9123,17 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                 # reported here instead of falling through to the next model; single-model
                 # queries (the common case) are unaffected. Opens no upstream connection.
                 ka_resp, result, errors, stopped = await _race_ndjson_keepalive(
-                    request, session, model, _servers, opayload, req_caps, job_wid)
+                    request, session, model, _servers, opayload, req_caps, job_wid,
+                    hedge_delay=pin_hedge)
                 if result:
+                    if sid:
+                        _rhost, _rfull = result[1], result[2]
+                        prev = (sess or {}).get("host")
+                        if prev and prev != _rhost:
+                            session_rebind = True
+                        session_touch(sid, host=_rhost, full=_rfull, query=model_list[0])
+                        session_set_messages(sid, list(opayload.get("messages") or []))
+                        _apply_session_headers(ka_resp, sid, _rhost, _rfull, session_rebind)
                     return await _stream_chat_failover(
                         request, session, model, _servers, opayload,
                         openai_format, req_caps, job_wid, result, cancel, response=ka_resp)
@@ -8971,7 +9160,7 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                     if nctx_pin:
                         send_payload["options"] = dict(send_payload.get("options") or {},
                                                        num_ctx=nctx_pin)
-                    result, errors, stopped = await _race_servers(session, model, _servers, send_payload, do_stream=True, remote=request.remote, caps=req_caps, job_wid=job_wid, hedge_delay=HEDGE_DELAY)
+                    result, errors, stopped = await _race_servers(session, model, _servers, send_payload, do_stream=True, remote=request.remote, caps=req_caps, job_wid=job_wid, hedge_delay=pin_hedge)
                     if not result:
                         break
                     _, host, full, resp, first_line, first, _oai = result
@@ -8997,6 +9186,9 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                             f"stream stalled: {host}@{model} — no tokens for {TIMEOUT}s",
                             wid=job_wid)
                         _servers = [s for s in _servers if s[1] != host]
+                        if sid:
+                            session_clear_pin(sid)
+                            session_rebind = True
                         _set_worker_phase(job_wid, None)
                         if _servers:
                             continue                    # re-race the remaining pool
@@ -9017,6 +9209,20 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                     out.headers["X-Dyva-Model"] = full
                     out.headers["X-Dyva-Service"] = service_of(host)
                     out.headers["Access-Control-Expose-Headers"] = "X-Dyva-Host, X-Dyva-Model, X-Dyva-Service"
+                    if sid:
+                        prev = (sess or {}).get("host")
+                        if prev and prev != host:
+                            session_rebind = True
+                        session_touch(sid, host=host, full=full, query=model_list[0])
+                        asst = data.get("message")
+                        if not isinstance(asst, dict):
+                            asst = {"role": "assistant", "content": data.get("response") or ""}
+                        else:
+                            asst = {"role": asst.get("role") or "assistant",
+                                    "content": asst.get("content") or ""}
+                        session_set_messages(sid, list(send_payload.get("messages") or []) + [asst])
+                        _apply_session_headers(out, sid, host, full, session_rebind)
+                        sess = session_get(sid)
                     return out
 
         msg = "worker manually stopped" if stopped else "all servers failed"
@@ -10355,6 +10561,7 @@ async def handle_settings_get(request):
                               "admin_pw_set": bool(ADMIN_PW),
                               "model_list": MODEL_LIST, "model_list_on": MODEL_LIST_ON,
                               "gossiper_url": GOSSIPER_URL, "gossiper_enabled": GOSSIPER_ENABLED,
+                              "session_sticky": SESSION_STICKY, "session_ttl": SESSION_TTL,
                               "admin": True, "sources": _stored_sources(),
                               "source_toggles": _source_toggles()})
 
@@ -10369,7 +10576,7 @@ async def handle_settings_post(request):
       '200':
         description: Updated settings
     """
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, SESSION_STICKY, SESSION_TTL
     resp = await _check_local(request) or _check_admin(request)
     if resp:
         return resp
@@ -10433,6 +10640,10 @@ async def handle_settings_post(request):
         GOSSIPER_URL = body["gossiper_url"].strip()
     if isinstance(body.get("gossiper_enabled"), bool):
         GOSSIPER_ENABLED = body["gossiper_enabled"]
+    if isinstance(body.get("session_sticky"), bool):
+        SESSION_STICKY = body["session_sticky"]
+    if isinstance(body.get("session_ttl"), (int, float)) and body["session_ttl"] > 0:
+        SESSION_TTL = int(body["session_ttl"])
     # admin_pw: only when the key is present. A non-empty value sets/changes the
     # password (stored hashed); an explicit empty string clears protection. The
     # plaintext is never stored or echoed back.
@@ -19459,6 +19670,8 @@ def main():
                              "that mark, and '--hosts bad __tts__ del' to clear them")
     parser.add_argument("--curlify", action="store_true", help="print curl commands of upstream requests to stderr")
     parser.add_argument("--log", action="store_true", help="persist the activity feed to a date-stamped JSONL on disk (~/.cache/free-ollama/activity-YYYY-MM-DD.jsonl); off by default")
+    parser.add_argument("--session-sticky", action="store_true",
+                        help="auto-mint X-Dyva-Session when the client omits one")
     parser.add_argument("-v", "--version",  action="store_true", help="show version information")
     parser.add_argument("--virgin", action="store_true", help=argparse.SUPPRESS)  # say it out loud
     args = parser.parse_args()
@@ -19494,6 +19707,7 @@ def main():
     if args.version:
         sys.exit(0)
 
+    global SESSION_STICKY
     WORKER_COUNT = args.workers
     TIMEOUT = args.timeout
     PORT = args.port
@@ -19515,6 +19729,8 @@ def main():
         log.info("Logging ON -> " + os.path.join(_logdir, "activity-<UTC-date>.jsonl")
                  + " (feed) + " + os.path.join(_logdir, "dyva-<UTC-date>.log") + " (requests/errors)")
     load_settings()   # persisted dashboard settings override the CLI defaults
+    if getattr(args, "session_sticky", False):
+        SESSION_STICKY = True
     if args.local:       # an explicit -l flag always wins over saved settings
         _LOCAL = True
     if args.base is not None:   # --base always wins over the saved base_path
