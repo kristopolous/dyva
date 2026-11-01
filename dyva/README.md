@@ -257,6 +257,27 @@ line** no matter how good its reputation is, and that only an explicit 👍 (fav
 clears. Favour also nudges the pair back toward good. It's a routing veto you own,
 not a quality signal the router is allowed to overrule.
 
+### Sticky sessions (opt-in)
+
+Pass `X-Dyva-Session: <id>` (or body field `dyva_session`) on `/api/chat` /
+`/v1/chat/completions` and dyva pins the resolved `(host, model)` for that id
+for `session_ttl` seconds (default 3600), merging a local transcript so a later
+re-pin can replay prior turns. No session id ⇒ identical to historical routing.
+`--session-sticky` auto-mints an id when the client omits one.
+
+Responses echo `X-Dyva-Session`, `X-Dyva-Session-Host`, `X-Dyva-Session-Model`,
+and `X-Dyva-Session-Rebind: 1` when the pin moved. Streamed replies also record
+the full assistant text into the transcript (same as non-stream).
+
+`X-Dyva-Session-Repin: 1` clears the pin and session-skips the prior host for
+this process so the next race must pick a different one. It is **off by
+default** (ops footgun): enable with `--session-allow-repin`, settings
+`session_allow_repin`, or env `DYVA_SESSION_ALLOW_REPIN=1`.
+
+Plain chat queries also drop specialty non-chat name tokens (`ocr`, `rerank`,
+`whisper`, `asr`, `stt`, `tts`, `xtts`) the same way embedders already are —
+ask for `ocr` (etc.) explicitly to keep them.
+
 ### Hedged failover
 
 The sticky host is tried first, as always, but it no longer gets to block the

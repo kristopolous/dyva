@@ -420,6 +420,10 @@ STICKY_TTL = 2 * 3600   # 2 hours
 SESSION_STICKY = False
 SESSION_TTL = 3600
 SESSION_MSG_CAP = 200
+# Force-repin via X-Dyva-Session-Repin is an ops footgun (clears the pin and
+# session-skips the prior host). Off by default; enable with --session-allow-repin,
+# settings session_allow_repin, or env DYVA_SESSION_ALLOW_REPIN=1.
+SESSION_ALLOW_REPIN = False
 _sessions = {}
 MIN_COUNT = 0   # hide models served by fewer than this many hosts (0/1 = show all)
 EXPLORE_MODE = False   # route UNKNOWN/unvisited hosts first to map more of the pool (slower)
@@ -664,7 +668,7 @@ def model_modalities(model):
 def load_settings():
     """Apply persisted runtime settings (workers/timeout/min_count/local) over
     the CLI defaults, so changes made in the dashboard survive restarts."""
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, SESSION_STICKY, SESSION_TTL
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, SESSION_STICKY, SESSION_TTL, SESSION_ALLOW_REPIN
     if not os.path.exists(SETTINGS_FILE):
         return
     try:
@@ -723,6 +727,8 @@ def load_settings():
         SESSION_STICKY = s["session_sticky"]
     if isinstance(s.get("session_ttl"), (int, float)) and s["session_ttl"] > 0:
         SESSION_TTL = int(s["session_ttl"])
+    if isinstance(s.get("session_allow_repin"), bool):
+        SESSION_ALLOW_REPIN = s["session_allow_repin"]
 
 
 def save_settings(extra=None):
@@ -743,7 +749,8 @@ def save_settings(extra=None):
                  "admin_pw": ADMIN_PW, "model_list": MODEL_LIST, "model_list_on": MODEL_LIST_ON,
                  "cloudskip": sorted(CLOUD_SKIP), "base_path": BASE_PATH,
                  "gossiper_url": GOSSIPER_URL, "gossiper_enabled": GOSSIPER_ENABLED,
-                 "session_sticky": SESSION_STICKY, "session_ttl": SESSION_TTL})
+                 "session_sticky": SESSION_STICKY, "session_ttl": SESSION_TTL,
+                 "session_allow_repin": SESSION_ALLOW_REPIN})
     if isinstance(extra, dict):
         data.update(extra)
     try:
@@ -4959,6 +4966,11 @@ def _split_fallback(q):
     return parts or [(q or "").strip()]
 
 
+# Specialty non-chat name tokens (OCR / rerank / ASR / TTS). Same contract as the
+# embed substring filter inside _find_servers_raw: drop unless the query asks.
+_NON_CHAT_TOKENS = ("ocr", "rerank", "whisper", "asr", "stt", "tts", "xtts")
+
+
 def _find_servers_raw(sub, caps=None):
     chain = _split_fallback(sub)
     if len(chain) > 1:
@@ -5027,6 +5039,13 @@ def _find_servers_raw(sub, caps=None):
             ms = [m for m in ms if "embed" not in m.lower()]
             if not ms:
                 continue
+        # Same shape as embed: drop OCR / reranker / ASR / TTS unless the query
+        # itself asks for them (VL/vision chat models are unaffected — no token hit).
+        for _tok in _NON_CHAT_TOKENS:
+            if _tok not in sub:
+                ms = [m for m in ms if _tok not in m.lower()]
+        if not ms:
+            continue
         if any(re.search(r"[:-]cloud", m) for m in ms) and not re.search(r"[:-]cloud", sub):
             continue
         host = s.get("server", "")
@@ -8146,7 +8165,7 @@ async def _race_ndjson_keepalive(request, session, model, servers, payload, req_
 
 async def _stream_chat_failover(request, session, model, servers, opayload,
                                 openai_format, req_caps, job_wid, result, cancel=None,
-                                response=None):
+                                response=None, sid=None):
     """Stream a chat answer, and if an upstream drops mid-stream WITHOUT a terminal
     done token, seamlessly fail over to the next server — the SAME client connection
     stays open — carrying the work so far as context (with the window bumped to fit),
@@ -8337,6 +8356,20 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
     if (len(partial[0]) + partial[1]) > 0:
         with contextlib.suppress(Exception):
             _banker.served(model, host)
+    # Sticky-session transcript: non-stream path records the assistant turn after
+    # drain; the stream path previously only stored the request messages, so a
+    # later re-pin had nothing to replay. Capture the full streamed assistant
+    # text (and refresh the pin to the host that finished) when a session is on.
+    if sid and partial[0]:
+        with contextlib.suppress(Exception):
+            session_touch(sid, host=host, full=full)
+            entry = session_get(sid)
+            base = list((entry or {}).get("messages") or [])
+            # Avoid double-appending if a caller already stored the same turn.
+            if not (base and base[-1].get("role") == "assistant"
+                    and base[-1].get("content") == partial[0]):
+                base.append({"role": "assistant", "content": partial[0]})
+            session_set_messages(sid, base)
     return response
 
 
@@ -9033,14 +9066,22 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
     session_rebind = False
 
     # Force re-pin hook: clear pin and skip the previous host for this process so
-    # the race cannot immediately reselect it (used by local failover tests).
-    if sid and request.headers.get("X-Dyva-Session-Repin", "").strip().lower() in ("1", "true", "yes"):
-        if sess and sess.get("host"):
-            _session_skip_hosts.add(_norm_host(sess["host"]))
-            log.info("session %s: force-repin, skipping host %s", sid, sess.get("host"))
-        session_clear_pin(sid)
-        sess = session_get(sid)
-        session_rebind = True
+    # the race cannot immediately reselect it (failover tests / ops). Gated —
+    # SESSION_ALLOW_REPIN or env DYVA_SESSION_ALLOW_REPIN must be on, otherwise
+    # the header is ignored (avoids a wide-open ops footgun).
+    _want_repin = request.headers.get("X-Dyva-Session-Repin", "").strip().lower() in ("1", "true", "yes")
+    if sid and _want_repin:
+        _env_repin = os.environ.get("DYVA_SESSION_ALLOW_REPIN", "").strip().lower() in ("1", "true", "yes")
+        if SESSION_ALLOW_REPIN or _env_repin:
+            if sess and sess.get("host"):
+                _session_skip_hosts.add(_norm_host(sess["host"]))
+                log.info("session %s: force-repin, skipping host %s", sid, sess.get("host"))
+            session_clear_pin(sid)
+            sess = session_get(sid)
+            session_rebind = True
+        else:
+            log.warning("session %s: X-Dyva-Session-Repin ignored (enable --session-allow-repin "
+                        "or DYVA_SESSION_ALLOW_REPIN=1)", sid)
 
     if sess and isinstance(opayload.get("messages"), list):
         opayload = dict(opayload, messages=session_merge_messages(
@@ -9103,7 +9144,8 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                         _apply_session_headers(ka_resp, sid, _rhost, _rfull, session_rebind)
                     return await _stream_chat_failover(
                         request, session, model, _servers, opayload,
-                        openai_format, req_caps, job_wid, result, cancel, response=ka_resp)
+                        openai_format, req_caps, job_wid, result, cancel, response=ka_resp,
+                        sid=sid)
                 msg = "worker manually stopped" if stopped else "all servers failed"
                 if errors:
                     msg += ": " + "; ".join(dict.fromkeys(errors))
@@ -9136,7 +9178,8 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                         _apply_session_headers(ka_resp, sid, _rhost, _rfull, session_rebind)
                     return await _stream_chat_failover(
                         request, session, model, _servers, opayload,
-                        openai_format, req_caps, job_wid, result, cancel, response=ka_resp)
+                        openai_format, req_caps, job_wid, result, cancel, response=ka_resp,
+                        sid=sid)
                 msg = "worker manually stopped" if stopped else "all servers failed"
                 if errors:
                     msg += ": " + "; ".join(dict.fromkeys(errors))
@@ -10562,6 +10605,7 @@ async def handle_settings_get(request):
                               "model_list": MODEL_LIST, "model_list_on": MODEL_LIST_ON,
                               "gossiper_url": GOSSIPER_URL, "gossiper_enabled": GOSSIPER_ENABLED,
                               "session_sticky": SESSION_STICKY, "session_ttl": SESSION_TTL,
+                              "session_allow_repin": SESSION_ALLOW_REPIN,
                               "admin": True, "sources": _stored_sources(),
                               "source_toggles": _source_toggles()})
 
@@ -10576,7 +10620,7 @@ async def handle_settings_post(request):
       '200':
         description: Updated settings
     """
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, SESSION_STICKY, SESSION_TTL
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, SESSION_STICKY, SESSION_TTL, SESSION_ALLOW_REPIN
     resp = await _check_local(request) or _check_admin(request)
     if resp:
         return resp
@@ -10644,6 +10688,8 @@ async def handle_settings_post(request):
         SESSION_STICKY = body["session_sticky"]
     if isinstance(body.get("session_ttl"), (int, float)) and body["session_ttl"] > 0:
         SESSION_TTL = int(body["session_ttl"])
+    if isinstance(body.get("session_allow_repin"), bool):
+        SESSION_ALLOW_REPIN = body["session_allow_repin"]
     # admin_pw: only when the key is present. A non-empty value sets/changes the
     # password (stored hashed); an explicit empty string clears protection. The
     # plaintext is never stored or echoed back.
@@ -19672,6 +19718,8 @@ def main():
     parser.add_argument("--log", action="store_true", help="persist the activity feed to a date-stamped JSONL on disk (~/.cache/free-ollama/activity-YYYY-MM-DD.jsonl); off by default")
     parser.add_argument("--session-sticky", action="store_true",
                         help="auto-mint X-Dyva-Session when the client omits one")
+    parser.add_argument("--session-allow-repin", action="store_true",
+                        help="honor X-Dyva-Session-Repin (force re-pin + skip prior host); off by default")
     parser.add_argument("-v", "--version",  action="store_true", help="show version information")
     parser.add_argument("--virgin", action="store_true", help=argparse.SUPPRESS)  # say it out loud
     args = parser.parse_args()
@@ -19707,7 +19755,7 @@ def main():
     if args.version:
         sys.exit(0)
 
-    global SESSION_STICKY
+    global SESSION_STICKY, SESSION_ALLOW_REPIN
     WORKER_COUNT = args.workers
     TIMEOUT = args.timeout
     PORT = args.port
@@ -19731,6 +19779,10 @@ def main():
     load_settings()   # persisted dashboard settings override the CLI defaults
     if getattr(args, "session_sticky", False):
         SESSION_STICKY = True
+    if getattr(args, "session_allow_repin", False):
+        SESSION_ALLOW_REPIN = True
+    if os.environ.get("DYVA_SESSION_ALLOW_REPIN", "").strip().lower() in ("1", "true", "yes"):
+        SESSION_ALLOW_REPIN = True
     if args.local:       # an explicit -l flag always wins over saved settings
         _LOCAL = True
     if args.base is not None:   # --base always wins over the saved base_path
