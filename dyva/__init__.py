@@ -661,7 +661,7 @@ def model_modalities(model):
 def load_settings():
     """Apply persisted runtime settings (workers/timeout/min_count/local) over
     the CLI defaults, so changes made in the dashboard survive restarts."""
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION
     if not os.path.exists(SETTINGS_FILE):
         return
     try:
@@ -675,6 +675,8 @@ def load_settings():
         TIMEOUT = s["timeout"]
     if isinstance(s.get("hedge_delay"), (int, float)) and s["hedge_delay"] >= 0:
         HEDGE_DELAY = s["hedge_delay"]
+    if isinstance(s.get("ctx_confident_fraction"), (int, float)) and 0 < s["ctx_confident_fraction"] <= 1:
+        CTX_CONFIDENT_FRACTION = s["ctx_confident_fraction"]
     if "warm_connect_wait" in s:
         _wcw = s["warm_connect_wait"]
         WARM_CONNECT_WAIT = _wcw if isinstance(_wcw, (int, float)) and _wcw >= 0 else None
@@ -730,7 +732,7 @@ def save_settings(extra=None):
     if not isinstance(data, dict):
         data = {}
     data.update({"workers": WORKER_COUNT, "timeout": TIMEOUT,
-                 "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS,
+                 "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS, "ctx_confident_fraction": CTX_CONFIDENT_FRACTION,
                  "worker_max": WORKER_MAX, "worker_max_failover": WORKER_MAX_FAILOVER, "tool_resume": TOOL_RESUME, "race_watchdog": RACE_WATCHDOG,
                  "min_count": MIN_COUNT, "local": _LOCAL, "explore": EXPLORE_MODE, "hide_dyva": HIDE_DYVA,
                  "admin_pw": ADMIN_PW, "model_list": MODEL_LIST, "model_list_on": MODEL_LIST_ON,
@@ -1906,6 +1908,11 @@ async def account_tokens(wid, host, model, obj, num_ctx):
     # Self-refresh the context ceiling: the host just ingested `p` prompt tokens, so if a
     # recorded ctx_limit was <= that, it was stale (reloaded bigger) — clear it.
     clear_ctx_limit(host, model, p)
+    # Positive evidence: the host just PROVED it can handle `p` prompt tokens — band big
+    # requests toward hosts proven at/above their size (see _sizeband). A head-truncated
+    # prompt (p reached num_ctx) was NOT processed whole at that size, so it doesn't count.
+    if not _prompt_truncated(p, num_ctx):
+        mark_max_ok(host, model, p)
     # tokens/second, most-recent (host, model) reading. Prefer the upstream's OWN
     # generation timing when it reports it: Ollama gives eval_count / eval_duration
     # (nanoseconds), the true tok/s regardless of how fast WE drained the socket.
@@ -2809,6 +2816,11 @@ def _get_db():
                      # (still raced, never banned), and it's cleared the moment the host
                      # succeeds on a prompt that big (it was reloaded bigger). NULL = unknown.
                      "ctx_limit INTEGER",
+                     # Largest prompt (tokens) this (host,model) has SUCCESSFULLY processed — the
+                     # positive twin of ctx_limit. Hard evidence used to BAND candidates for a big
+                     # request (proven-capable first). Only ever GROWS (MAX on write); not a
+                     # reputation mark, cleared by nothing (a success never shrinks). NULL = never measured.
+                     "max_ok INTEGER",
                      # Physical micro-batch ceiling (ubatch / num_batch) a DECISION-model host
                      # reported when it rejected an oversized input: "input (N tokens) is too large
                      # to process. increase the physical batch size (current batch size: M)". Raw
@@ -3656,6 +3668,25 @@ def mark_ctx_limit(host, model, n_ctx):
         log.debug(f"mark_ctx_limit failed: {e}")
 
 
+def mark_overflow(host, model, prompt_tokens):
+    """A 0-char done_reason='length' drop: the host couldn't answer a prompt of
+    `prompt_tokens`, so its effective ceiling is at/below that. Lower ctx_limit toward it
+    (MIN — never RAISES an existing lower ceiling), soft + reversible like mark_ctx_limit;
+    cleared by clear_ctx_limit on the next success at that size. No reputation mark."""
+    if not prompt_tokens:
+        return
+    try:
+        db = _get_db()
+        db.execute(
+            "INSERT INTO host_status(host,model,state,ctx_limit) VALUES(?,?, 'unknown', ?)"
+            " ON CONFLICT(host,model) DO UPDATE SET"
+            " ctx_limit=MIN(COALESCE(ctx_limit, excluded.ctx_limit), excluded.ctx_limit)",
+            (host, model, int(prompt_tokens)))
+        db.commit()
+    except Exception as e:
+        log.debug(f"mark_overflow failed: {e}")
+
+
 def mark_empty_length(host, model):
     """Tally a 0-char done_reason='length' drop for (host, resolved-model): bump the
     count and stamp the time. Observational only — no reputation mark, no routing
@@ -3690,6 +3721,65 @@ def clear_ctx_limit(host, model, ingested):
         db.commit()
     except Exception as e:
         log.debug(f"clear_ctx_limit failed: {e}")
+
+
+def mark_max_ok(host, model, tokens):
+    """Record that (host, resolved-model) SUCCESSFULLY processed a prompt of `tokens`.
+    max_ok only ever grows (MAX), so a smaller later success never shrinks it. Upserts a
+    neutral 'unknown' row if none exists (same idiom as mark_ctx_limit); no reputation mark."""
+    if not tokens:
+        return
+    try:
+        db = _get_db()
+        db.execute(
+            "INSERT INTO host_status(host,model,state,max_ok) VALUES(?,?, 'unknown', ?)"
+            " ON CONFLICT(host,model) DO UPDATE SET max_ok=MAX(COALESCE(max_ok,0), excluded.max_ok)",
+            (host, model, int(tokens)))
+        db.commit()
+    except Exception as e:
+        log.debug(f"mark_max_ok failed: {e}")
+
+
+def _load_max_ok():
+    """{(host, model): max_ok} for the hosts we've measured a successful prompt size on.
+    Only non-NULL rows, so cheap to load per race (mirrors _load_ctx_limits)."""
+    try:
+        db = _get_db()
+        return {(h, m): n for h, m, n in db.execute(
+            f"SELECT host, model, max_ok FROM host_status "
+            f"WHERE max_ok IS NOT NULL AND {_LIVE_REAL}")}
+    except Exception:
+        return {}
+
+
+def _size_rank(need, max_ok, frac):
+    """Band a (host,model) by PROVEN capacity vs the needed window: 0 = proven at/above
+    need, 1 = proven within frac×need, 2 = unknown or proven smaller. Lower is better."""
+    if not max_ok:
+        return 2
+    if max_ok >= need:
+        return 0
+    if max_ok >= frac * need:
+        return 1
+    return 2
+
+
+def _sizeband(need, maxok, frac, host, ms):
+    """Band a (host, models) by PROVEN size for the race sort key (0 best, 2 unknown) — the
+    host's BEST (lowest-rank) model. Returns a constant 0 (no effect on ordering) when need<=0
+    or no sizes are known, so small/unmeasured traffic is never reordered. Bad-host protection
+    is NOT here: the race key keeps TIER primary, so a bad host is never promoted by its band."""
+    if need <= 0 or not maxok:
+        return 0
+    return min((_size_rank(need, maxok.get((host, m)), frac) for m in ms), default=2)
+
+
+def _race_sort_key(prio, vote, size_band, warm0, toobig, fav):
+    """The race candidate ordering key, lowest sorts first: TIER first (mechanical authority —
+    a bad/unreachable host is never promoted), then the user vote, then the PROVEN size band,
+    then warmth, then ctx-fit, then favourability. Extracted so the precedence — in particular
+    size sitting ABOVE warmth — is unit-testable (a bare pre-sort was silently overridden here)."""
+    return (prio, -vote, size_band, warm0, toobig, fav)
 
 
 def _load_ctx_limits():
@@ -6878,6 +6968,8 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
             servers = [(prio, host,
                         [m for m in ms if _fits(host, m)] + [m for m in ms if not _fits(host, m)])
                        for (prio, host, ms) in servers]
+    # Proven-size data for the race sort key below (loaded once; only when there's a real prompt).
+    _maxok = _load_max_ok() if _pt else {}
     def _toobig(host, ms):
         return 0 if (not _ctx or not ms or _fits(host, ms[0])) else 1
     # User vote (👍/👎): a signed preference that orders a pair WITHIN its tier and NEVER
@@ -6889,16 +6981,20 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
     def _vote(host, ms):
         vs = [_votes[(host, m)] for m in ms if (host, m) in _votes]
         return max(vs) if vs else 0   # +1 (favored); sorted via -vote so it lands first
-    # Order: TIER first (mechanical), then the vote within it, then warm/sticky, then
-    # too-big to the back of its tier, then WITHIN good/maybe by favorability. _fav is a
-    # per-job frozen snapshot so this race's own record_race writes can't churn the order
-    # mid-race. Unknown/explore hosts get favk=0 and keep their find_servers order (stable sort).
+    # Order: TIER first (mechanical), then the vote within it, then PROVEN size band, then
+    # warm/sticky, then too-big to the back of its tier, then WITHIN good/maybe by favorability.
+    # _fav is a per-job frozen snapshot so this race's own record_race writes can't churn the
+    # order mid-race. Unknown/explore hosts get favk=0 and keep their find_servers order (stable sort).
     _fav = _favorability(model, servers)
     def _order(it):
         prio, host, ms = it
         warm0 = 0 if (host in _warm and prio < TIER_BAD) else 1
         favk = -_fav[host]["fav"] if (host in _fav and prio in (TIER_GOOD, TIER_MAYBE)) else 0.0
-        return (prio, -_vote(host, ms), warm0, _toobig(host, ms), favk)
+        # Proven-size band sits ABOVE warmth: a host already shown to handle this prompt size
+        # beats a warm-but-unproven one for a big request (the fall-off-the-saddle fix).
+        return _race_sort_key(prio, _vote(host, ms),
+                              _sizeband(_need, _maxok, CTX_CONFIDENT_FRACTION, host, ms),
+                              warm0, _toobig(host, ms), favk)
     servers = sorted(servers, key=_order)
     for _i, (_p, _h, _m) in enumerate(servers):     # stamp final try-order rank for the log
         if _h in _fav:
@@ -7336,6 +7432,10 @@ IMAGE_TOKENS = 2048
 # silently clamping. The old 32768 cap quietly broke agentic tooling, whose tool
 # schemas + accumulated history routinely blow past it.
 NUM_CTX_MAX = 2 ** 20          # 1048576 — a sanity bound, not a real limit (Qwen3 et al. reach 256k native, ~1M with YaRN)
+# Size banding (routing): a host PROVEN to have handled at least this fraction of the needed
+# window is still preferred for a big request (band 1), below one proven at/above it (band 0).
+# Routing-config tunable, NOT a magic number — overridable via settings/dashboard. 0.6 = 60%.
+CTX_CONFIDENT_FRACTION = 0.6
 NUM_CTX_RETRIES = 2            # re-sends with a doubled window after a truncation
 
 # The upstream models are Llama/Qwen/etc., whose tokenizers we don't ship, so an
@@ -8160,6 +8260,9 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
                 f"{host} returned an empty response but reported hitting its length limit "
                 f"— it won't answer a prompt this size; trying another host", wid=job_wid)
             mark_empty_length(host, full)   # observational tally — see the column note
+            # ...and now act on it: the host couldn't answer a prompt this big, so lower its
+            # ctx_limit toward that size (soft, self-healing) — big requests stop re-racing into it.
+            mark_overflow(host, full, (_workers.get(job_wid) or {}).get("prompt_est"))
             dead.add(host)
         else:  # 'length' with real streamed text
             await broadcast_activity(host, full, "trying",
@@ -10351,7 +10454,7 @@ async def handle_settings_get(request):
         # show a password prompt instead of the controls.
         return web.json_response({"admin": False, "admin_pw_set": True}, status=403)
     return web.json_response({"workers": WORKER_COUNT, "timeout": TIMEOUT,
-                              "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS,
+                              "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS, "ctx_confident_fraction": CTX_CONFIDENT_FRACTION,
                               "worker_max": WORKER_MAX, "worker_max_failover": WORKER_MAX_FAILOVER, "tool_resume": TOOL_RESUME, "race_watchdog": RACE_WATCHDOG,
                               "min_count": MIN_COUNT, "local": _LOCAL,
                               "explore": EXPLORE_MODE, "hide_dyva": HIDE_DYVA,
@@ -10374,7 +10477,7 @@ async def handle_settings_post(request):
       '200':
         description: Updated settings
     """
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION
     resp = await _check_local(request) or _check_admin(request)
     if resp:
         return resp
@@ -10397,6 +10500,8 @@ async def handle_settings_post(request):
         TIMEOUT = min(body["timeout"], 600)
     if isinstance(body.get("hedge_delay"), (int, float)) and body["hedge_delay"] >= 0:
         HEDGE_DELAY = min(body["hedge_delay"], 600)
+    if isinstance(body.get("ctx_confident_fraction"), (int, float)) and 0 < body["ctx_confident_fraction"] <= 1:
+        CTX_CONFIDENT_FRACTION = body["ctx_confident_fraction"]
     if "warm_connect_wait" in body:   # a number = connect sub-phase; null = full lead (off)
         _wcw = body["warm_connect_wait"]
         WARM_CONNECT_WAIT = min(_wcw, 600) if isinstance(_wcw, (int, float)) and _wcw >= 0 else None
@@ -10466,7 +10571,7 @@ async def handle_settings_post(request):
     if sources_changed:
         await asyncio.get_event_loop().run_in_executor(None, refresh_cache)
     return web.json_response({"workers": WORKER_COUNT, "timeout": TIMEOUT,
-                              "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS,
+                              "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS, "ctx_confident_fraction": CTX_CONFIDENT_FRACTION,
                               "worker_max": WORKER_MAX, "worker_max_failover": WORKER_MAX_FAILOVER, "tool_resume": TOOL_RESUME, "race_watchdog": RACE_WATCHDOG,
                               "min_count": MIN_COUNT, "local": _LOCAL,
                               "explore": EXPLORE_MODE, "hide_dyva": HIDE_DYVA,
