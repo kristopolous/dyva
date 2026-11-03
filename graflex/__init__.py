@@ -3013,6 +3013,41 @@ def _session_hosts(session, service, site=None, base="/tmp/graflex"):
     return list(out.values())
 
 
+def _survey_recovery_targets(sighted, recoverable):
+    """The survey entries worth re-probing for recovery: those a fresh survey sighted
+    (`sighted`, host-entry dicts) whose host is ALSO in the store's `recoverable` set
+    (currently `unreachable`). Returns the original survey entries (order preserved) so the
+    probe carries each host's full record, not a bare host string."""
+    return [h for h in sighted if _entry_host(h) in recoverable]
+
+
+async def _run_survey_recovery(service, name=None, check_timeout=60, workers=10,
+                               session=None, site=None, sighted=None, probe=None):
+    """Re-probe ONLY the hosts a fresh survey re-sighted that we currently hold as
+    `unreachable`. The expensive whole-pool re-probe is `check-everything`; this is the
+    cheap, re-sighting-triggered path — bounded by the survey's size, not the stored pool.
+
+    `sighted` / `probe` are injection seams for tests (no network, no session files):
+    `sighted` overrides the reparse of the survey's raw files; `probe(targets)` overrides
+    the live host probe."""
+    if name is None:
+        name = service
+    if sighted is None:
+        sighted = _session_hosts(session, service, site)
+    recoverable = _hoststore.recoverable_hosts(_store(), service)
+    targets = _survey_recovery_targets(sighted, recoverable)
+    log.info(f"check-survey: {len(targets)} re-sighted unreachable host(s) to re-probe "
+             f"(of {len(sighted)} sighted; {len(recoverable)} currently unreachable in store)")
+    if targets:
+        if probe is None:
+            working_file = _cache_file(name, "working")
+            notworking_file = _cache_file(name, "notworking")
+            await _check_hosts(targets, service, working_file, notworking_file, check_timeout, workers)
+        else:
+            await probe(targets)
+    export(service)   # regenerate this service's json from the DB (a recovered host leaves the bad pool)
+
+
 async def _check_all(service, name=None, check_timeout=60, check_new=False, check_all=False, workers=10, session=None, site=None):
     from datetime import datetime, timezone
 
@@ -4379,7 +4414,7 @@ The other actions find hosts, reshape the stores, or mine the snapshots:
                     files) — not data loss: geo re-derives with enrich.""")
     parser.add_argument("--ct", "--check-timeout", dest="check_timeout", type=int, default=60, help="per-host check timeout in seconds (default: 60)")
     parser.add_argument("--curlify", action="store_true", help="print curl command instead of executing")
-    parser.add_argument("-a", "--action", choices=["fetch", "check", "check-new", "check-everything", "check-all", "check-working", "check-zero", "check-stdin", "fetch-check", "classify", "enrich", "survey", "reconstruct", "export", "score-bogus", "sample", "strip"], required=True, help="action to perform. check-new = this session's newly-fetched hosts (light); check-everything = re-probe the whole stored pool; check-all = the whole pool INCLUDING known-good; check-stdin = re-probe a newline-delimited host list on stdin (per-host service looked up in the store, or forced with -s). Bare 'check' is intentionally undefined (the big sweep must be asked for explicitly).")
+    parser.add_argument("-a", "--action", choices=["fetch", "check", "check-new", "check-everything", "check-all", "check-survey", "check-working", "check-zero", "check-stdin", "fetch-check", "classify", "enrich", "survey", "reconstruct", "export", "score-bogus", "sample", "strip"], required=True, help="action to perform. check-new = this session's newly-fetched hosts (light); check-everything = re-probe the whole stored pool; check-all = the whole pool INCLUDING known-good; check-survey = run a fresh survey, then re-probe ONLY the re-sighted hosts we hold as unreachable (cheap recovery of hosts that came back online, vs. the weeks-long whole-pool check-everything); check-stdin = re-probe a newline-delimited host list on stdin (per-host service looked up in the store, or forced with -s). Bare 'check' is intentionally undefined (the big sweep must be asked for explicitly).")
     parser.add_argument("-c", "--countries", help="comma-separated country codes to cycle (default: CN,US,CA,JP,KR)")
     parser.add_argument("-d", "--dry", action="store_true", help="report what fetch would do without saving")
     parser.add_argument("-e", "--servers", help="comma-separated server values to cycle (default: uvicorn,nginx)")
@@ -4575,6 +4610,19 @@ The other actions find hosts, reshape the stores, or mine the snapshots:
                     if args.session and _svc == "ollama":
                         log.info("--- fold probed hosts into working (from check snapshots) ---")
                         reconstruct(name=_nm, session=args.session)
+            elif args.action == "check-survey":
+                # Fresh survey, then re-probe ONLY the hosts it re-sighted that we hold as
+                # `unreachable` — recovery of boxes that came back online, bounded by the
+                # survey size rather than the whole pool (the weeks-long check-everything).
+                log.info("--- check-survey (fresh survey → re-probe re-sighted unreachable) ---")
+                fetch(dry=args.dry, curlify=args.curlify, service=_svc, query=args.query,
+                      name=_nm, servers=args.servers, ports=args.ports, countries=args.countries,
+                      fids=args.fids, sleep=args.sleep, session=args.session, shuffle=args.shuffle,
+                      site=args.site)
+                if not args.dry and not args.curlify:
+                    asyncio.run(_run_survey_recovery(
+                        _svc, name=_nm, check_timeout=args.check_timeout, workers=args.workers,
+                        session=_RUN_TS or args.session, site=args.site))
             else:
                 for step in parts:
                     # log.info(f"--- {step} ---")

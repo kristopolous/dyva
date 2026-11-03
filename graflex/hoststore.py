@@ -168,6 +168,19 @@ def _reduce_service(conn, service):
     return final
 
 
+def recoverable_hosts(conn, service):
+    """The service's hosts whose CURRENT effective status is `unreachable` (offline /
+    timeout) — the ones worth re-probing when a fresh survey sights them again. Resolved
+    through the same last-observation-wins reduce the export uses, so a host that has since
+    come back (a newer working row) is excluded, as are hard-`error` endpoints (404 / auth /
+    bad JSON) and honeypots: only the offline class can be expected to simply return."""
+    out = set()
+    for host, (status, payload, _checked) in _reduce_service(conn, service).items():
+        if status == "notworking" and isinstance(payload, dict) and payload.get("result") == "unreachable":
+            out.add(host)
+    return out
+
+
 def all_hosts(conn, service):
     """Every host of a service across both tables (deduped). Discovery always inserts a `host`
     row before any probe, so this is normally just `host`; bad_hosts-only hosts (defensive, and
