@@ -2804,6 +2804,11 @@ def _get_db():
                      # (still raced, never banned), and it's cleared the moment the host
                      # succeeds on a prompt that big (it was reloaded bigger). NULL = unknown.
                      "ctx_limit INTEGER",
+                     # Largest prompt (tokens) this (host,model) has SUCCESSFULLY processed — the
+                     # positive twin of ctx_limit. Hard evidence used to BAND candidates for a big
+                     # request (proven-capable first). Only ever GROWS (MAX on write); not a
+                     # reputation mark, cleared by nothing (a success never shrinks). NULL = never measured.
+                     "max_ok INTEGER",
                      # Physical micro-batch ceiling (ubatch / num_batch) a DECISION-model host
                      # reported when it rejected an oversized input: "input (N tokens) is too large
                      # to process. increase the physical batch size (current batch size: M)". Raw
@@ -3685,6 +3690,35 @@ def clear_ctx_limit(host, model, ingested):
         db.commit()
     except Exception as e:
         log.debug(f"clear_ctx_limit failed: {e}")
+
+
+def mark_max_ok(host, model, tokens):
+    """Record that (host, resolved-model) SUCCESSFULLY processed a prompt of `tokens`.
+    max_ok only ever grows (MAX), so a smaller later success never shrinks it. Upserts a
+    neutral 'unknown' row if none exists (same idiom as mark_ctx_limit); no reputation mark."""
+    if not tokens:
+        return
+    try:
+        db = _get_db()
+        db.execute(
+            "INSERT INTO host_status(host,model,state,max_ok) VALUES(?,?, 'unknown', ?)"
+            " ON CONFLICT(host,model) DO UPDATE SET max_ok=MAX(COALESCE(max_ok,0), excluded.max_ok)",
+            (host, model, int(tokens)))
+        db.commit()
+    except Exception as e:
+        log.debug(f"mark_max_ok failed: {e}")
+
+
+def _load_max_ok():
+    """{(host, model): max_ok} for the hosts we've measured a successful prompt size on.
+    Only non-NULL rows, so cheap to load per race (mirrors _load_ctx_limits)."""
+    try:
+        db = _get_db()
+        return {(h, m): n for h, m, n in db.execute(
+            f"SELECT host, model, max_ok FROM host_status "
+            f"WHERE max_ok IS NOT NULL AND {_LIVE_REAL}")}
+    except Exception:
+        return {}
 
 
 def _load_ctx_limits():
