@@ -24,7 +24,12 @@
     "^(clip_gguf|tmp_hunyuan_loras|tmp_wanvideo_loras|video_formats|frame_interpolation)/"
   ],
   "music": [
-    "(ace_step|acestep)"
+    "(ace_step|acestep)",
+    "minimax.?music",
+    "musicgen",
+    "audiocraft",
+    "songbloom",
+    "(^|[/_.-])yue(?=[-_.0-9])"
   ],
   "audio": [
     "^(qwen-tts|fishaudioS2|mmaudio|voxcpm|voxcpm_lora|SenseVoice|sonic|foley|audiodit|audio_encoders|wav2vec2)/",

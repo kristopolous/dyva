@@ -18820,53 +18820,104 @@ async def _poll_comfy_audio(session, host, prompt_id, timeout=900):
         raise _MusicError(str(e))
 
 
+async def _music_attempt(session, host, job):
+    """One host's turn in the music race: probe /object_info, pick a family, build
+    the graph, and submit. Returns the Outcome the race reads — `accepted` carries
+    (host, prompt_id, family, model); anything else is a failure verdict. The race
+    engine records reputation from the verdict, so this records none itself."""
+    p = job.get("params") or {}
+    info = await _get_object_info(session, host)
+    if not info:
+        return unreachable_host("unreachable")
+    fam, enc, lat = _music_family_on_host(info)
+    if not fam:
+        return unsuitable("no known music nodes")
+    try:
+        graph, model_ref = _build_music_workflow(
+            info, fam, enc, lat, job["style"], job.get("lyrics") or "",
+            job["seconds"], job["seed"], int(p.get("steps", 50)), float(p.get("cfg", 5.0)))
+    except _MusicError as e:
+        return unsuitable(str(e) or "music build failed")
+    try:
+        pid = await comfy_submit(session, host, graph)
+    except (ComfyError, asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
+        return render_verdict(e)
+    return accepted((host, pid, fam["name"], model_ref), model_ref)
+
+
 async def _run_music_job(session, jid):
+    """Generate music by racing the WHOLE audio-host pool through the shared
+    `_race_hosts` engine — the same routing chat/image/video/speech use (bounded
+    concurrent worker pool, reputation tiers, host leasing, no candidate cap),
+    with `_music_attempt` as the only music-specific part. The race finds a host
+    that accepts the submit; we poll that host for the audio and, if it
+    accepted-then-failed, re-race the rest. Mirrors `_run_video_job`."""
     job = _MUSIC_JOBS.get(jid)
     if not job:
         return
     job["status"] = "in_progress"
     _music_job_save()
-    p = job.get("params") or {}
     label = f"music: {job.get('style', '')[:40]}"
-    t0 = time.time()
-    host = None
+    hosts = list(job.get("hosts") or [])
     errors = []
+    job_wid = await _register_worker(job.get("model") or "*", len(hosts),
+                                     lambda: None, kind="music")
+
+    async def attempt(host, wid, done):
+        await broadcast_activity(host, label, "trying", label, wid=wid)
+        t0 = time.time()
+        out = await _music_attempt(session, host, job)
+        if out.verdict == V_ACCEPTED:
+            await broadcast_activity(host, label, "connected", label,
+                                     duration=time.time() - t0, wid=wid, rmodel=out.result[3])
+        else:
+            errors.append(f"{host}: {out.detail or out.verdict}")
+            await broadcast_activity(host, label, "failed",
+                                     f"{label}: {out.detail or out.verdict}",
+                                     duration=time.time() - t0, wid=wid)
+        return out
+
+    completed = False
+    tried = set()
     try:
-        for cand in job.get("hosts") or []:
-            info = await _get_object_info(session, cand)
-            if not info:
-                errors.append(f"{cand}: unreachable")
-                continue
-            fam, enc, lat = _music_family_on_host(info)
-            if not fam:
-                errors.append(f"{cand}: no known music nodes")
-                continue
-            try:
-                graph, model_ref = _build_music_workflow(
-                    info, fam, enc, lat, job["style"], job.get("lyrics") or "",
-                    job["seconds"], job["seed"], int(p.get("steps", 50)), float(p.get("cfg", 5.0)))
-            except _MusicError as e:
-                log.warning(f"music build: {cand}: {e}")
-                errors.append(f"{cand}: {e}")
-                continue
-            host = cand
+        while True:
+            pool = [h for h in hosts if h not in tried]
+            if not pool:
+                break
+            # Lease each host exclusively so concurrent renders spread across the
+            # pool (the text race's one-job-per-host rule); busy-beats-none fallback.
+            starved = []
+            result, stopped, _tried, _tally = await _race_hosts(
+                pool, attempt, MUSIC_KEY, job_wid=job_wid, banker_key=MUSIC_KEY,
+                starved_out=starved, defer_good=True)
+            if result is None and starved and not stopped:
+                result, stopped, _t2, _ta2 = await _race_hosts(
+                    starved, attempt, MUSIC_KEY, job_wid=job_wid, defer_good=True)
+            if not result or stopped:
+                break
+            host, pid, fam_name, model_ref = result
+            tried.add(host)
             job["host"] = host
-            job["family"] = fam["name"]
+            job["family"] = fam_name
             job["model"] = model_ref
-            _music_job_save()
-            await broadcast_activity(host, label, "trying", label, rmodel=model_ref)
-            try:
-                pid = await comfy_submit(session, host, graph)
-            except ComfyError as e:
-                # The reason the host said no is worth keeping — "rejected the
-                # graph" hid whether the nodes were missing or it was just down.
-                errors.append(f"{host}: {e}")
-                host = None
-                continue
             job["comfyui_prompt_id"] = pid
+            job["phase"] = "composing"
+            job["phase_at"] = time.time()
             _music_job_save()
-            async with _waiting_worker(label, host, "composing", model=model_ref):
+            mark_worker_found(job_wid, host, model_ref)
+            _set_worker_phase(job_wid, "composing")
+            try:
                 content, filename = await _poll_comfy_audio(session, host, pid)
+            except (_MusicError, ComfyError, asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
+                # took the job then couldn't finish — record it so the host stops
+                # looking good, and re-race the remaining hosts.
+                record_verdict(host, MUSIC_KEY, render_verdict(e))
+                err = str(e) or type(e).__name__
+                errors.append(f"{host}: {err}")
+                log.warning(f"music: {host}: took the job then failed: {err}")
+                await broadcast_activity(host, label, "failed", f"{label}: {err}")
+                _set_worker_phase(job_wid, None)
+                continue
             os.makedirs(MUSIC_JOBS_DIR, exist_ok=True)
             content_path = os.path.join(MUSIC_JOBS_DIR, f"{jid}.bin")
             with open(content_path, "wb") as f:
@@ -18874,25 +18925,28 @@ async def _run_music_job(session, jid):
             job["content_path"] = content_path
             job["filename"] = filename
             job["status"] = "completed"
+            job["phase"] = None
             job["unsigned_urls"] = [f"/v1/music/{jid}/content"]
-            add_good(host, MUSIC_KEY)
+            # GOOD on completion, not on accept (the race ran defer_good).
+            record_verdict(host, MUSIC_KEY, accepted(None, model_ref), sticky_key=MUSIC_KEY)
             set_last(MUSIC_KEY, host, model_ref)
-            await broadcast_activity(host, label, "done", label, duration=time.time() - t0,
-                                     rmodel=model_ref)
+            await broadcast_activity(host, label, "done", label, rmodel=model_ref)
             _music_job_save()
-            return
-        raise _MusicError("; ".join(errors) if errors else "no music-capable host answered")
-    except (_MusicError, asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
-        job["status"] = "failed"
-        job["error"] = str(e) or type(e).__name__
-        if host:
-            log.warning(f"music: {host}: {job['error']}")
-            # A timeout on music gen is alive-but-slow (rendering is slow) -> SOFT-fail; a real
-            # fault/connection error -> add_bad.
-            (add_soft_fail if isinstance(e, asyncio.TimeoutError) else add_bad)(
-                host, MUSIC_KEY, reason=f"music: {job['error']}")
-            await broadcast_activity(host, label, "failed", f"{label}: {job['error']}", duration=time.time() - t0)
-        _music_job_save()
+            completed = True
+            break
+    except Exception as e:                                  # never leak the worker
+        log.warning(f"music {jid}: unexpected: {e}")
+        errors.append(f"{job.get('host') or '?'}: {e}")
+
+    if completed:
+        await _unregister_worker(job_wid, ok=True)
+        return
+    await _unregister_worker(job_wid)
+    reasons = collections.Counter(e.split(": ", 1)[1] if ": " in e else e for e in errors)
+    job["status"] = "failed"
+    job["error"] = ("; ".join(f"{c}x {r}" for r, c in reasons.most_common())
+                    or "no music-capable host answered")
+    _music_job_save()
 
 
 async def handle_music_post(request):
@@ -18970,7 +19024,7 @@ async def handle_music_post(request):
     model_filter = str(body.get("model") or "")
     if model_filter:
         hosts = [h for h in hosts if _pick_music_model(h, model_filter)] or hosts
-    job = {"id": None, "status": "pending", "hosts": hosts[:8], "host": None,
+    job = {"id": None, "status": "pending", "hosts": hosts, "host": None,
            "model": None, "family": None, "style": style, "lyrics": lyrics,
            "seconds": seconds, "seed": seed, "params": dict(body),
            "created": time.time(), "unsigned_urls": []}
@@ -18993,6 +19047,71 @@ def _pick_music_model(host, model_filter=None):
                 continue
             return m
     return None
+
+
+async def handle_music_list(request):
+    """
+    Recent music jobs
+    ---
+    tags: [Music]
+    summary: GET /v1/music — the recent job list, newest first
+    description: |
+      Metadata only; the bytes are at `/v1/music/{id}/content`. `content_url` is
+      set only for a completed job that actually wrote a clip, so an in-flight or
+      failed job never advertises a dead URL. In-flight and failed jobs are listed
+      too, so the gallery can show what is cooking and what went wrong.
+    responses:
+      '200':
+        description: Job list
+    """
+    # _MUSIC_JOBS is loaded lazily; without this the gallery comes up EMPTY when
+    # GET /v1/music is the first music endpoint hit after a restart (mirrors the
+    # video gallery's same fix).
+    _load_music_jobs()
+    out = []
+    for jid, job in _MUSIC_JOBS.items():
+        if not isinstance(job, dict):
+            continue
+        host = job.get("host") or ""
+        out.append({
+            "id": jid,
+            "status": job.get("status"),
+            "prompt": job.get("style") or "",          # named `prompt` like the video list
+            "style": job.get("style") or "",
+            "lyrics": job.get("lyrics") or "",
+            "model": job.get("model") or "",
+            "host": host,
+            "family": job.get("family") or "",
+            "service": service_of(host) if host else "",
+            "seconds": job.get("seconds"),
+            "created": job.get("created"),
+            "error": job.get("error"),
+            "content_url": (f"/v1/music/{jid}/content" if job.get("content_path") else None),
+        })
+    out.sort(key=lambda j: j.get("created") or 0, reverse=True)
+    return web.json_response(out)
+
+
+async def handle_music_delete(request):
+    """
+    Delete a music job
+    ---
+    tags: [Music]
+    summary: GET /v1/music/{id}/delete — remove a job and its clip
+    responses:
+      '200':
+        description: Deleted
+    """
+    jid = request.match_info.get("id", "")
+    _load_music_jobs()
+    job = _MUSIC_JOBS.pop(jid, None)
+    if job and job.get("content_path"):
+        try:
+            os.remove(job["content_path"])
+        except OSError:
+            pass
+    _music_job_save()
+    return web.json_response({"deleted": bool(job)})
 
 
 async def handle_music_get(request):
@@ -19067,49 +19186,6 @@ async def handle_music_content(request):
     with open(path, "rb") as f:
         return web.Response(body=f.read(), content_type=ctype,
                             headers={"Content-Disposition": f'inline; filename="{name}"'})
-
-
-async def handle_music_models(request):
-    """
-    List music-capable hosts and the families they run
-    ---
-    tags: [Music]
-    summary: GET /v1/music/models — probe audio hosts for known music node families
-    responses:
-      '200':
-        description: Per-host music capability
-    """
-    resp = await _check_local(request)
-    if resp:
-        return resp
-    session = request.app["session"]
-    hosts = _find_music_hosts(request.query.get("host"))
-    if not hosts:
-        return web.json_response({"hosts": [], "families": []})
-
-    async def probe(host):
-        info = await _get_object_info(session, host)
-        if not info:
-            return None
-        fam, enc, lat = _music_family_on_host(info)
-        if not fam:
-            return None
-        return {"host": _norm_host(host), "family": fam["name"],
-                "encode_node": enc, "latent_node": lat,
-                "models": [m for m in (_host_models(host) or [])
-                           if model_classes(m) & _AUDIO_CLASSES]}
-
-    found = [r for r in await asyncio.gather(*(probe(h) for h in hosts[:12]),
-                                             return_exceptions=True) if isinstance(r, dict)]
-    return web.json_response({"hosts": found,
-                              "families": sorted({f["family"] for f in found})})
-
-
-def _host_models(host):
-    for s in load_servers():
-        if s.get("server") == host:
-            return s.get("models") or []
-    return []
 
 
 def _task_stack_1line(t):
@@ -19345,7 +19421,6 @@ def make_app():
     swagger.add_get("/v1/images/edit-models", handle_edit_models)
     swagger.add_get("/v1/audio/voices", handle_audio_voices)
     app.router.add_get("/v1/audio/clips/{name}", handle_audio_clip)
-    swagger.add_get("/v1/music/models", handle_music_models)
     # Registered on the plain router (not swagger) so path params and the
     # sendBeacon POST body aren't subject to swagger request validation.
     app.router.add_post("/v1/web/fetch", handle_web_fetch)
@@ -19371,6 +19446,8 @@ def make_app():
     app.router.add_get("/v1/videos/{id}", handle_videos_get)
     app.router.add_get("/v1/videos/{id}/content", handle_videos_content)
     app.router.add_post("/v1/music", handle_music_post)
+    swagger.add_get("/v1/music", handle_music_list)
+    app.router.add_get("/v1/music/{id}/delete", handle_music_delete)
     app.router.add_get("/v1/music/{id}", handle_music_get)
     app.router.add_get("/v1/music/{id}/content", handle_music_content)
 
