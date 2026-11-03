@@ -8245,8 +8245,8 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
                 f"retrying for a complete answer (not penalised)", wid=job_wid)
         elif made <= 40:  # 'length' with no real output — see note above
             await broadcast_activity(host, full, "warming",
-                f"hit the context window at {made} chars (no output) on {host} — "
-                f"failing over to a fresh host", wid=job_wid)
+                f"{host} returned an empty response but reported hitting its length limit "
+                f"— it won't answer a prompt this size; trying another host", wid=job_wid)
             mark_empty_length(host, full)   # observational tally — see the column note
             # ...and now act on it: the host couldn't answer a prompt this big, so lower its
             # ctx_limit toward that size (soft, self-healing) — big requests stop re-racing into it.
