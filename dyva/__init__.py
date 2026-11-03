@@ -1901,6 +1901,9 @@ async def account_tokens(wid, host, model, obj, num_ctx):
     # Self-refresh the context ceiling: the host just ingested `p` prompt tokens, so if a
     # recorded ctx_limit was <= that, it was stale (reloaded bigger) — clear it.
     clear_ctx_limit(host, model, p)
+    # Positive evidence: the host just PROVED it can handle `p` prompt tokens — band big
+    # requests toward hosts proven at/above their size (see _order_by_size).
+    mark_max_ok(host, model, p)
     # tokens/second, most-recent (host, model) reading. Prefer the upstream's OWN
     # generation timing when it reports it: Ollama gives eval_count / eval_duration
     # (nanoseconds), the true tok/s regardless of how fast WE drained the socket.
@@ -3654,6 +3657,25 @@ def mark_ctx_limit(host, model, n_ctx):
         db.commit()
     except Exception as e:
         log.debug(f"mark_ctx_limit failed: {e}")
+
+
+def mark_overflow(host, model, prompt_tokens):
+    """A 0-char done_reason='length' drop: the host couldn't answer a prompt of
+    `prompt_tokens`, so its effective ceiling is at/below that. Lower ctx_limit toward it
+    (MIN — never RAISES an existing lower ceiling), soft + reversible like mark_ctx_limit;
+    cleared by clear_ctx_limit on the next success at that size. No reputation mark."""
+    if not prompt_tokens:
+        return
+    try:
+        db = _get_db()
+        db.execute(
+            "INSERT INTO host_status(host,model,state,ctx_limit) VALUES(?,?, 'unknown', ?)"
+            " ON CONFLICT(host,model) DO UPDATE SET"
+            " ctx_limit=MIN(COALESCE(ctx_limit, excluded.ctx_limit), excluded.ctx_limit)",
+            (host, model, int(prompt_tokens)))
+        db.commit()
+    except Exception as e:
+        log.debug(f"mark_overflow failed: {e}")
 
 
 def mark_empty_length(host, model):
@@ -8189,6 +8211,9 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
                 f"hit the context window at {made} chars (no output) on {host} — "
                 f"failing over to a fresh host", wid=job_wid)
             mark_empty_length(host, full)   # observational tally — see the column note
+            # ...and now act on it: the host couldn't answer a prompt this big, so lower its
+            # ctx_limit toward that size (soft, self-healing) — big requests stop re-racing into it.
+            mark_overflow(host, full, (_workers.get(job_wid) or {}).get("prompt_est"))
             dead.add(host)
         else:  # 'length' with real streamed text
             await broadcast_activity(host, full, "trying",
