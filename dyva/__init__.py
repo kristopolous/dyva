@@ -656,7 +656,7 @@ def model_modalities(model):
 def load_settings():
     """Apply persisted runtime settings (workers/timeout/min_count/local) over
     the CLI defaults, so changes made in the dashboard survive restarts."""
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION
     if not os.path.exists(SETTINGS_FILE):
         return
     try:
@@ -670,6 +670,8 @@ def load_settings():
         TIMEOUT = s["timeout"]
     if isinstance(s.get("hedge_delay"), (int, float)) and s["hedge_delay"] >= 0:
         HEDGE_DELAY = s["hedge_delay"]
+    if isinstance(s.get("ctx_confident_fraction"), (int, float)) and 0 < s["ctx_confident_fraction"] <= 1:
+        CTX_CONFIDENT_FRACTION = s["ctx_confident_fraction"]
     if "warm_connect_wait" in s:
         _wcw = s["warm_connect_wait"]
         WARM_CONNECT_WAIT = _wcw if isinstance(_wcw, (int, float)) and _wcw >= 0 else None
@@ -725,7 +727,7 @@ def save_settings(extra=None):
     if not isinstance(data, dict):
         data = {}
     data.update({"workers": WORKER_COUNT, "timeout": TIMEOUT,
-                 "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS,
+                 "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS, "ctx_confident_fraction": CTX_CONFIDENT_FRACTION,
                  "worker_max": WORKER_MAX, "worker_max_failover": WORKER_MAX_FAILOVER, "tool_resume": TOOL_RESUME, "race_watchdog": RACE_WATCHDOG,
                  "min_count": MIN_COUNT, "local": _LOCAL, "explore": EXPLORE_MODE, "hide_dyva": HIDE_DYVA,
                  "admin_pw": ADMIN_PW, "model_list": MODEL_LIST, "model_list_on": MODEL_LIST_ON,
@@ -3741,6 +3743,32 @@ def _load_max_ok():
             f"WHERE max_ok IS NOT NULL AND {_LIVE_REAL}")}
     except Exception:
         return {}
+
+
+def _size_rank(need, max_ok, frac):
+    """Band a (host,model) by PROVEN capacity vs the needed window: 0 = proven at/above
+    need, 1 = proven within frac×need, 2 = unknown or proven smaller. Lower is better."""
+    if not max_ok:
+        return 2
+    if max_ok >= need:
+        return 0
+    if max_ok >= frac * need:
+        return 1
+    return 2
+
+
+def _order_by_size(servers, need, max_ok, frac):
+    """Stable-reorder race candidates [(prio, host, models)] best-proven-size first. A no-op
+    when need<=0 or no sizes are known. A bad/unreachable host (prio >= TIER_BAD) is never
+    promoted — it sorts below every non-bad host regardless of its max_ok."""
+    if need <= 0 or not max_ok:
+        return servers
+    def _band(entry):
+        prio, host, ms = entry
+        if prio >= TIER_BAD:
+            return 3
+        return min((_size_rank(need, max_ok.get((host, m)), frac) for m in ms), default=2)
+    return sorted(servers, key=_band)
 
 
 def _load_ctx_limits():
@@ -6929,6 +6957,11 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
             servers = [(prio, host,
                         [m for m in ms if _fits(host, m)] + [m for m in ms if not _fits(host, m)])
                        for (prio, host, ms) in servers]
+    # Size banding: among the ctx-fitting survivors, prefer hosts PROVEN to handle this prompt
+    # size (max_ok >= need), then those proven near it (>= CTX_CONFIDENT_FRACTION×need), then
+    # the rest by existing order — so a big request stops cascading through hosts that nope out.
+    # Bad/unreachable hosts are never promoted (see _order_by_size).
+    servers = _order_by_size(servers, _need, _load_max_ok() if _pt else {}, CTX_CONFIDENT_FRACTION)
     def _toobig(host, ms):
         return 0 if (not _ctx or not ms or _fits(host, ms[0])) else 1
     # User vote (👍/👎): a signed preference that orders a pair WITHIN its tier and NEVER
@@ -7387,6 +7420,10 @@ IMAGE_TOKENS = 2048
 # silently clamping. The old 32768 cap quietly broke agentic tooling, whose tool
 # schemas + accumulated history routinely blow past it.
 NUM_CTX_MAX = 2 ** 20          # 1048576 — a sanity bound, not a real limit (Qwen3 et al. reach 256k native, ~1M with YaRN)
+# Size banding (routing): a host PROVEN to have handled at least this fraction of the needed
+# window is still preferred for a big request (band 1), below one proven at/above it (band 0).
+# Routing-config tunable, NOT a magic number — overridable via settings/dashboard. 0.6 = 60%.
+CTX_CONFIDENT_FRACTION = 0.6
 NUM_CTX_RETRIES = 2            # re-sends with a doubled window after a truncation
 
 # The upstream models are Llama/Qwen/etc., whose tokenizers we don't ship, so an
@@ -10405,7 +10442,7 @@ async def handle_settings_get(request):
         # show a password prompt instead of the controls.
         return web.json_response({"admin": False, "admin_pw_set": True}, status=403)
     return web.json_response({"workers": WORKER_COUNT, "timeout": TIMEOUT,
-                              "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS,
+                              "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS, "ctx_confident_fraction": CTX_CONFIDENT_FRACTION,
                               "worker_max": WORKER_MAX, "worker_max_failover": WORKER_MAX_FAILOVER, "tool_resume": TOOL_RESUME, "race_watchdog": RACE_WATCHDOG,
                               "min_count": MIN_COUNT, "local": _LOCAL,
                               "explore": EXPLORE_MODE, "hide_dyva": HIDE_DYVA,
@@ -10428,7 +10465,7 @@ async def handle_settings_post(request):
       '200':
         description: Updated settings
     """
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION
     resp = await _check_local(request) or _check_admin(request)
     if resp:
         return resp
@@ -10451,6 +10488,8 @@ async def handle_settings_post(request):
         TIMEOUT = min(body["timeout"], 600)
     if isinstance(body.get("hedge_delay"), (int, float)) and body["hedge_delay"] >= 0:
         HEDGE_DELAY = min(body["hedge_delay"], 600)
+    if isinstance(body.get("ctx_confident_fraction"), (int, float)) and 0 < body["ctx_confident_fraction"] <= 1:
+        CTX_CONFIDENT_FRACTION = body["ctx_confident_fraction"]
     if "warm_connect_wait" in body:   # a number = connect sub-phase; null = full lead (off)
         _wcw = body["warm_connect_wait"]
         WARM_CONNECT_WAIT = min(_wcw, 600) if isinstance(_wcw, (int, float)) and _wcw >= 0 else None
@@ -10520,7 +10559,7 @@ async def handle_settings_post(request):
     if sources_changed:
         await asyncio.get_event_loop().run_in_executor(None, refresh_cache)
     return web.json_response({"workers": WORKER_COUNT, "timeout": TIMEOUT,
-                              "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS,
+                              "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS, "ctx_confident_fraction": CTX_CONFIDENT_FRACTION,
                               "worker_max": WORKER_MAX, "worker_max_failover": WORKER_MAX_FAILOVER, "tool_resume": TOOL_RESUME, "race_watchdog": RACE_WATCHDOG,
                               "min_count": MIN_COUNT, "local": _LOCAL,
                               "explore": EXPLORE_MODE, "hide_dyva": HIDE_DYVA,
