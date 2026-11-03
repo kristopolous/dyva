@@ -934,6 +934,36 @@ def _is_offline_error(exc):
     return type(exc).__name__ == "NameResolutionError" or _is_offline_msg(str(exc))
 
 
+_AUTH_GATE_RE = re.compile(r"token|auth|unauthoriz|forbidden|credential|api.?key", re.I)
+
+
+async def _comfy_auth_gated(session, base_url, timeout=TIMEOUT):
+    """Probe POST /prompt with a throwaway empty graph to detect a token-gated ComfyUI.
+    A gated host rejects it with an auth error (401/403, or a body carrying a token/auth
+    message) BEFORE it ever validates the workflow; an OPEN host returns a 400 validation
+    error (the empty graph is rejected, but only after auth passed). Returns True only on a
+    clear auth refusal — it never queues real work (the empty graph can't run), and a
+    connection failure returns False, since unreachable is the check's verdict, not this one."""
+    try:
+        resp = await asyncio.wait_for(
+            session.post(f"{base_url}prompt", json={"prompt": {}}, allow_redirects=False),
+            timeout=timeout)
+    except (asyncio.TimeoutError, aiohttp.ClientError, OSError):
+        return False
+    try:
+        if resp.status in (401, 403):
+            return True
+        body = await resp.text()
+        return bool(_AUTH_GATE_RE.search(body or ""))
+    except (aiohttp.ClientError, OSError):
+        return False
+    finally:
+        try:
+            await resp.release()
+        except Exception:
+            pass
+
+
 async def _comfyui_folders_direct(session, base_url, folders, timeout=TIMEOUT):
     """Fallback for comfyui hosts whose /models category index is unavailable (older
     or locked ComfyUI): probe the named model folders DIRECTLY — their per-folder
@@ -1316,6 +1346,11 @@ async def _check_host(session, host, port, service, timeout=TIMEOUT):
                             await stats_resp.release()
                     except Exception:
                         pass
+                    # Token-gate check: a ComfyUI that answers /models and /api/system_stats
+                    # but gates POST /prompt behind a token is unusable to us — flag it here so
+                    # it's excluded at survey time, not rediscovered per-request (~30s each).
+                    if await _comfy_auth_gated(session, base_url, timeout):
+                        result["auth_gated"] = True
                     return result
                 elif service == "vllm":
                     data = await resp.json()
@@ -3245,7 +3280,16 @@ async def _check_hosts(hosts, service, working_file, notworking_file, check_time
                     result["method"] = method
                 else:
                     result.pop("method", None)
-                if service == "comfyui" and not result["models"]:
+                if service == "comfyui" and result.get("auth_gated"):
+                    # Gates POST /prompt behind a token: answers our GET probes but rejects every
+                    # generation, so it must never be promoted. Same reversible idiom as no-models
+                    # below — the full payload is kept (auditable), and a later ungated check writes
+                    # a "working" row that the export reduce flips back by `checked` recency.
+                    result["reason"] = "auth-gated"
+                    result["result"] = "auth-gated"
+                    _store_record(service, entry["host"], "notworking", result)
+                    log.info(f"~ {entry['host']}: comfyui, token-gated POST /prompt -> auth-gated (not promoted)")
+                elif service == "comfyui" and not result["models"]:
                     # Probes as live ComfyUI but serves ZERO model files across every
                     # category — it cannot generate anything, so it must never be
                     # promoted to the pool. Record as notworking with a distinct,
