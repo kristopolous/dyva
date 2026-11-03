@@ -510,6 +510,11 @@ _CLASS_MODALITIES = {
 }
 _VIDEO_CLASSES = {"video", "t2v", "i2v"}
 _AUDIO_CLASSES = {"audio", "music", "t2a"}
+# Music GENERATION needs a text-to-music checkpoint (ace-step, minimax-music, yue,
+# songbloom, musicgen), not just any audio-class model. Selecting by _AUDIO_CLASSES
+# swept in TTS-only hosts and hosts with the AceStep *nodes* but no *model* — ~100
+# of ~120 "candidates" that could only ever fail with "no matching model to load".
+_MUSIC_MODEL_CLASS = frozenset({"music"})
 
 # Async ComfyUI video-generation jobs (OpenRouter /v1/videos compatible).
 VIDEO_KEY = "video"      # no wildcard: canon_pattern() eats a trailing "*"
@@ -8152,8 +8157,8 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
                 f"retrying for a complete answer (not penalised)", wid=job_wid)
         elif made <= 40:  # 'length' with no real output — see note above
             await broadcast_activity(host, full, "warming",
-                f"hit the context window at {made} chars (no output) on {host} — "
-                f"failing over to a fresh host", wid=job_wid)
+                f"{host} returned an empty response but reported hitting its length limit "
+                f"— it won't answer a prompt this size; trying another host", wid=job_wid)
             mark_empty_length(host, full)   # observational tally — see the column note
             dead.add(host)
         else:  # 'length' with real streamed text
@@ -15701,7 +15706,9 @@ async def _run_video_job(session, jid):
         await _unregister_worker(job_wid, ok=True)
         return
 
-    await _unregister_worker(job_wid)
+    # ok=False: a video job that found a host and then failed the render is a
+    # failure, not the default found-a-host "ok" that mislabels the worker record.
+    await _unregister_worker(job_wid, ok=False)
     reasons = collections.Counter(e.split(": ", 1)[1] if ": " in e else e for e in errors)
     job["status"] = "failed"
     job["error"] = ("; ".join(f"{c}x {r}" for r, c in reasons.most_common())
@@ -18744,14 +18751,17 @@ def _build_music_workflow(info, fam, enc_cls, lat_cls, style, lyrics, seconds, s
 
 
 def _find_music_hosts(target_host=None):
-    """ComfyUI hosts carrying an audio/music-class model. Whether they can
-    actually generate music is decided by probing /object_info at submit time —
-    a model class alone never implies capability."""
+    """ComfyUI hosts carrying a music GENERATION model (the `music` class — a
+    loadable text-to-music checkpoint), not merely any audio-class model. A
+    TTS-only host, or one with the AceStep nodes but no checkpoint, is not a
+    candidate: it could only ever fail with "no matching model to load". Whether
+    a selected host can finish is still decided by probing /object_info at submit
+    time — model presence narrows the field, it doesn't promise success."""
     if target_host:
-        return [target_host] if _host_has_class(target_host, _AUDIO_CLASSES) else []
+        return [target_host] if _host_has_class(target_host, _MUSIC_MODEL_CLASS) else []
     hosts = [s.get("server") for s in load_servers()
              if s.get("service") == "comfyui" and s.get("server")
-             and _host_has_class(s.get("server"), _AUDIO_CLASSES)]
+             and _host_has_class(s.get("server"), _MUSIC_MODEL_CLASS)]
     bad, good = load_bad(), load_good()
     hosts.sort(key=lambda h: 0 if f"{h} {MUSIC_KEY}" in good else (1 if f"{h} {MUSIC_KEY}" not in bad else 2))
     last = get_last(MUSIC_KEY)
@@ -18941,7 +18951,10 @@ async def _run_music_job(session, jid):
     if completed:
         await _unregister_worker(job_wid, ok=True)
         return
-    await _unregister_worker(job_wid)
+    # ok=False explicitly: this media job FOUND a host (the race accepted) but the
+    # render then failed, so the default "found a host => ok" (a streaming-text
+    # assumption) would mislabel the worker record won/completed on a real failure.
+    await _unregister_worker(job_wid, ok=False)
     reasons = collections.Counter(e.split(": ", 1)[1] if ": " in e else e for e in errors)
     job["status"] = "failed"
     job["error"] = ("; ".join(f"{c}x {r}" for r, c in reasons.most_common())
@@ -19041,7 +19054,7 @@ def _pick_music_model(host, model_filter=None):
         if s.get("server") != host:
             continue
         for m in s.get("models") or []:
-            if not (model_classes(m) & _AUDIO_CLASSES):
+            if not (model_classes(m) & _MUSIC_MODEL_CLASS):
                 continue
             if model_filter and not match_model(m, model_filter):
                 continue
