@@ -1904,8 +1904,10 @@ async def account_tokens(wid, host, model, obj, num_ctx):
     # recorded ctx_limit was <= that, it was stale (reloaded bigger) — clear it.
     clear_ctx_limit(host, model, p)
     # Positive evidence: the host just PROVED it can handle `p` prompt tokens — band big
-    # requests toward hosts proven at/above their size (see _order_by_size).
-    mark_max_ok(host, model, p)
+    # requests toward hosts proven at/above their size (see _sizeband). A head-truncated
+    # prompt (p reached num_ctx) was NOT processed whole at that size, so it doesn't count.
+    if not _prompt_truncated(p, num_ctx):
+        mark_max_ok(host, model, p)
     # tokens/second, most-recent (host, model) reading. Prefer the upstream's OWN
     # generation timing when it reports it: Ollama gives eval_count / eval_duration
     # (nanoseconds), the true tok/s regardless of how fast WE drained the socket.
@@ -3757,18 +3759,22 @@ def _size_rank(need, max_ok, frac):
     return 2
 
 
-def _order_by_size(servers, need, max_ok, frac):
-    """Stable-reorder race candidates [(prio, host, models)] best-proven-size first. A no-op
-    when need<=0 or no sizes are known. A bad/unreachable host (prio >= TIER_BAD) is never
-    promoted — it sorts below every non-bad host regardless of its max_ok."""
-    if need <= 0 or not max_ok:
-        return servers
-    def _band(entry):
-        prio, host, ms = entry
-        if prio >= TIER_BAD:
-            return 3
-        return min((_size_rank(need, max_ok.get((host, m)), frac) for m in ms), default=2)
-    return sorted(servers, key=_band)
+def _sizeband(need, maxok, frac, host, ms):
+    """Band a (host, models) by PROVEN size for the race sort key (0 best, 2 unknown) — the
+    host's BEST (lowest-rank) model. Returns a constant 0 (no effect on ordering) when need<=0
+    or no sizes are known, so small/unmeasured traffic is never reordered. Bad-host protection
+    is NOT here: the race key keeps TIER primary, so a bad host is never promoted by its band."""
+    if need <= 0 or not maxok:
+        return 0
+    return min((_size_rank(need, maxok.get((host, m)), frac) for m in ms), default=2)
+
+
+def _race_sort_key(prio, vote, size_band, warm0, toobig, fav):
+    """The race candidate ordering key, lowest sorts first: TIER first (mechanical authority —
+    a bad/unreachable host is never promoted), then the user vote, then the PROVEN size band,
+    then warmth, then ctx-fit, then favourability. Extracted so the precedence — in particular
+    size sitting ABOVE warmth — is unit-testable (a bare pre-sort was silently overridden here)."""
+    return (prio, -vote, size_band, warm0, toobig, fav)
 
 
 def _load_ctx_limits():
@@ -6957,11 +6963,8 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
             servers = [(prio, host,
                         [m for m in ms if _fits(host, m)] + [m for m in ms if not _fits(host, m)])
                        for (prio, host, ms) in servers]
-    # Size banding: among the ctx-fitting survivors, prefer hosts PROVEN to handle this prompt
-    # size (max_ok >= need), then those proven near it (>= CTX_CONFIDENT_FRACTION×need), then
-    # the rest by existing order — so a big request stops cascading through hosts that nope out.
-    # Bad/unreachable hosts are never promoted (see _order_by_size).
-    servers = _order_by_size(servers, _need, _load_max_ok() if _pt else {}, CTX_CONFIDENT_FRACTION)
+    # Proven-size data for the race sort key below (loaded once; only when there's a real prompt).
+    _maxok = _load_max_ok() if _pt else {}
     def _toobig(host, ms):
         return 0 if (not _ctx or not ms or _fits(host, ms[0])) else 1
     # User vote (👍/👎): a signed preference that orders a pair WITHIN its tier and NEVER
@@ -6973,16 +6976,20 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
     def _vote(host, ms):
         vs = [_votes[(host, m)] for m in ms if (host, m) in _votes]
         return max(vs) if vs else 0   # +1 (favored); sorted via -vote so it lands first
-    # Order: TIER first (mechanical), then the vote within it, then warm/sticky, then
-    # too-big to the back of its tier, then WITHIN good/maybe by favorability. _fav is a
-    # per-job frozen snapshot so this race's own record_race writes can't churn the order
-    # mid-race. Unknown/explore hosts get favk=0 and keep their find_servers order (stable sort).
+    # Order: TIER first (mechanical), then the vote within it, then PROVEN size band, then
+    # warm/sticky, then too-big to the back of its tier, then WITHIN good/maybe by favorability.
+    # _fav is a per-job frozen snapshot so this race's own record_race writes can't churn the
+    # order mid-race. Unknown/explore hosts get favk=0 and keep their find_servers order (stable sort).
     _fav = _favorability(model, servers)
     def _order(it):
         prio, host, ms = it
         warm0 = 0 if (host in _warm and prio < TIER_BAD) else 1
         favk = -_fav[host]["fav"] if (host in _fav and prio in (TIER_GOOD, TIER_MAYBE)) else 0.0
-        return (prio, -_vote(host, ms), warm0, _toobig(host, ms), favk)
+        # Proven-size band sits ABOVE warmth: a host already shown to handle this prompt size
+        # beats a warm-but-unproven one for a big request (the fall-off-the-saddle fix).
+        return _race_sort_key(prio, _vote(host, ms),
+                              _sizeband(_need, _maxok, CTX_CONFIDENT_FRACTION, host, ms),
+                              warm0, _toobig(host, ms), favk)
     servers = sorted(servers, key=_order)
     for _i, (_p, _h, _m) in enumerate(servers):     # stamp final try-order rank for the log
         if _h in _fav:

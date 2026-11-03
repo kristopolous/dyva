@@ -1,18 +1,19 @@
-"""Size-aware band ordering of race candidates — pytest
-(`uv run pytest tests/test_ctx_size_routing.py`).
+"""Size-aware race ordering — pytest (`uv run pytest tests/test_ctx_size_routing.py`).
 
-A big request should prefer hosts PROVEN to handle its size: band 0 (max_ok >= need)
-before band 1 (>= frac*need) before band 2 (unknown/smaller), falling back to the
-incoming reputation order within a band. A bad/unreachable host is never promoted by a
-good max_ok, and a small/unknown request is untouched.
+A big request should prefer hosts PROVEN to handle its size. The banding feeds the race
+sort KEY (not a throwaway pre-sort), where it sits ABOVE warmth/favour but BELOW tier — so
+a proven host beats a warm-but-unproven one, yet a bad/unreachable host is never promoted.
+
+  - _size_rank: band one (need, max_ok) pair.
+  - _sizeband: band a host's best model, a no-op (constant 0) for small/unknown traffic.
+  - _race_sort_key: the race key; pins the precedence (size above warmth, tier primary) that
+    a bare pre-sort got wrong — the final _order sort would otherwise override it.
 """
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import dyva   # noqa: E402
-
-U = dyva.TIER_UNKNOWN
 
 
 def test_size_rank_bands():
@@ -22,29 +23,27 @@ def test_size_rank_bands():
     assert dyva._size_rank(100000, None, 0.6) == 2     # never measured
 
 
-def test_order_band0_before_band1_before_band2():
-    servers = [(U, "unknown", ["m"]), (U, "proven100", ["m"]), (U, "proven70", ["m"])]
-    max_ok = {("proven100", "m"): 120000, ("proven70", "m"): 70000}
-    order = [h for _, h, _ in dyva._order_by_size(servers, 100000, max_ok, 0.6)]
-    assert order == ["proven100", "proven70", "unknown"]
+def test_sizeband_bands_min_over_models_and_noop():
+    assert dyva._sizeband(100000, {("h", "m"): 120000}, 0.6, "h", ["m"]) == 0
+    assert dyva._sizeband(100000, {("h", "m"): 70000}, 0.6, "h", ["m"]) == 1
+    assert dyva._sizeband(100000, {("h", "m"): 40000}, 0.6, "h", ["m"]) == 2
+    # min over models: one proven model bands the host best
+    assert dyva._sizeband(100000, {("h", "a"): 120000}, 0.6, "h", ["a", "b"]) == 0
+    # no-op (constant 0, no reordering) when need<=0 or no sizes known
+    assert dyva._sizeband(0, {("h", "m"): 1}, 0.6, "h", ["m"]) == 0
+    assert dyva._sizeband(100000, {}, 0.6, "h", ["m"]) == 0
 
 
-def test_within_band_order_preserved():
-    servers = [(U, "a", ["m"]), (U, "b", ["m"]), (U, "z", ["m"])]
-    max_ok = {("a", "m"): 120000, ("b", "m"): 120000}          # a,b band 0; z unknown
-    order = [h for _, h, _ in dyva._order_by_size(servers, 100000, max_ok, 0.6)]
-    assert order[:2] == ["a", "b"]                              # stable within band 0
-    assert order[-1] == "z"
+def test_race_key_proven_size_beats_warmth():
+    # Finding-1 regression: proven (band 0) but NOT warm must sort before unknown (band 2)
+    # but warm. Size is key position 3, warmth position 4 — so size wins.
+    proven_cold = dyva._race_sort_key(dyva.TIER_GOOD, 0, 0, 1, 0, 0.0)   # warm0=1 (cold)
+    warm_unknown = dyva._race_sort_key(dyva.TIER_GOOD, 0, 2, 0, 0, 0.0)  # warm0=0 (warm)
+    assert proven_cold < warm_unknown
 
 
-def test_bad_host_never_promoted():
-    servers = [(dyva.TIER_BAD, "bad", ["m"]), (dyva.TIER_GOOD, "good", ["m"])]
-    max_ok = {("bad", "m"): 200000}                            # bad would be band 0
-    order = [h for _, h, _ in dyva._order_by_size(servers, 100000, max_ok, 0.6)]
-    assert order == ["good", "bad"]                            # bad sinks despite max_ok
-
-
-def test_small_or_unknown_need_is_noop():
-    servers = [(U, "a", ["m"]), (U, "b", ["m"])]
-    assert dyva._order_by_size(servers, 0, {("a", "m"): 1}, 0.6) == servers
-    assert dyva._order_by_size(servers, 100000, {}, 0.6) == servers
+def test_race_key_tier_stays_primary():
+    # tier outranks size: a bad host proven at size must NOT beat a good host of unknown size
+    bad_proven = dyva._race_sort_key(dyva.TIER_BAD, 0, 0, 0, 0, 0.0)
+    good_unknown = dyva._race_sort_key(dyva.TIER_GOOD, 0, 2, 1, 0, 0.0)
+    assert good_unknown < bad_proven

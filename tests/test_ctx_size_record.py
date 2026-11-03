@@ -76,6 +76,16 @@ def test_overflow_never_raises_a_lower_ceiling(monkeypatch):
     assert _ctx_limit(conn)[0] == 32768
 
 
+def test_truncated_success_does_not_record_max_ok(monkeypatch):
+    # Ollama dialect, prompt filled the window (p >= num_ctx) => head-truncated, NOT proof the
+    # host handled a prompt that size. Must not be recorded as max_ok (would mis-promote it).
+    conn = _db()
+    monkeypatch.setattr(dyva, "_status_db", conn, raising=False)
+    _quiet_tail(monkeypatch, usage=(70000, 5), openai=False, workers={WID: {}})
+    asyncio.run(dyva.account_tokens(WID, H, M, {}, 70000))   # num_ctx == p == 70000 -> truncated
+    assert (H, M) not in dyva._load_max_ok()
+
+
 def test_success_clears_overflow_ceiling(monkeypatch):
     conn = _db()
     monkeypatch.setattr(dyva, "_status_db", conn, raising=False)
