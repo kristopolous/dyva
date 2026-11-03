@@ -484,6 +484,14 @@ def _resolve_version():
 
 
 VERSION = _resolve_version()
+
+
+async def _stamp_server(request, response):
+    """Put the dyva build into the HTTP Server: header (same string as /api/version) so a bare
+    `curl -I` reveals which commit is answering, not the stock Python/aiohttp. on_response_prepare
+    (like _no_index) so it also stamps STREAMING responses before their headers flush, and it
+    overrides aiohttp's default Server (which is only applied via setdefault)."""
+    response.headers["Server"] = f"DYVA-{VERSION}"
 START_TS = time.time()   # process start (epoch secs); surfaced in /api/stats for the uptime counter
 SETTINGS_FILE = os.path.join(CACHE_DIR, "settings.json")
 
@@ -19467,6 +19475,7 @@ def make_app():
         response.headers["X-Robots-Tag"] = "noindex, nofollow, noarchive, nosnippet"
 
     app.on_response_prepare.append(_no_index)
+    app.on_response_prepare.append(_stamp_server)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
 
