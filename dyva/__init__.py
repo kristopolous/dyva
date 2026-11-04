@@ -6486,6 +6486,14 @@ def openai_payload(p):
                      ("stop", "stop")):
         if src in opts:
             out[dst] = opts[src]
+    # max_tokens must be an int (from options.num_predict above, or supplied top-level) —
+    # a strict OpenAI/vLLM host 400s a float/string, the same way Ollama 500s num_predict.
+    # Coerce it; an uncoercible value is dropped so the host uses its own default.
+    if "max_tokens" in out:
+        try:
+            out["max_tokens"] = int(out["max_tokens"])
+        except (TypeError, ValueError):
+            out.pop("max_tokens", None)
     if isinstance(out.get("messages"), list):
         out["messages"] = _messages_openai(out["messages"])
     # OpenAI-compatible hosts OMIT the `usage` block from a STREAMING response unless
