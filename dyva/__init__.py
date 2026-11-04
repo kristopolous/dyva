@@ -3921,7 +3921,34 @@ _session_prefer_hosts = set()
 # PURPOSE: the bug is versioned (service + ollama version + model), too messy to track
 # precisely, so a restart is the reset (the model may have been re-pulled/fixed). This is
 # NOT a reputation signal — the host answered fine; it never touches host-status.
-_session_no_think = set()
+#
+# STRIKES, not one-shot: a `status == "empty"` leg means the host closed the stream with a
+# clean `done` chunk but delivered no content. That IS the thinking bug — but it's also what
+# a host that choked / OOM'd mid-answer sends, and the two are indistinguishable at that
+# point. So one empty mustn't permanently flip a thinking-capable pair to no_think for the
+# whole runtime; we retry on every empty (cheap) but only PROACTIVELY suppress after
+# NO_THINK_STRIKES of them, and a real (non-empty) answer in between clears the tally.
+NO_THINK_STRIKES = 2
+_session_empty_strikes = {}   # (norm_host, model) -> empty-answer count this runtime
+
+
+def _note_empty_answer(host, full):
+    """Count one empty (thinking-only OR host-choked) answer for this pair; return the tally."""
+    k = (_norm_host(host), full)
+    _session_empty_strikes[k] = _session_empty_strikes.get(k, 0) + 1
+    return _session_empty_strikes[k]
+
+
+def _should_suppress_think(host, full):
+    """True once a pair has gone empty NO_THINK_STRIKES times — then it's the thinking bug,
+    not a one-off choke, so send no_think from the start to skip the wasted first pass."""
+    return _session_empty_strikes.get((_norm_host(host), full), 0) >= NO_THINK_STRIKES
+
+
+def _clear_empty_strikes(host, full):
+    """A real (non-empty) answer clears the tally: the pair CAN think, so any earlier empty
+    was a transient choke, not the versioned bug."""
+    _session_empty_strikes.pop((_norm_host(host), full), None)
 
 
 def mark_honeypot(host, reason=None):
@@ -6753,7 +6780,7 @@ async def _send_chat(session, host, full, payload, endpoint, do_stream, timeout=
         # thinking off, so we never pay the wasted first pass again this runtime. The
         # caller's explicit think wins; this only fires when think wasn't set.
         _think = payload.get("think")
-        if _think is None and (_norm_host(host), full) in _session_no_think:
+        if _think is None and _should_suppress_think(host, full):
             _think = False
         # think:false has no universal off-switch, so STACK every known lever per
         # dialect (the way llcat's -nt does) — each backend ignores the ones it
@@ -8203,6 +8230,8 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
                 await _write_terminal_done(response, full, openai_format)
             break
         if status in ("done", "client"):
+            if status == "done":
+                _clear_empty_strikes(host, full)   # a real answer clears any transient-empty tally
             break
         if status == "empty":
             # Finished cleanly but delivered NOTHING — the whole answer went into the
@@ -8216,7 +8245,7 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
                     await _write_terminal_done(response, full, openai_format)
                 break
             _no_think_retried = True
-            _session_no_think.add((_norm_host(host), full))
+            _note_empty_answer(host, full)
             payload = dict(payload, think=False)
             partial = ["", 0]
             await broadcast_activity(host, full, "warming",
