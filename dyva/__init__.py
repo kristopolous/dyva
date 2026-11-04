@@ -6758,13 +6758,24 @@ def _now_iso():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+# A TLS listener recorded as http:// doesn't always 301 to https — many just 400 with
+# one of these (nginx's phrasing, or the Go/"Client sent..." one). Same fix as a redirect:
+# flip the scheme and retry. Matched on the body so a genuine 400 is left alone.
+_HTTPS_PORT_RE = re.compile(r"http request .*https server|plain http request .*https port", re.I)
+
+
 async def _post_follow(session, url, *, json, timeout):
     """POST and follow redirects PRESERVING the method. aiohttp downgrades a POST to a GET on a
     301/302/303 (per the old spec), and many http:80 inference hosts 301 to https — which drops
     our method AND body, so the API answers "Unexpected endpoint or method (GET /api/chat)" even
     though it would serve the POST. We follow manually and re-POST to the Location (up to 4 hops)
     so the body and method survive the hop to https. A host that doesn't redirect behaves exactly
-    as before."""
+    as before.
+
+    Some TLS listeners recorded as http:// don't redirect at all — they 400 with "Client sent an
+    HTTP request to an HTTPS server." We flip http->https and retry that too, the same transition
+    by a different signal. The 400 body peek uses read(), which aiohttp caches, so a 400 we DON'T
+    flip is returned with its body still readable by the caller."""
     from urllib.parse import urljoin
     cur = url
     resp = None
@@ -6775,6 +6786,15 @@ async def _post_follow(session, url, *, json, timeout):
             if loc:
                 await resp.release()
                 cur = urljoin(cur, loc)
+                continue
+        if resp.status == 400 and cur.startswith("http://"):
+            try:
+                _peek = (await resp.read()).decode("utf-8", "replace")
+            except Exception:
+                _peek = ""
+            if _HTTPS_PORT_RE.search(_peek):
+                await resp.release()
+                cur = "https://" + cur[len("http://"):]
                 continue
         return resp
     return resp
