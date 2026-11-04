@@ -5672,6 +5672,36 @@ def _stats_where(db, q):
     return "WHERE (" + " OR ".join(cl) + ")", ps
 
 
+def _fold_models(rows):
+    """Collapse per-model stat rows that name the SAME model under different spellings —
+    case, `-`-vs-`:` separators, a leading `publisher/` prefix — into one row, keyed by
+    `_norm_model` (the key routing already uses). Quant/tag/size tokens survive that key
+    (`-MXFP4`, `:latest`, bare `qwen3.8`), so those stay their own rows. Each `rows` item
+    is (name, up, down, reqs, tsum, tn, last): tps is re-meaned across the whole group
+    from its summed readings (not an average of pre-rounded means), `last` is the latest,
+    and the displayed name is the group's heaviest spelling by tokens."""
+    groups = {}
+    for name, up, down, reqs, tsum, tn, last in rows:
+        up = up or 0; down = down or 0; reqs = reqs or 0
+        tsum = tsum or 0; tn = tn or 0; last = last or 0
+        disp = name or "?"
+        key = _norm_model(disp) or disp
+        g = groups.setdefault(key, {"up": 0, "down": 0, "reqs": 0, "tsum": 0.0,
+                                    "tn": 0, "last": 0, "names": {}})
+        g["up"] += up; g["down"] += down; g["reqs"] += reqs
+        g["tsum"] += tsum; g["tn"] += tn
+        if last > g["last"]:
+            g["last"] = last
+        g["names"][disp] = g["names"].get(disp, 0) + up + down
+    out = {}
+    for g in groups.values():
+        disp = max(g["names"].items(), key=lambda kv: (kv[1], kv[0]))[0]
+        out[disp] = {"up": g["up"], "down": g["down"], "reqs": g["reqs"],
+                     "tps": round(g["tsum"] / g["tn"], 1) if g["tn"] else None,
+                     "last": (g["last"] or None)}
+    return out
+
+
 def _stats_aggregate(q=""):
     """The Stats payload, aggregated in SQL. Same shape handle_stats always returned:
     per-day / per-week(Monday) / per-hour(168h) token buckets with a {family:tokens}
@@ -5712,16 +5742,22 @@ def _stats_aggregate(q=""):
         _bucket(hours, h, up, down, reqs, _family_of(model or "?"), up + down)
 
     # per-model and per-host rows (tps = mean of the non-null readings; last = most
-    # recent time this pair actually emitted tokens)
-    for bucket, col in ((models, "model"), (hosts, "host")):
-        for name, up, down, reqs, tsum, tn, last in db.execute(
-                f"SELECT {col}, SUM(up), SUM(down), COUNT(*), SUM(tps), "
-                f"SUM(CASE WHEN tps IS NOT NULL THEN 1 ELSE 0 END), "
-                f"MAX(CASE WHEN down>0 THEN ts ELSE 0 END) FROM stats {where} GROUP BY {col}",
-                params):
-            bucket[name or "?"] = {"up": up or 0, "down": down or 0, "reqs": reqs or 0,
-                                   "tps": round(tsum / tn, 1) if tn else None,
-                                   "last": (last or None)}
+    # recent time this pair actually emitted tokens). The SQL groups on the raw string;
+    # for MODELS we then fold spelling-variants of the same model together (the by-model
+    # table otherwise showed qwen3.8-27b, Qwen3.8-27B, qwen3.8:27b as separate rows).
+    # Hosts don't fragment that way, so they keep the raw group-by.
+    def _agg(col):
+        return db.execute(
+            f"SELECT {col}, SUM(up), SUM(down), COUNT(*), SUM(tps), "
+            f"SUM(CASE WHEN tps IS NOT NULL THEN 1 ELSE 0 END), "
+            f"MAX(CASE WHEN down>0 THEN ts ELSE 0 END) FROM stats {where} GROUP BY {col}",
+            params).fetchall()
+
+    models = _fold_models(_agg("model"))
+    for name, up, down, reqs, tsum, tn, last in _agg("host"):
+        hosts[name or "?"] = {"up": up or 0, "down": down or 0, "reqs": reqs or 0,
+                              "tps": round(tsum / tn, 1) if tn else None,
+                              "last": (last or None)}
 
     trow = db.execute(f"SELECT SUM(up), SUM(down), COUNT(*) FROM stats {where}", params).fetchone()
 
