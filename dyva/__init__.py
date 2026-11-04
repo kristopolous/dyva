@@ -7706,7 +7706,14 @@ def _with_num_predict(payload):
     num_ctx reissue still handles the case where the answer genuinely fills num_ctx."""
     opts = dict(payload.get("options") or {})
     if "num_predict" in opts:
-        return payload
+        # A caller (or an OpenAI max_tokens that rode in) can pin num_predict as a float,
+        # a string, or null — Ollama 500s on anything but an int ("option num_predict must
+        # be of type integer"). Coerce it; an uncoercible value falls back to our default.
+        try:
+            opts["num_predict"] = int(opts["num_predict"])
+        except (TypeError, ValueError):
+            opts["num_predict"] = -1
+        return dict(payload, options=opts)
     opts["num_predict"] = -1
     return dict(payload, options=opts)
 
