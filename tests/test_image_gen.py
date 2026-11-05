@@ -151,12 +151,11 @@ F = _srv("http://f:1", ["diffusion_models/flux1-dev.safetensors"])
 
 @pytest.fixture
 def clean(monkeypatch):
-    """Neutral routing state: nothing incompatible, no load, no votes."""
+    """Neutral routing state: nothing incompatible, no load, no reranker votes."""
     monkeypatch.setattr(dyva, "load_incompatible", lambda: set())
     monkeypatch.setattr(dyva, "is_active", lambda h: False)
     monkeypatch.setattr(dyva, "_inflight", {})
-    monkeypatch.setattr(dyva, "_session_skip_hosts", set())
-    monkeypatch.setattr(dyva, "_session_prefer_hosts", set())
+    monkeypatch.setattr(dyva, "rerank_scores", lambda: {})
 
 
 def _marks(good=(), maybe=(), bad=(), unreachable=()):
@@ -170,15 +169,16 @@ def test_pool_honours_fallback_chain_order(clean):
     assert pool == ["http://z:1", "http://f:1"]
 
 
-def test_pool_thumbsdown_host_is_dropped(clean, monkeypatch):
-    monkeypatch.setattr(dyva, "_session_skip_hosts", {dyva._norm_host("http://z:1")})
-    pool = dyva._image_pool([], [Z, F], "z*image,flux*2", _marks(), None)
-    assert "http://z:1" not in pool and "http://f:1" in pool
+def test_pool_thumbsdown_host_sinks_to_back(clean, monkeypatch):
+    # 👎 is now a -1 rerank: z sinks to the BACK (still a candidate), not hard-dropped.
+    monkeypatch.setattr(dyva, "rerank_scores", lambda: {dyva._norm_host("http://z:1"): -1})
+    pool = dyva._image_pool([], [Z, F], None, _marks(), None)
+    assert "http://z:1" in pool and pool[-1] == "http://z:1" and "http://f:1" in pool
 
 
 def test_pool_thumbsup_host_floats_to_front(clean, monkeypatch):
-    # f is 'good', z is unknown — but a 👍 on z floats it above the better tier.
-    monkeypatch.setattr(dyva, "_session_prefer_hosts", {dyva._norm_host("http://z:1")})
+    # f is 'good', z is unknown — but a 👍 (+1 rerank) on z floats it above the better tier.
+    monkeypatch.setattr(dyva, "rerank_scores", lambda: {dyva._norm_host("http://z:1"): 1})
     pool = dyva._image_pool([], [Z, F], None, _marks(good=[f"http://f:1 {K}"]), None)
     assert pool[0] == "http://z:1"
 

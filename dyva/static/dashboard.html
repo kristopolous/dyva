@@ -3061,10 +3061,11 @@ function renderWorkers(workers){
     // is cancelled via its re-armed stop handle (see _stream_chat_failover / _pump_stream),
     // so offer stop for every running worker. (The old `!w.phase` gate predated that and
     // hid the button exactly when a long generation most needs it.)
-    // Stop (cancel the whole worker) is offered for every running worker. There is
-    // no per-row "skip the current host" button: it was wired to a skip handle that
-    // most worker kinds (streaming chat, image, speech, /api/generate, edit) never
-    // arm, so it silently did nothing on those rows. Stop is the honest control.
+    // Stop (cancel the whole worker) and Skip (abandon this host, fail over to the next,
+    // client connection kept open) are both offered for every running worker. Skip used to
+    // silently no-op on a committed stream because its handle wasn't re-armed past the race;
+    // the stream leg now re-arms it per leg (see _stream_chat_failover), so Skip works
+    // mid-stream too — and a mid-toolcall skip truncates the partial call to invalid.
     if(!w.done){
       var stop=document.createElement('button');stop.type='button';stop.className='worker-stop';
       // A stop isn't instant — the race has to unwind and the in-flight upstream
@@ -3084,6 +3085,24 @@ function renderWorkers(workers){
         });
       });
       sub.appendChild(stop);
+      // Skip: abandon THIS host and fail over to the next one, keeping the client's
+      // connection open (unlike Stop, which ends it). The content from the next host is
+      // undefined — a partial tool call is truncated to invalid, never executed. Works
+      // during the race and on a committed stream (the stream leg re-arms this handle).
+      var skip=document.createElement('button');skip.type='button';skip.className='worker-stop';
+      skip.textContent='skip';
+      skip.title='move this request to another host (connection stays open; a partial tool call is dropped, not run)';
+      skip.addEventListener('click',function(){
+        if(skip.disabled)return;
+        skip.disabled=true;skip.textContent='skipping…';
+        fetch('skip-worker?wid='+encodeURIComponent(w.wid)).then(function(r){
+          if(!r.ok)throw 0;
+        }).catch(function(){}).then(function(){
+          // the worker keeps running on the next host — re-enable shortly for another skip
+          setTimeout(function(){skip.textContent='skip';skip.disabled=false;},600);
+        });
+      });
+      sub.appendChild(skip);
     }
     var where=w.host?String(w.host).replace(/^https?:\/\//,''):'';
     var rm=w.rmodel?String(w.rmodel).replace(/\\/g,'/').split('/').pop():'';
