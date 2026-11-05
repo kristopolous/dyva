@@ -1,4 +1,4 @@
-"""Empty (thinking-only) answer -> one-shot think:false retry, then a session memo — pytest.
+"""Empty (thinking-only) answer -> one-shot think:false retry, then a strike — pytest.
 
 Some models (a custom-GGUF reasoner under ollama) stream their whole answer into the
 `thinking` channel and send `content` empty — the reply looks blank. think:false fixes it.
@@ -6,8 +6,10 @@ dyva detects the SYMPTOM (a done chunk with no content and no tool call), not th
 
   - `_is_empty_answer` / `_pump_stream` classify such a completion as "empty";
   - the stream driver retries that turn once with think:false (verified end-to-end live);
-  - and remembers the (host, model) in `_session_no_think` so later requests to that
-    pairing start with think:false — one-time cost per runtime, no persistence.
+  - and COUNTS a strike for the (host, model). A done-but-empty is also what a choked/OOM'd
+    host sends, so one strike is NOT enough to change routing: only after NO_THINK_STRIKES of
+    them does a later request start with think:false up front (`_session_empty_strikes`,
+    `_should_suppress_think`). No persistence — a restart resets.
 """
 import asyncio
 import json
@@ -107,13 +109,13 @@ class _FakeSession:
         return _FakeResp()
 
 
-def test_memoized_pairing_sends_think_false_up_front(monkeypatch):
-    # a (host, model) already learned as thinking-only must get think:false on the NEXT
-    # request without waiting to fail again — the whole point of the session memo.
+def test_struck_out_pairing_sends_think_false_up_front(monkeypatch):
+    # a (host, model) that has gone empty NO_THINK_STRIKES times is taken as the thinking
+    # bug and gets think:false on the NEXT request without waiting to fail again.
     monkeypatch.setattr(dyva, "speaks_openai", lambda host: False)   # force the native dialect
     host, model = "http://h:1", "mymodel"
     key = (dyva._norm_host(host), model)
-    monkeypatch.setattr(dyva, "_session_no_think", {key})
+    monkeypatch.setattr(dyva, "_session_empty_strikes", {key: dyva.NO_THINK_STRIKES})
 
     sess = _FakeSession()
     asyncio.run(dyva._send_chat(sess, host, model,
@@ -122,9 +124,23 @@ def test_memoized_pairing_sends_think_false_up_front(monkeypatch):
     assert sess.posted and sess.posted[0].get("think") is False       # thinking turned off up front
 
 
-def test_not_memoized_pairing_leaves_think_unset(monkeypatch):
+def test_one_strike_pairing_still_leaves_think_unset(monkeypatch):
+    # the behaviour change: a SINGLE empty (maybe just a choked host) must not flip routing —
+    # the next request still tries thinking.
     monkeypatch.setattr(dyva, "speaks_openai", lambda host: False)
-    monkeypatch.setattr(dyva, "_session_no_think", set())             # nothing learned
+    host, model = "http://h:1", "mymodel"
+    key = (dyva._norm_host(host), model)
+    monkeypatch.setattr(dyva, "_session_empty_strikes", {key: 1})
+    sess = _FakeSession()
+    asyncio.run(dyva._send_chat(sess, host, model,
+                                {"messages": [{"role": "user", "content": "hi"}]},
+                                "/api/chat", False))
+    assert "think" not in sess.posted[0]                              # one strike is not enough
+
+
+def test_unstruck_pairing_leaves_think_unset(monkeypatch):
+    monkeypatch.setattr(dyva, "speaks_openai", lambda host: False)
+    monkeypatch.setattr(dyva, "_session_empty_strikes", {})           # nothing learned
     sess = _FakeSession()
     asyncio.run(dyva._send_chat(sess, "http://h:1", "mymodel",
                                 {"messages": [{"role": "user", "content": "hi"}]},

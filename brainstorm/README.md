@@ -14,6 +14,9 @@ shipped have graduated out of here (into the code and `docs/`).
 | [honeypot-score.md](honeypot-score.md) | flag **built**, scoring **designed** | escalate honeypot evidence to a whole-machine flag |
 | [canary-detection.md](canary-detection.md) | idea (data-collection only) | find hosts whose connect trips a Cloudflare soft-ban |
 | [graflex-sample.md](graflex-sample.md) | planned, **lower priority** | a publishable rotating "sample platter" of hosts |
+| [dumb-gateway-split.md](dumb-gateway-split.md) | idea | split dyva into a dumb host-racing gateway + a light app tier that owns chat features & detachable jobs |
+| [skip-to-next-host.md](skip-to-next-host.md) | designed | restore the per-worker "skip" control — abandon a stalled host for the next, connection never dropped, partial toolcalls truncated to invalid |
+| [auth-required-hosts.md](auth-required-hosts.md) | idea | recognize 401 "API token required" (LM Studio/Bearer) and quarantine the host instead of re-racing it |
 
 Status legend: **designed** = written down, ready to build, not built · **parked** =
 deliberately on hold with a named trigger to revisit · **idea** = early thinking,
@@ -100,3 +103,60 @@ thousands of hosts and **without** a curated winners list (which would concentra
 and accelerate discovery of those machines). Destroys nothing (read-only inputs, one
 new output, not committed to git); re-running rotates exposure. Consumed by dyva via a
 pluggable `--pool <path|url>` — the same slot the gossiper URL drops into.
+
+---
+
+## Theme 3 — the shape of the system (architecture)
+
+How the responsibilities are drawn, not what any one feature does. The governing posture
+is that dyva has stayed **painless and hassle-free** (clone-and-run, no infra, no service
+to babysit) — any architectural move is judged first against *keeping* that.
+
+### [dumb-gateway-split.md](dumb-gateway-split.md) — idea, not committed
+dyva is quietly two things: a host-racing **gateway** and a chat **application** (web UI,
+spreadsheet, screen-grab, stats, media orchestration). The idea is to name that seam and
+pull the app features up into a separate light tier, leaving dyva a dumb, stateless,
+restartable gateway whose one hard job is talking to hosts correctly and politely. The
+forcing function is **detachable jobs** (survive a phone screen-off — web workers can't,
+the page freezes; the real answer is a server-side job with reconnect-by-id). The catch
+that survives any version: detaching the job from the client socket throws away the
+automatic reaper, so you owe back an explicit lease/deadline/TTL **and** cancel-propagation
+to the host, or you leak held host connections. Hard constraint: **no heavy brokers**
+(Postgres/docker/Temporal) — lift the pattern, not the stack; for one operator the job
+layer is a dict + sqlite + an asyncio reaper. Open keystone, still **unverified**: does
+dyva abort the upstream today when a client disconnects mid-stream?
+
+---
+
+## Theme 4 — operator control over live routing
+
+Manual levers a human can pull on an in-flight request, for the cases the automatic
+machinery can't adjudicate from the outside.
+
+### [skip-to-next-host.md](skip-to-next-host.md) — designed, not built
+Restore the per-worker **skip** control that fell away (UI button cut on purpose; the
+`?wid=` endpoint and the racing-phase `_skip` are still live, but the handle no-ops once a
+worker commits to streaming). Skip = abandon this host, go to the next; **content is
+undefined, always**, but the **client connection is never dropped** (the whole difference
+from stop). Human-triggered because the machine can't tell a stall from a legit slow
+toolcall (`sleep 100000`). The load-bearing rule: a mid-toolcall skip must **truncate the
+partial call to *invalid*** in both directions — never emit `finish_reason: tool_calls` to
+the client, and drop the partial from the next host's context — or you ship a half-streamed
+`DELETE FROM users`. Open pivot that sizes the build: does `_stream_chat_failover` already
+keep the client stream open across a *post-token* host switch, or only pre-first-token?
+
+---
+
+## Theme 5 — hosts we can't use (classification)
+
+Honest servers that aren't bad or fake but that we can't route to, and shouldn't keep
+re-racing as if a retry might work.
+
+### [auth-required-hosts.md](auth-required-hosts.md) — idea, not built
+An LM Studio host with auth on 401s every request ("API token required", Bearer scheme) —
+and was seen being **re-raced twice in 5s across two workers** instead of quarantined. It's
+not a bad host or a honeypot, just gated. Proposed: recognize the 401 token-required signal
+and quarantine the host (per-host — the token gates the whole server), same additive/reversible
+shape as `UNREACHABLE`, so routing stops offering it. Open: how dyva classes a 401 today
+(it's clearly retryable now), and whether to reuse `UNREACHABLE_KEY` or a dedicated reversible
+`AUTH_WALL` marker.

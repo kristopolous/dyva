@@ -270,6 +270,14 @@ CHATS_DB = os.path.join(CACHE_DIR, "chats.db")
 # a job is router-level delivery state, and this table is keyed by `kind`
 # (text/video/…) so every generation kind can share it.
 JOBS_DB = os.path.join(CACHE_DIR, "jobs.db")
+# Temporary, expiring routing reorder votes (the "reranker"): one append-only table of
+# (host, direction, expire_at). Deliberately its OWN db — a human 👍/👎 or a transient
+# busy signal is routing-time, reversible, and must never land anywhere near the
+# reputation truth in host-status.db. Append-only, no DELETE/GC: at a couple rows a day
+# it stays tiny for years, and expired rows are simply ignored, never destroyed (dyva
+# stays 100% additive). See brainstorm/reranker.md.
+RERANKER_DB = os.path.join(CACHE_DIR, "reranker.db")
+_reranker_db = None
 IMG_HISTORY_MAX = 1000
 CAP_REFRESH_TTL = 3600
 _last_cache = None
@@ -348,6 +356,11 @@ TOOL_RESUME = False
 # come back. WARMING_RETRY is how long we wait before re-fronting such a host, retried
 # until it's ready or the request TIMEOUT lapses.
 WARMING_RETRY = 5
+# Reranker vote lifetimes (seconds), overridable in settings.json. A temporary, expiring
+# reorder on top of the reputation tiers — see brainstorm/reranker.md and rerank_scores().
+RERANK_BUSY_SECS = 1800       # a 503-busy host sinks to the back for ~30 min, recovers on its own
+RERANK_UP_SECS = 43200        # 👍 floats a host to the front for ~12 h
+RERANK_DOWN_SECS = 43200      # 👎 sinks a host to the back for ~12 h
 # A race that's still SEARCHING (no host found) past this many seconds logs its internal
 # state every RACE_WATCHDOG seconds — tried/started/permit/n, the fan-out task's liveness
 # and any exception — so a wedged search (e.g. a continuation pinned to a dead warm host,
@@ -496,6 +509,14 @@ def _resolve_version():
 
 
 VERSION = _resolve_version()
+
+
+async def _stamp_server(request, response):
+    """Put the dyva build into the HTTP Server: header (same string as /api/version) so a bare
+    `curl -I` reveals which commit is answering, not the stock Python/aiohttp. on_response_prepare
+    (like _no_index) so it also stamps STREAMING responses before their headers flush, and it
+    overrides aiohttp's default Server (which is only applied via setdefault)."""
+    response.headers["Server"] = f"DYVA-{VERSION}"
 START_TS = time.time()   # process start (epoch secs); surfaced in /api/stats for the uptime counter
 SETTINGS_FILE = os.path.join(CACHE_DIR, "settings.json")
 
@@ -522,6 +543,11 @@ _CLASS_MODALITIES = {
 }
 _VIDEO_CLASSES = {"video", "t2v", "i2v"}
 _AUDIO_CLASSES = {"audio", "music", "t2a"}
+# Music GENERATION needs a text-to-music checkpoint (ace-step, minimax-music, yue,
+# songbloom, musicgen), not just any audio-class model. Selecting by _AUDIO_CLASSES
+# swept in TTS-only hosts and hosts with the AceStep *nodes* but no *model* — ~100
+# of ~120 "candidates" that could only ever fail with "no matching model to load".
+_MUSIC_MODEL_CLASS = frozenset({"music"})
 
 # Async ComfyUI video-generation jobs (OpenRouter /v1/videos compatible).
 VIDEO_KEY = "video"      # no wildcard: canon_pattern() eats a trailing "*"
@@ -551,7 +577,7 @@ def _apply_cache_dir(path):
     so they're intentionally left alone."""
     global CACHE_DIR, CACHE_FILE, NOTWORKING_FILE, BAD_FILE, GOOD_FILE, STATUS_DB
     global LAST_FILE, STATS_FILE, STATS_DB, KNOWN_FILE, PROBE_FILE, IMG_DIR, AUDIO_DIR, IMG_HISTORY_FILE, THUMB_DIR
-    global CHATS_FILE, CHATS_DB, JOBS_DB, SETTINGS_FILE, VIDEO_JOBS_FILE
+    global CHATS_FILE, CHATS_DB, JOBS_DB, RERANKER_DB, SETTINGS_FILE, VIDEO_JOBS_FILE
     global VIDEO_JOBS_DIR, CLEANSED_FILE, SURVEY_FILE, MUSIC_JOBS_FILE, MUSIC_JOBS_DIR
     CACHE_DIR = os.path.abspath(os.path.expanduser(path))
     CACHE_FILE = os.path.join(CACHE_DIR, "free-ollama.json")
@@ -571,6 +597,7 @@ def _apply_cache_dir(path):
     CHATS_FILE = os.path.join(CACHE_DIR, "chats.json")
     CHATS_DB = os.path.join(CACHE_DIR, "chats.db")
     JOBS_DB = os.path.join(CACHE_DIR, "jobs.db")
+    RERANKER_DB = os.path.join(CACHE_DIR, "reranker.db")
     SETTINGS_FILE = os.path.join(CACHE_DIR, "settings.json")
     VIDEO_JOBS_FILE = os.path.join(CACHE_DIR, "video-jobs.json")
     VIDEO_JOBS_DIR = os.path.join(CACHE_DIR, "video-jobs")
@@ -668,7 +695,7 @@ def model_modalities(model):
 def load_settings():
     """Apply persisted runtime settings (workers/timeout/min_count/local) over
     the CLI defaults, so changes made in the dashboard survive restarts."""
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION, RERANK_BUSY_SECS, RERANK_UP_SECS, RERANK_DOWN_SECS
     if not os.path.exists(SETTINGS_FILE):
         return
     try:
@@ -682,6 +709,8 @@ def load_settings():
         TIMEOUT = s["timeout"]
     if isinstance(s.get("hedge_delay"), (int, float)) and s["hedge_delay"] >= 0:
         HEDGE_DELAY = s["hedge_delay"]
+    if isinstance(s.get("ctx_confident_fraction"), (int, float)) and 0 < s["ctx_confident_fraction"] <= 1:
+        CTX_CONFIDENT_FRACTION = s["ctx_confident_fraction"]
     if "warm_connect_wait" in s:
         _wcw = s["warm_connect_wait"]
         WARM_CONNECT_WAIT = _wcw if isinstance(_wcw, (int, float)) and _wcw >= 0 else None
@@ -723,6 +752,12 @@ def load_settings():
         GOSSIPER_URL = s["gossiper_url"].strip()
     if isinstance(s.get("gossiper_enabled"), bool):
         GOSSIPER_ENABLED = s["gossiper_enabled"]
+    if isinstance(s.get("rerank_busy_secs"), (int, float)) and s["rerank_busy_secs"] >= 0:
+        RERANK_BUSY_SECS = s["rerank_busy_secs"]
+    if isinstance(s.get("rerank_up_secs"), (int, float)) and s["rerank_up_secs"] >= 0:
+        RERANK_UP_SECS = s["rerank_up_secs"]
+    if isinstance(s.get("rerank_down_secs"), (int, float)) and s["rerank_down_secs"] >= 0:
+        RERANK_DOWN_SECS = s["rerank_down_secs"]
     _apply_session_setting_keys(s)
 
 
@@ -738,12 +773,13 @@ def save_settings(extra=None):
     if not isinstance(data, dict):
         data = {}
     data.update({"workers": WORKER_COUNT, "timeout": TIMEOUT,
-                 "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS,
+                 "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS, "ctx_confident_fraction": CTX_CONFIDENT_FRACTION,
                  "worker_max": WORKER_MAX, "worker_max_failover": WORKER_MAX_FAILOVER, "tool_resume": TOOL_RESUME, "race_watchdog": RACE_WATCHDOG,
                  "min_count": MIN_COUNT, "local": _LOCAL, "explore": EXPLORE_MODE, "hide_dyva": HIDE_DYVA,
                  "admin_pw": ADMIN_PW, "model_list": MODEL_LIST, "model_list_on": MODEL_LIST_ON,
                  "cloudskip": sorted(CLOUD_SKIP), "base_path": BASE_PATH,
                  "gossiper_url": GOSSIPER_URL, "gossiper_enabled": GOSSIPER_ENABLED,
+                 "rerank_busy_secs": RERANK_BUSY_SECS, "rerank_up_secs": RERANK_UP_SECS, "rerank_down_secs": RERANK_DOWN_SECS,
                  "session_sticky": SESSION_STICKY, "session_ttl": SESSION_TTL,
                  "session_allow_repin": SESSION_ALLOW_REPIN})
     if isinstance(extra, dict):
@@ -1916,6 +1952,11 @@ async def account_tokens(wid, host, model, obj, num_ctx):
     # Self-refresh the context ceiling: the host just ingested `p` prompt tokens, so if a
     # recorded ctx_limit was <= that, it was stale (reloaded bigger) — clear it.
     clear_ctx_limit(host, model, p)
+    # Positive evidence: the host just PROVED it can handle `p` prompt tokens — band big
+    # requests toward hosts proven at/above their size (see _sizeband). A head-truncated
+    # prompt (p reached num_ctx) was NOT processed whole at that size, so it doesn't count.
+    if not _prompt_truncated(p, num_ctx):
+        mark_max_ok(host, model, p)
     # tokens/second, most-recent (host, model) reading. Prefer the upstream's OWN
     # generation timing when it reports it: Ollama gives eval_count / eval_duration
     # (nanoseconds), the true tok/s regardless of how fast WE drained the socket.
@@ -2819,6 +2860,11 @@ def _get_db():
                      # (still raced, never banned), and it's cleared the moment the host
                      # succeeds on a prompt that big (it was reloaded bigger). NULL = unknown.
                      "ctx_limit INTEGER",
+                     # Largest prompt (tokens) this (host,model) has SUCCESSFULLY processed — the
+                     # positive twin of ctx_limit. Hard evidence used to BAND candidates for a big
+                     # request (proven-capable first). Only ever GROWS (MAX on write); not a
+                     # reputation mark, cleared by nothing (a success never shrinks). NULL = never measured.
+                     "max_ok INTEGER",
                      # Physical micro-batch ceiling (ubatch / num_batch) a DECISION-model host
                      # reported when it rejected an oversized input: "input (N tokens) is too large
                      # to process. increase the physical batch size (current batch size: M)". Raw
@@ -3361,26 +3407,9 @@ def add_good(host, model):
     db.commit()
 
 
-def favor_host(host, model):
-    """👍 = a ONE-TIME, optimistic tier boost: lift this (host, model) into the 'good' tier so the
-    race actually CONSIDERS it again — and NOTHING else. It is deliberately NOT sticky: no persistent
-    vote, and it does NOT fabricate a success, last_good, or ttft/tps (that would pollute the very
-    record the user is reading). It only sets the tier and clears a stale streak / unreachable mark so
-    the host gets a fair look. From there it earns its keep like everyone else — a real win writes
-    genuine 'good' via add_good, a stall/failure demotes it via add_bad — so a host the user favored
-    that turns out janky falls right back down. The boost buys a LOOK, not a permanent seat; we never
-    remember 'this was thumbs-up, keep it here'."""
-    model = canon_pattern(model)
-    try:
-        db = _get_db()
-        db.execute(
-            "INSERT INTO host_status(host,model,state,failure_streak) VALUES(?,?, 'good', 0)"
-            " ON CONFLICT(host,model) DO UPDATE SET state='good', failure_streak=0",
-            (host, model))
-        db.execute("DELETE FROM host_status WHERE host=? AND model=?", (host, UNREACHABLE_KEY))
-        db.commit()
-    except Exception as e:
-        log.debug(f"favor_host failed: {e}")
+# favor_host removed: 👍 now routes through the reranker (add_rerank +1), a temporary,
+# expiring reorder that floats a starved host to the front WITHOUT writing reputation or
+# clearing an unreachable mark (don't force traffic at a dead socket). See brainstorm/reranker.md.
 
 
 def record_perf(host, model, ttft=None, tps=None):
@@ -3666,6 +3695,25 @@ def mark_ctx_limit(host, model, n_ctx):
         log.debug(f"mark_ctx_limit failed: {e}")
 
 
+def mark_overflow(host, model, prompt_tokens):
+    """A 0-char done_reason='length' drop: the host couldn't answer a prompt of
+    `prompt_tokens`, so its effective ceiling is at/below that. Lower ctx_limit toward it
+    (MIN — never RAISES an existing lower ceiling), soft + reversible like mark_ctx_limit;
+    cleared by clear_ctx_limit on the next success at that size. No reputation mark."""
+    if not prompt_tokens:
+        return
+    try:
+        db = _get_db()
+        db.execute(
+            "INSERT INTO host_status(host,model,state,ctx_limit) VALUES(?,?, 'unknown', ?)"
+            " ON CONFLICT(host,model) DO UPDATE SET"
+            " ctx_limit=MIN(COALESCE(ctx_limit, excluded.ctx_limit), excluded.ctx_limit)",
+            (host, model, int(prompt_tokens)))
+        db.commit()
+    except Exception as e:
+        log.debug(f"mark_overflow failed: {e}")
+
+
 def mark_empty_length(host, model):
     """Tally a 0-char done_reason='length' drop for (host, resolved-model): bump the
     count and stamp the time. Observational only — no reputation mark, no routing
@@ -3700,6 +3748,65 @@ def clear_ctx_limit(host, model, ingested):
         db.commit()
     except Exception as e:
         log.debug(f"clear_ctx_limit failed: {e}")
+
+
+def mark_max_ok(host, model, tokens):
+    """Record that (host, resolved-model) SUCCESSFULLY processed a prompt of `tokens`.
+    max_ok only ever grows (MAX), so a smaller later success never shrinks it. Upserts a
+    neutral 'unknown' row if none exists (same idiom as mark_ctx_limit); no reputation mark."""
+    if not tokens:
+        return
+    try:
+        db = _get_db()
+        db.execute(
+            "INSERT INTO host_status(host,model,state,max_ok) VALUES(?,?, 'unknown', ?)"
+            " ON CONFLICT(host,model) DO UPDATE SET max_ok=MAX(COALESCE(max_ok,0), excluded.max_ok)",
+            (host, model, int(tokens)))
+        db.commit()
+    except Exception as e:
+        log.debug(f"mark_max_ok failed: {e}")
+
+
+def _load_max_ok():
+    """{(host, model): max_ok} for the hosts we've measured a successful prompt size on.
+    Only non-NULL rows, so cheap to load per race (mirrors _load_ctx_limits)."""
+    try:
+        db = _get_db()
+        return {(h, m): n for h, m, n in db.execute(
+            f"SELECT host, model, max_ok FROM host_status "
+            f"WHERE max_ok IS NOT NULL AND {_LIVE_REAL}")}
+    except Exception:
+        return {}
+
+
+def _size_rank(need, max_ok, frac):
+    """Band a (host,model) by PROVEN capacity vs the needed window: 0 = proven at/above
+    need, 1 = proven within frac×need, 2 = unknown or proven smaller. Lower is better."""
+    if not max_ok:
+        return 2
+    if max_ok >= need:
+        return 0
+    if max_ok >= frac * need:
+        return 1
+    return 2
+
+
+def _sizeband(need, maxok, frac, host, ms):
+    """Band a (host, models) by PROVEN size for the race sort key (0 best, 2 unknown) — the
+    host's BEST (lowest-rank) model. Returns a constant 0 (no effect on ordering) when need<=0
+    or no sizes are known, so small/unmeasured traffic is never reordered. Bad-host protection
+    is NOT here: the race key keeps TIER primary, so a bad host is never promoted by its band."""
+    if need <= 0 or not maxok:
+        return 0
+    return min((_size_rank(need, maxok.get((host, m)), frac) for m in ms), default=2)
+
+
+def _race_sort_key(prio, vote, size_band, warm0, toobig, fav):
+    """The race candidate ordering key, lowest sorts first: TIER first (mechanical authority —
+    a bad/unreachable host is never promoted), then the user vote, then the PROVEN size band,
+    then warmth, then ctx-fit, then favourability. Extracted so the precedence — in particular
+    size sitting ABOVE warmth — is unit-testable (a bare pre-sort was silently overridden here)."""
+    return (prio, -vote, size_band, warm0, toobig, fav)
 
 
 def _load_ctx_limits():
@@ -3809,20 +3916,61 @@ def _load_votes():
         return {}
 
 
-# A 👎 means, literally, "do not go back to this host" — not "demote it", not "mark it
-# bad/honeypot", just: don't consider it. It is SESSION-scoped and NON-persistent (in
-# memory, cleared on restart) on purpose — a down is "not right now", not a forever ban,
-# and there are ~10k hosts of nuance between the sticky top-slot and the bad tier. Keyed
-# by scheme-stripped host (the vote machinery missed because it matched on exact
-# host+model strings); find_servers drops any host in here outright. 👍 removes it.
-_session_skip_hosts = set()
+# ---- Reranker: a temporary, expiring reorder layer on top of the reputation tiers -------
+# The tiers are the long-memory, self-healing truth; this is a short-lived, reversible
+# nudge for TRANSIENT states — a host slammed right now (busy -1), a human vote (👍 +1 /
+# 👎 -1) — that NEVER writes reputation and expires on its own. Append-only, keyed by
+# _norm_host, summed at read time. See brainstorm/reranker.md.
+def _get_reranker_db():
+    global _reranker_db
+    if _reranker_db is None:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        _reranker_db = sqlite3.connect(RERANKER_DB, check_same_thread=False)
+        _reranker_db.execute("PRAGMA journal_mode=WAL")
+        _reranker_db.execute("PRAGMA synchronous=NORMAL")
+        _reranker_db.execute("PRAGMA busy_timeout=5000")
+        _reranker_db.execute(
+            "CREATE TABLE IF NOT EXISTS reranker("
+            "host TEXT NOT NULL, direction INTEGER NOT NULL, expire_at REAL NOT NULL)")
+        _reranker_db.execute(
+            "CREATE INDEX IF NOT EXISTS ix_reranker_expire ON reranker(expire_at)")
+        _reranker_db.commit()
+    return _reranker_db
 
-# The mirror image of the skip set: hosts the operator 👍'd this session. find_servers
-# floats any host in here to TIER_PREFER — above EVERY tier, even the warm sticky — so a
-# preferred host is raced first. Session-scoped and non-persistent (same as the skip set):
-# a restart clears it, and a 👎 removes the host from here (the two sets are mutually
-# exclusive — favoring discards a skip, skipping discards a favor).
-_session_prefer_hosts = set()
+
+def add_rerank(host, direction, ttl_secs):
+    """Append a temporary, EXPIRING reorder vote on a host: +1 floats it toward the front
+    of the eligible candidate list, -1 sinks it toward the back. NEVER a reputation write,
+    and it vanishes on its own at expire_at (append-only; no DELETE/GC). Best-effort — a
+    reorder hiccup must never break the request path."""
+    try:
+        h = _norm_host(host)
+        if not h:
+            return
+        db = _get_reranker_db()
+        db.execute("INSERT INTO reranker(host,direction,expire_at) VALUES(?,?,?)",
+                   (h, int(direction), time.time() + float(ttl_secs)))
+        db.commit()
+    except Exception as e:
+        log.debug(f"add_rerank failed: {e}")
+
+
+def rerank_scores():
+    """{_norm_host: net_direction} summed over ACTIVE rows (expire_at > now), net-zero
+    hosts dropped. Expired rows are ignored, never deleted. Empty on any error."""
+    try:
+        return {h: n for h, n in _get_reranker_db().execute(
+            "SELECT host, SUM(direction) FROM reranker WHERE expire_at > ? "
+            "GROUP BY host HAVING SUM(direction) != 0", (time.time(),))}
+    except Exception:
+        return {}
+
+
+# _session_skip_hosts / _session_prefer_hosts removed: the in-memory, session-scoped,
+# binary 👎/👍 sets are superseded by the reranker (add_rerank / rerank_scores) — a
+# persistent, expiring, magnitude-aware reorder that survives a restart and clears itself.
+# 👎 is now a -1 (sink to the back, still a last resort — no longer a hard-drop), 👍 a +1
+# (float to the front). Both fold into routing via _rerank_prio(). See brainstorm/reranker.md.
 
 # (norm-host, resolved-model) pairs that answered with ONLY reasoning — the whole reply
 # went into the `thinking` channel and `content` came back empty (an ollama/custom-GGUF
@@ -3833,7 +3981,34 @@ _session_prefer_hosts = set()
 # PURPOSE: the bug is versioned (service + ollama version + model), too messy to track
 # precisely, so a restart is the reset (the model may have been re-pulled/fixed). This is
 # NOT a reputation signal — the host answered fine; it never touches host-status.
-_session_no_think = set()
+#
+# STRIKES, not one-shot: a `status == "empty"` leg means the host closed the stream with a
+# clean `done` chunk but delivered no content. That IS the thinking bug — but it's also what
+# a host that choked / OOM'd mid-answer sends, and the two are indistinguishable at that
+# point. So one empty mustn't permanently flip a thinking-capable pair to no_think for the
+# whole runtime; we retry on every empty (cheap) but only PROACTIVELY suppress after
+# NO_THINK_STRIKES of them, and a real (non-empty) answer in between clears the tally.
+NO_THINK_STRIKES = 2
+_session_empty_strikes = {}   # (norm_host, model) -> empty-answer count this runtime
+
+
+def _note_empty_answer(host, full):
+    """Count one empty (thinking-only OR host-choked) answer for this pair; return the tally."""
+    k = (_norm_host(host), full)
+    _session_empty_strikes[k] = _session_empty_strikes.get(k, 0) + 1
+    return _session_empty_strikes[k]
+
+
+def _should_suppress_think(host, full):
+    """True once a pair has gone empty NO_THINK_STRIKES times — then it's the thinking bug,
+    not a one-off choke, so send no_think from the start to skip the wasted first pass."""
+    return _session_empty_strikes.get((_norm_host(host), full), 0) >= NO_THINK_STRIKES
+
+
+def _clear_empty_strikes(host, full):
+    """A real (non-empty) answer clears the tally: the pair CAN think, so any earlier empty
+    was a transient choke, not the versioned bug."""
+    _session_empty_strikes.pop((_norm_host(host), full), None)
 
 
 def mark_honeypot(host, reason=None):
@@ -4144,7 +4319,7 @@ def _session_commit(sid, sess, host, full, query, messages, resp, rebind=False):
 
 async def _keepalive_then_stream(racer, request, session, model, servers, opayload, req_caps,
                                  job_wid, openai_format, cancel, hedge_delay, sid, sess,
-                                 session_rebind, query):
+                                 session_rebind, query, skip=None):
     """Race under keepalive, pin the sticky session on a win, then stream.
 
     Shared by the SSE and ndjson branches of _proxy_chat so those call sites
@@ -4162,7 +4337,7 @@ async def _keepalive_then_stream(racer, request, session, model, servers, opaylo
         out = await _stream_chat_failover(
             request, session, model, servers, opayload,
             openai_format, req_caps, job_wid, result, cancel, response=ka_resp,
-            sid=sid)
+            skip=skip, sid=sid)
         return out, None, stopped
     msg = "worker manually stopped" if stopped else "all servers failed"
     if errors:
@@ -4321,7 +4496,7 @@ def needs_caps(messages):
             for blk in content:
                 if isinstance(blk, dict):
                     t = blk.get("type")
-                    if t in ("image_url", "file"):
+                    if t in ("image_url", "input_image", "image"):
                         caps.add("vision")
                     elif t in ("audio", "input_audio"):
                         caps.add("audio")
@@ -4876,6 +5051,19 @@ def host_tier(is_last, in_good, in_maybe, in_bad, unreachable=False):
     return TIER_UNKNOWN
 
 
+def _rerank_prio(prio, net):
+    """Fold a temporary reranker vote (net sum from rerank_scores) into a host's earned tier
+    priority. net>0 floats it ABOVE every tier (bigger = further front), net<0 sinks it BELOW
+    every tier (more negative = further back, past even TIER_BAD and any warm sticky), net==0
+    leaves the earned tier untouched. Lower sorts earlier. A pure function so the reorder can
+    be unit-tested without the whole candidate pipeline."""
+    if net > 0:
+        return TIER_PREFER - net
+    if net < 0:
+        return max(prio, TIER_BAD) - net
+    return prio
+
+
 def capability_tier(host, key, marks, last_host, extra_bad=False):
     """host_tier for a capability sentinel key (__tts__, __a1111__, ...).
 
@@ -5058,6 +5246,7 @@ def _find_servers_raw(sub, caps=None):
     attested_pass_hosts = {k.split(" ", 1)[0] for k in attested_pass}   # host-level, for "any" queries
     cooling = load_unreachable_cooling()   # dead-socket hosts still inside UNREACHABLE_COOLDOWN — dropped below
     votes = _load_votes()   # 👎/👍 per (host, resolved-model); only non-zero pairs
+    rr = rerank_scores()    # temporary expiring reorder votes (busy -1 / 👍 +1 / 👎 -1)
     # Explore de-prioritizes hosts dyva has already raced (incl. no-verdict
     # timeouts) so they aren't re-fronted forever; only needed in Explore.
     race_stats = load_race_stats() if EXPLORE_MODE else {}
@@ -5108,10 +5297,6 @@ def _find_servers_raw(sub, caps=None):
         if any(re.search(r"[:-]cloud", m) for m in ms) and not re.search(r"[:-]cloud", sub):
             continue
         host = s.get("server", "")
-        # User 👎 this session: "do not go back to this host." Hard-drop it — not a
-        # last-resort tier, just gone — until the process restarts or a 👍 clears it.
-        if _norm_host(host) in _session_skip_hosts:
-            continue
         # Drop (host, model) pairs that failed STRUCTURALLY (old-ollama "unknown
         # renderer", missing/corrupt blob, model-not-found): they never work, so
         # they must not be candidates at all — not a bad-tier last resort re-raced
@@ -5214,11 +5399,11 @@ def _find_servers_raw(sub, caps=None):
             # Within the normal UNKNOWN tier, most-recently-checked first; other tiers
             # keep their order via a constant secondary key (stable sort).
             crank = _checked_rank(s) if prio == TIER_UNKNOWN else 0
-        # Manual 👍 this session floats the host above EVERY tier (even the warm sticky).
-        # Applied last, so it is the final word — overriding the explore cascade and any
-        # down-vote demotion (a 👎'd host isn't in this set anyway; the two are exclusive).
-        if _norm_host(host) in _session_prefer_hosts:
-            prio = TIER_PREFER
+        # Reranker: a temporary, expiring reorder on top of the earned tier (a human 👍/👎 or
+        # a transient busy signal). Applied LAST so it is the final word — net>0 floats the
+        # host above every tier, net<0 sinks it below every tier; it expires on its own and
+        # never touches reputation. See rerank_scores() / _rerank_prio().
+        prio = _rerank_prio(prio, rr.get(_norm_host(host), 0))
         matched.append((cap_known, prio, crank, host, ms))
     # REPUTATION FIRST, capability a within-tier hint. Sorting by cap_known BEFORE tier let an
     # imperfect capability FLAG (a survey/classifier guess, unreliable for the many engines that
@@ -5743,6 +5928,36 @@ def _stats_where(db, q):
     return "WHERE (" + " OR ".join(cl) + ")", ps
 
 
+def _fold_models(rows):
+    """Collapse per-model stat rows that name the SAME model under different spellings —
+    case, `-`-vs-`:` separators, a leading `publisher/` prefix — into one row, keyed by
+    `_norm_model` (the key routing already uses). Quant/tag/size tokens survive that key
+    (`-MXFP4`, `:latest`, bare `qwen3.8`), so those stay their own rows. Each `rows` item
+    is (name, up, down, reqs, tsum, tn, last): tps is re-meaned across the whole group
+    from its summed readings (not an average of pre-rounded means), `last` is the latest,
+    and the displayed name is the group's heaviest spelling by tokens."""
+    groups = {}
+    for name, up, down, reqs, tsum, tn, last in rows:
+        up = up or 0; down = down or 0; reqs = reqs or 0
+        tsum = tsum or 0; tn = tn or 0; last = last or 0
+        disp = name or "?"
+        key = _norm_model(disp) or disp
+        g = groups.setdefault(key, {"up": 0, "down": 0, "reqs": 0, "tsum": 0.0,
+                                    "tn": 0, "last": 0, "names": {}})
+        g["up"] += up; g["down"] += down; g["reqs"] += reqs
+        g["tsum"] += tsum; g["tn"] += tn
+        if last > g["last"]:
+            g["last"] = last
+        g["names"][disp] = g["names"].get(disp, 0) + up + down
+    out = {}
+    for g in groups.values():
+        disp = max(g["names"].items(), key=lambda kv: (kv[1], kv[0]))[0]
+        out[disp] = {"up": g["up"], "down": g["down"], "reqs": g["reqs"],
+                     "tps": round(g["tsum"] / g["tn"], 1) if g["tn"] else None,
+                     "last": (g["last"] or None)}
+    return out
+
+
 def _stats_aggregate(q=""):
     """The Stats payload, aggregated in SQL. Same shape handle_stats always returned:
     per-day / per-week(Monday) / per-hour(168h) token buckets with a {family:tokens}
@@ -5783,16 +5998,22 @@ def _stats_aggregate(q=""):
         _bucket(hours, h, up, down, reqs, _family_of(model or "?"), up + down)
 
     # per-model and per-host rows (tps = mean of the non-null readings; last = most
-    # recent time this pair actually emitted tokens)
-    for bucket, col in ((models, "model"), (hosts, "host")):
-        for name, up, down, reqs, tsum, tn, last in db.execute(
-                f"SELECT {col}, SUM(up), SUM(down), COUNT(*), SUM(tps), "
-                f"SUM(CASE WHEN tps IS NOT NULL THEN 1 ELSE 0 END), "
-                f"MAX(CASE WHEN down>0 THEN ts ELSE 0 END) FROM stats {where} GROUP BY {col}",
-                params):
-            bucket[name or "?"] = {"up": up or 0, "down": down or 0, "reqs": reqs or 0,
-                                   "tps": round(tsum / tn, 1) if tn else None,
-                                   "last": (last or None)}
+    # recent time this pair actually emitted tokens). The SQL groups on the raw string;
+    # for MODELS we then fold spelling-variants of the same model together (the by-model
+    # table otherwise showed qwen3.8-27b, Qwen3.8-27B, qwen3.8:27b as separate rows).
+    # Hosts don't fragment that way, so they keep the raw group-by.
+    def _agg(col):
+        return db.execute(
+            f"SELECT {col}, SUM(up), SUM(down), COUNT(*), SUM(tps), "
+            f"SUM(CASE WHEN tps IS NOT NULL THEN 1 ELSE 0 END), "
+            f"MAX(CASE WHEN down>0 THEN ts ELSE 0 END) FROM stats {where} GROUP BY {col}",
+            params).fetchall()
+
+    models = _fold_models(_agg("model"))
+    for name, up, down, reqs, tsum, tn, last in _agg("host"):
+        hosts[name or "?"] = {"up": up or 0, "down": down or 0, "reqs": reqs or 0,
+                              "tps": round(tsum / tn, 1) if tn else None,
+                              "last": (last or None)}
 
     trow = db.execute(f"SELECT SUM(up), SUM(down), COUNT(*) FROM stats {where}", params).fetchone()
 
@@ -6521,6 +6742,14 @@ def openai_payload(p):
                      ("stop", "stop")):
         if src in opts:
             out[dst] = opts[src]
+    # max_tokens must be an int (from options.num_predict above, or supplied top-level) —
+    # a strict OpenAI/vLLM host 400s a float/string, the same way Ollama 500s num_predict.
+    # Coerce it; an uncoercible value is dropped so the host uses its own default.
+    if "max_tokens" in out:
+        try:
+            out["max_tokens"] = int(out["max_tokens"])
+        except (TypeError, ValueError):
+            out.pop("max_tokens", None)
     if isinstance(out.get("messages"), list):
         out["messages"] = _messages_openai(out["messages"])
     # OpenAI-compatible hosts OMIT the `usage` block from a STREAMING response unless
@@ -6785,13 +7014,24 @@ def _now_iso():
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
+# A TLS listener recorded as http:// doesn't always 301 to https — many just 400 with
+# one of these (nginx's phrasing, or the Go/"Client sent..." one). Same fix as a redirect:
+# flip the scheme and retry. Matched on the body so a genuine 400 is left alone.
+_HTTPS_PORT_RE = re.compile(r"http request .*https server|plain http request .*https port", re.I)
+
+
 async def _post_follow(session, url, *, json, timeout):
     """POST and follow redirects PRESERVING the method. aiohttp downgrades a POST to a GET on a
     301/302/303 (per the old spec), and many http:80 inference hosts 301 to https — which drops
     our method AND body, so the API answers "Unexpected endpoint or method (GET /api/chat)" even
     though it would serve the POST. We follow manually and re-POST to the Location (up to 4 hops)
     so the body and method survive the hop to https. A host that doesn't redirect behaves exactly
-    as before."""
+    as before.
+
+    Some TLS listeners recorded as http:// don't redirect at all — they 400 with "Client sent an
+    HTTP request to an HTTPS server." We flip http->https and retry that too, the same transition
+    by a different signal. The 400 body peek uses read(), which aiohttp caches, so a 400 we DON'T
+    flip is returned with its body still readable by the caller."""
     from urllib.parse import urljoin
     cur = url
     resp = None
@@ -6802,6 +7042,15 @@ async def _post_follow(session, url, *, json, timeout):
             if loc:
                 await resp.release()
                 cur = urljoin(cur, loc)
+                continue
+        if resp.status == 400 and cur.startswith("http://"):
+            try:
+                _peek = (await resp.read()).decode("utf-8", "replace")
+            except Exception:
+                _peek = ""
+            if _HTTPS_PORT_RE.search(_peek):
+                await resp.release()
+                cur = "https://" + cur[len("http://"):]
                 continue
         return resp
     return resp
@@ -6851,7 +7100,7 @@ async def _send_chat(session, host, full, payload, endpoint, do_stream, timeout=
         # thinking off, so we never pay the wasted first pass again this runtime. The
         # caller's explicit think wins; this only fires when think wasn't set.
         _think = payload.get("think")
-        if _think is None and (_norm_host(host), full) in _session_no_think:
+        if _think is None and _should_suppress_think(host, full):
             _think = False
         # think:false has no universal off-switch, so STACK every known lever per
         # dialect (the way llcat's -nt does) — each backend ignores the ones it
@@ -7074,6 +7323,8 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
             servers = [(prio, host,
                         [m for m in ms if _fits(host, m)] + [m for m in ms if not _fits(host, m)])
                        for (prio, host, ms) in servers]
+    # Proven-size data for the race sort key below (loaded once; only when there's a real prompt).
+    _maxok = _load_max_ok() if _pt else {}
     def _toobig(host, ms):
         return 0 if (not _ctx or not ms or _fits(host, ms[0])) else 1
     # User vote (👍/👎): a signed preference that orders a pair WITHIN its tier and NEVER
@@ -7085,16 +7336,20 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
     def _vote(host, ms):
         vs = [_votes[(host, m)] for m in ms if (host, m) in _votes]
         return max(vs) if vs else 0   # +1 (favored); sorted via -vote so it lands first
-    # Order: TIER first (mechanical), then the vote within it, then warm/sticky, then
-    # too-big to the back of its tier, then WITHIN good/maybe by favorability. _fav is a
-    # per-job frozen snapshot so this race's own record_race writes can't churn the order
-    # mid-race. Unknown/explore hosts get favk=0 and keep their find_servers order (stable sort).
+    # Order: TIER first (mechanical), then the vote within it, then PROVEN size band, then
+    # warm/sticky, then too-big to the back of its tier, then WITHIN good/maybe by favorability.
+    # _fav is a per-job frozen snapshot so this race's own record_race writes can't churn the
+    # order mid-race. Unknown/explore hosts get favk=0 and keep their find_servers order (stable sort).
     _fav = _favorability(model, servers)
     def _order(it):
         prio, host, ms = it
         warm0 = 0 if (host in _warm and prio < TIER_BAD) else 1
         favk = -_fav[host]["fav"] if (host in _fav and prio in (TIER_GOOD, TIER_MAYBE)) else 0.0
-        return (prio, -_vote(host, ms), warm0, _toobig(host, ms), favk)
+        # Proven-size band sits ABOVE warmth: a host already shown to handle this prompt size
+        # beats a warm-but-unproven one for a big request (the fall-off-the-saddle fix).
+        return _race_sort_key(prio, _vote(host, ms),
+                              _sizeband(_need, _maxok, CTX_CONFIDENT_FRACTION, host, ms),
+                              warm0, _toobig(host, ms), favk)
     servers = sorted(servers, key=_order)
     for _i, (_p, _h, _m) in enumerate(servers):     # stamp final try-order rank for the log
         if _h in _fav:
@@ -7308,6 +7563,9 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
             if code == 503:
                 await broadcast_activity(host, model, "warming",
                     f"busy: {host}@{model} - {detail}", duration=dur, wid=wid)
+                # Transient: sink this host to the back of the pool for a while so a slammed
+                # host stops being the constant first pick. Expires on its own, no penalty.
+                add_rerank(host, -1, RERANK_BUSY_SECS)
                 return retry_later(detail)
             # The prompt is bigger than the window this host was LOADED with (LM Studio
             # "exceed_context_size_error", llama.cpp "exceeds the available context",
@@ -7532,6 +7790,10 @@ IMAGE_TOKENS = 2048
 # silently clamping. The old 32768 cap quietly broke agentic tooling, whose tool
 # schemas + accumulated history routinely blow past it.
 NUM_CTX_MAX = 2 ** 20          # 1048576 — a sanity bound, not a real limit (Qwen3 et al. reach 256k native, ~1M with YaRN)
+# Size banding (routing): a host PROVEN to have handled at least this fraction of the needed
+# window is still preferred for a big request (band 1), below one proven at/above it (band 0).
+# Routing-config tunable, NOT a magic number — overridable via settings/dashboard. 0.6 = 60%.
+CTX_CONFIDENT_FRACTION = 0.6
 NUM_CTX_RETRIES = 2            # re-sends with a doubled window after a truncation
 
 # The upstream models are Llama/Qwen/etc., whose tokenizers we don't ship, so an
@@ -7731,7 +7993,14 @@ def _with_num_predict(payload):
     num_ctx reissue still handles the case where the answer genuinely fills num_ctx."""
     opts = dict(payload.get("options") or {})
     if "num_predict" in opts:
-        return payload
+        # A caller (or an OpenAI max_tokens that rode in) can pin num_predict as a float,
+        # a string, or null — Ollama 500s on anything but an int ("option num_predict must
+        # be of type integer"). Coerce it; an uncoercible value falls back to our default.
+        try:
+            opts["num_predict"] = int(opts["num_predict"])
+        except (TypeError, ValueError):
+            opts["num_predict"] = -1
+        return dict(payload, options=opts)
     opts["num_predict"] = -1
     return dict(payload, options=opts)
 
@@ -7774,7 +8043,7 @@ def _is_empty_answer(partial):
 
 
 async def _pump_stream(response, resp, first_line, host, full, openai_format,
-                       upstream_openai, wid, num_ctx, partial, cancel=None):
+                       upstream_openai, wid, num_ctx, partial, cancel=None, skip=None):
     """Forward ONE already-won upstream stream to the already-prepared client
     `response`, translating dialect as needed and accumulating the assistant text
     into partial[0] so a mid-stream failover can carry the work forward. Returns:
@@ -7787,6 +8056,9 @@ async def _pump_stream(response, resp, first_line, host, full, openai_format,
       'client'    the CLIENT connection broke (abort — do NOT fail over);
       'stopped'   the operator hit Stop on this committed stream (`cancel` set): abort
                   THIS host without failing over, so a slow crawler can be killed.
+      'skip'      the operator hit Skip on this committed stream (`skip` set): abandon
+                  THIS host but KEEP the client connection open, so the caller fails over
+                  to the next server (same mid-toolcall policy as a truncation).
     Always releases `resp`. A client hang-up raises _ClientGone from the write
     helper; an upstream drop surfaces from the read loop — that split is the whole
     point, so we know whether to fail over."""
@@ -7828,6 +8100,7 @@ async def _pump_stream(response, resp, first_line, host, full, openai_format,
     # below so a Stop registers within one line even on a slow (or scaled-long TIMEOUT)
     # stream, instead of only being noticed at the next line boundary.
     cancel_wait = asyncio.ensure_future(cancel.wait()) if cancel is not None else None
+    skip_wait = asyncio.ensure_future(skip.wait()) if skip is not None else None
     try:
         if openai_format:
             first = json.loads(first_line)
@@ -7897,7 +8170,9 @@ async def _pump_stream(response, resp, first_line, host, full, openai_format,
                     return "capped"
                 _wait = min(TIMEOUT, _rem)
             read_task = asyncio.ensure_future(resp.content.readline())
-            waiters = [read_task] + ([cancel_wait] if cancel_wait is not None else [])
+            waiters = ([read_task]
+                       + ([cancel_wait] if cancel_wait is not None else [])
+                       + ([skip_wait] if skip_wait is not None else []))
             done_set, _pending = await asyncio.wait(
                 waiters, timeout=_wait, return_when=asyncio.FIRST_COMPLETED)
             if cancel_wait is not None and cancel_wait.done():
@@ -7905,6 +8180,14 @@ async def _pump_stream(response, resp, first_line, host, full, openai_format,
                 with contextlib.suppress(Exception):
                     await read_task
                 return "stopped"
+            if skip_wait is not None and skip_wait.done():
+                # Operator Skip: drop THIS host but leave the client connection open —
+                # the caller treats 'skip' like a mid-stream truncation and fails over to
+                # the next server (checked AFTER stop, so a simultaneous Stop still wins).
+                read_task.cancel()
+                with contextlib.suppress(Exception):
+                    await read_task
+                return "skip"
             if read_task not in done_set:
                 read_task.cancel()
                 with contextlib.suppress(Exception):
@@ -8012,6 +8295,8 @@ async def _pump_stream(response, resp, first_line, host, full, openai_format,
     finally:
         if cancel_wait is not None and not cancel_wait.done():
             cancel_wait.cancel()
+        if skip_wait is not None and not skip_wait.done():
+            skip_wait.cancel()
         with contextlib.suppress(Exception):
             await resp.release()
 
@@ -8224,7 +8509,7 @@ async def _race_ndjson_keepalive(request, session, model, servers, payload, req_
 
 async def _stream_chat_failover(request, session, model, servers, opayload,
                                 openai_format, req_caps, job_wid, result, cancel=None,
-                                response=None, sid=None):
+                                response=None, skip=None, sid=None):
     """Stream a chat answer, and if an upstream drops mid-stream WITHOUT a terminal
     done token, seamlessly fail over to the next server — the SAME client connection
     stays open — carrying the work so far as context (with the window bumped to fit),
@@ -8264,12 +8549,18 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
         # own race-cancel during the (re-)race, so once a host has been committed to the
         # stream we point the worker's Stop button back at the stream cancel — otherwise
         # Stop on a committed, slow stream is a no-op (what let a 0.4 t/s host run 20+ min).
-        if cancel is not None and job_wid:
+        if job_wid:
             _w = _workers.get(job_wid)
             if _w is not None:
-                _w["stop"] = cancel.set
+                if cancel is not None:
+                    _w["stop"] = cancel.set
+                # Re-arm Skip for THIS leg too: otherwise a committed stream's skip handle
+                # is the race's finished handle or the no-op default (why Skip did nothing
+                # on a committed slow stream). Point it at this leg's skip signal.
+                if skip is not None:
+                    _w["skip"] = skip.set
         status = await _pump_stream(response, resp, first_line, host, full, openai_format,
-                                    oai, job_wid, _effective_num_ctx(payload), partial, cancel)
+                                    oai, job_wid, _effective_num_ctx(payload), partial, cancel, skip)
         if status == "capped":
             # The absolute run-time ceiling (WORKER_MAX) was hit. Two actions by setting:
             # failover -> treat exactly like a mid-stream truncation (carry partial work
@@ -8293,6 +8584,8 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
                 await _write_terminal_done(response, full, openai_format)
             break
         if status in ("done", "client"):
+            if status == "done":
+                _clear_empty_strikes(host, full)   # a real answer clears any transient-empty tally
             break
         if status == "empty":
             # Finished cleanly but delivered NOTHING — the whole answer went into the
@@ -8306,7 +8599,7 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
                     await _write_terminal_done(response, full, openai_format)
                 break
             _no_think_retried = True
-            _session_no_think.add((_norm_host(host), full))
+            _note_empty_answer(host, full)
             payload = dict(payload, think=False)
             partial = ["", 0]
             await broadcast_activity(host, full, "warming",
@@ -8324,6 +8617,14 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
             with contextlib.suppress(Exception):
                 await _write_terminal_done(response, full, openai_format)
             break
+        # Operator Skip lands here as status 'skip'. Treat it like a mid-stream truncation
+        # (fail over, carry work forward, same mid-toolcall safety via _resume_dropped_stream)
+        # but NEVER ding the host's reputation — the operator may have skipped a perfectly
+        # good host that was merely slow. Clear the one-shot signal so the next leg doesn't
+        # instantly skip again.
+        operator_skipped = status == "skip"
+        if operator_skipped and skip is not None:
+            skip.clear()
         made = len(partial[0]) + partial[1]   # real progress: content + tool-call args
         # Two kinds of mid-stream truncation, both continued on the SAME open client
         # connection by carrying the work forward — capped so the loop can't spin:
@@ -8343,7 +8644,12 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
         #              min). Drop it from THIS request's pool and fail over — no
         #              reputation ding (a one-off prompt that overran its window is a
         #              plausible benign cause; the blast radius is just this request).
-        if status == "truncated" and made <= 40:
+        if operator_skipped:
+            await broadcast_activity(host, full, "warming",
+                f"operator skipped {host} after {made} chars — failing over to another host",
+                wid=job_wid)
+            dead.add(host)   # exclude the skipped host from this request; no reputation ding
+        elif status == "truncated" and made <= 40:
             await broadcast_activity(host, full, "failed",
                 f"truncated without end token: {host} dropped mid-stream after "
                 f"{made} chars — failing over", wid=job_wid)
@@ -8355,9 +8661,12 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
                 f"retrying for a complete answer (not penalised)", wid=job_wid)
         elif made <= 40:  # 'length' with no real output — see note above
             await broadcast_activity(host, full, "warming",
-                f"hit the context window at {made} chars (no output) on {host} — "
-                f"failing over to a fresh host", wid=job_wid)
+                f"{host} returned an empty response but reported hitting its length limit "
+                f"— it won't answer a prompt this size; trying another host", wid=job_wid)
             mark_empty_length(host, full)   # observational tally — see the column note
+            # ...and now act on it: the host couldn't answer a prompt this big, so lower its
+            # ctx_limit toward that size (soft, self-healing) — big requests stop re-racing into it.
+            mark_overflow(host, full, (_workers.get(job_wid) or {}).get("prompt_est"))
             dead.add(host)
         else:  # 'length' with real streamed text
             await broadcast_activity(host, full, "trying",
@@ -9113,8 +9422,9 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
     sess = session_get(sid) if sid else None
     session_rebind = False
 
-    # Force re-pin hook: clear pin and skip the previous host for this process so
-    # the race cannot immediately reselect it (failover tests / ops). Gated —
+    # Force re-pin hook: clear pin and sink the previous host to the back of the
+    # pool (a temporary -1 rerank, same as 👎) so the race tries other hosts first
+    # (failover tests / ops). Gated —
     # SESSION_ALLOW_REPIN or env DYVA_SESSION_ALLOW_REPIN must be on, otherwise
     # the header is ignored (avoids a wide-open ops footgun).
     _want_repin = request.headers.get("X-Dyva-Session-Repin", "").strip().lower() in ("1", "true", "yes")
@@ -9122,8 +9432,8 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
         _env_repin = os.environ.get("DYVA_SESSION_ALLOW_REPIN", "").strip().lower() in ("1", "true", "yes")
         if SESSION_ALLOW_REPIN or _env_repin:
             if sess and sess.get("host"):
-                _session_skip_hosts.add(_norm_host(sess["host"]))
-                log.info("session %s: force-repin, skipping host %s", sid, sess.get("host"))
+                add_rerank(sess["host"], -1, RERANK_DOWN_SECS)
+                log.info("session %s: force-repin, sinking host %s", sid, sess.get("host"))
             session_clear_pin(sid)
             sess = session_get(sid)
             session_rebind = True
@@ -9155,6 +9465,7 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
 
     total = len(_servers)
     cancel = asyncio.Event()   # manual-stop signal; armed onto the worker for the stream
+    skip = asyncio.Event()     # manual-skip signal; re-armed onto the worker per streaming leg
     job_wid = await _register_worker(model_list[0], total, cancel.set, kind="text",
                                      title=_client_title(request))
     # The context window we intend to send is prompt-derived and known NOW, before any
@@ -9181,7 +9492,7 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                 ka_resp, msg, stopped = await _keepalive_then_stream(
                     _race_sse_keepalive, request, session, model, _servers, opayload, req_caps,
                     job_wid, openai_format, cancel, pin_hedge, sid, sess,
-                    session_rebind, model_list[0])
+                    session_rebind, model_list[0], skip=skip)
                 if msg is None:
                     return ka_resp
                 with contextlib.suppress(Exception):
@@ -9202,7 +9513,7 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                 ka_resp, msg, stopped = await _keepalive_then_stream(
                     _race_ndjson_keepalive, request, session, model, _servers, opayload, req_caps,
                     job_wid, openai_format, cancel, pin_hedge, sid, sess,
-                    session_rebind, model_list[0])
+                    session_rebind, model_list[0], skip=skip)
                 if msg is None:
                     return ka_resp
                 with contextlib.suppress(Exception):
@@ -10614,7 +10925,7 @@ async def handle_settings_get(request):
         # show a password prompt instead of the controls.
         return web.json_response({"admin": False, "admin_pw_set": True}, status=403)
     return web.json_response({"workers": WORKER_COUNT, "timeout": TIMEOUT,
-                              "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS,
+                              "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS, "ctx_confident_fraction": CTX_CONFIDENT_FRACTION,
                               "worker_max": WORKER_MAX, "worker_max_failover": WORKER_MAX_FAILOVER, "tool_resume": TOOL_RESUME, "race_watchdog": RACE_WATCHDOG,
                               "min_count": MIN_COUNT, "local": _LOCAL,
                               "explore": EXPLORE_MODE, "hide_dyva": HIDE_DYVA,
@@ -10639,7 +10950,7 @@ async def handle_settings_post(request):
       '200':
         description: Updated settings
     """
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION
     resp = await _check_local(request) or _check_admin(request)
     if resp:
         return resp
@@ -10662,6 +10973,8 @@ async def handle_settings_post(request):
         TIMEOUT = min(body["timeout"], 600)
     if isinstance(body.get("hedge_delay"), (int, float)) and body["hedge_delay"] >= 0:
         HEDGE_DELAY = min(body["hedge_delay"], 600)
+    if isinstance(body.get("ctx_confident_fraction"), (int, float)) and 0 < body["ctx_confident_fraction"] <= 1:
+        CTX_CONFIDENT_FRACTION = body["ctx_confident_fraction"]
     if "warm_connect_wait" in body:   # a number = connect sub-phase; null = full lead (off)
         _wcw = body["warm_connect_wait"]
         WARM_CONNECT_WAIT = min(_wcw, 600) if isinstance(_wcw, (int, float)) and _wcw >= 0 else None
@@ -10732,7 +11045,7 @@ async def handle_settings_post(request):
     if sources_changed:
         await asyncio.get_event_loop().run_in_executor(None, refresh_cache)
     return web.json_response({"workers": WORKER_COUNT, "timeout": TIMEOUT,
-                              "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS,
+                              "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS, "ctx_confident_fraction": CTX_CONFIDENT_FRACTION,
                               "worker_max": WORKER_MAX, "worker_max_failover": WORKER_MAX_FAILOVER, "tool_resume": TOOL_RESUME, "race_watchdog": RACE_WATCHDOG,
                               "min_count": MIN_COUNT, "local": _LOCAL,
                               "explore": EXPLORE_MODE, "hide_dyva": HIDE_DYVA,
@@ -11228,16 +11541,16 @@ async def handle_skip_worker(request):
 
 async def handle_flag_worker(request):
     """
-    Thumbs-down a finished worker: force its (host, resolved-model) to bad.
+    Thumbs-down a finished worker: temporarily sink its host to the back of the pool.
     ---
     tags: [Admin]
-    summary: Mark the host+model a finished worker used as bad
+    summary: Sink the host a finished worker used to the back (👎), temporarily
     description: >
-      For a worker that completed but produced garbage (cut off, misconfigured,
-      bunk output despite emitting tokens). Sends that exact (host, resolved
-      model) straight to the bad tier so it is demoted out of routing. Resolves
-      host/model from the worker record when the wid is still tracked; otherwise
-      falls back to the host/model query params the card carries.
+      For a worker that produced garbage (cut off, misconfigured, bunk output). Adds a
+      temporary, expiring -1 rerank on that host so routing stops offering it first — it
+      stays a last-resort candidate, is NOT marked bad in the reputation DB, and the vote
+      clears itself after RERANK_DOWN_SECS. Resolves host/model from the worker record when
+      the wid is still tracked; otherwise falls back to the host/model query params.
     parameters:
       - in: query
         name: wid
@@ -11266,13 +11579,11 @@ async def handle_flag_worker(request):
     model = (w.get("rmodel") if w else None) or request.query.get("model")
     if not host or not model:
         return web.json_response({"error": "no host/model to flag"}, status=404)
-    # "Do not go back to this host." Session-scoped, non-persistent, host-wide: add it to
-    # the in-memory skip set (find_servers hard-drops it) and unpin any sticky pointing at
-    # it so nothing resurrects it. NOT a reputation mark — no bad/honeypot, nothing
-    # persisted; a restart or a 👍 clears it. (The old path set a -1 vote that the sticky
-    # top-slot simply outranked, so the host came right back — the exact bug this fixes.)
-    _session_skip_hosts.add(_norm_host(host))
-    _session_prefer_hosts.discard(_norm_host(host))   # 👎 undoes a session 👍 preference
+    # 👎 = a temporary, expiring -1 rerank: sink this host to the back of the pool for a
+    # while (RERANK_DOWN_SECS) — still a last-resort candidate (busy-beats-none), never a
+    # reputation mark, and it clears itself. A live 👍 (+1) nets it back toward neutral.
+    # Also unpin any sticky so the warm slot doesn't keep routing here meanwhile.
+    add_rerank(host, -1, RERANK_DOWN_SECS)
     clear_last(host)
     log.warning(f"worker skipped this session (👎): host={host} model={model} wid={wid}")
     await broadcast_activity(host, model, "flagged",
@@ -11282,15 +11593,15 @@ async def handle_flag_worker(request):
 
 async def handle_favor_worker(request):
     """
-    Thumbs-up a finished worker: a within-tier favor vote (does NOT change the tier).
+    Thumbs-up a finished worker: temporarily float its host to the front of the pool.
     ---
     tags: [Admin]
-    summary: Favor (👍) the host+model a finished worker used — the counterpart to 👎
+    summary: Float the host a finished worker used to the front (👍), temporarily
     description: >
-      Records a favor vote (-1) on that exact (host, resolved model), pulling it toward
-      the front of WHATEVER tier it mechanically earned — it does not promote the tier.
-      The reversible counterpart to /flag-worker. Resolves host/model from the worker
-      record, else the query params.
+      Adds a temporary, expiring +1 rerank on that host so routing offers it first for a
+      while — enough to get a starved-but-proven host raced and re-measured. It does NOT
+      write reputation and clears itself after RERANK_UP_SECS. The reversible counterpart
+      to /flag-worker. Resolves host/model from the worker record, else the query params.
     parameters:
       - {in: query, name: wid,   schema: {type: string}, required: false, description: Worker id}
       - {in: query, name: host,  schema: {type: string}, required: false, description: Host (fallback)}
@@ -11304,21 +11615,12 @@ async def handle_favor_worker(request):
     model = (w.get("rmodel") if w else None) or request.query.get("model")
     if not host or not model:
         return web.json_response({"error": "no host/model to favor"}, status=404)
-    # 👍 = a ONE-TIME optimistic tier boost (favor_host), NOT a sticky within-tier vote and NOT a
-    # permanent promotion. A proven-but-starved host (great record, but dropped to maybe_good/unknown
-    # by a decayed mark, so it never gets raced and never gets re-measured to climb back) is lifted
-    # into 'good' for ONE look. Then it earns its keep like the rest: a real win confirms it, a stall
-    # demotes it right back. We never remember it was favored — the tier ladder stays the law, the
-    # boost just buys a re-measurement. (Earlier this was set_vote, a within-tier nudge that could
-    # never lift a maybe_good host past the good tier, so it was useless for exactly this case.)
-    favor_host(host, model)
-    # Mirror of 👎: float this host to the TOP of the race this session (TIER_PREFER,
-    # above every tier incl. the sticky), and clear any 👎 skip on it. Session-scoped and
-    # non-persistent — a restart or a 👎 clears it. (favor_host above still gives the
-    # one-time reputation re-measurement; the preferred set is what makes 👍 actually put
-    # the host first, which it never did before.)
-    _session_prefer_hosts.add(_norm_host(host))
-    _session_skip_hosts.discard(_norm_host(host))   # 👍 undoes a session 👎 skip
+    # 👍 = a temporary, expiring +1 rerank: float this host to the front of the pool for a
+    # while (RERANK_UP_SECS), above every tier incl. the sticky — enough to get a starved-
+    # but-proven host raced and re-measured. It expires on its own and NEVER writes
+    # reputation (the tier ladder stays the law). A live -1 (busy / a 👎) just nets against
+    # it, so a slammed-but-liked host quietly waits and pops back when the busy row lapses.
+    add_rerank(host, 1, RERANK_UP_SECS)
     log.warning(f"worker favored (👍): host={host} model={model} wid={wid}")
     await broadcast_activity(host, model, "connected",
         f"preferred — routed first this session (👍): {_norm_host(host)}")
@@ -11857,6 +12159,7 @@ async def handle_systemone(request):
                 f"failure: {host}@{model} - {type(e).__name__}", duration=time.time() - t0, wid=wid)
             return unreachable_host(type(e).__name__)
         if code == 503:                       # alive but busy — park and retry, no penalty
+            add_rerank(host, -1, RERANK_BUSY_SECS)   # and sink it to the back for a while
             return retry_later("busy (HTTP 503)")
         if code == 400:
             # A 400 is the Jev API rejecting the REQUEST (bad question schema, missing
@@ -13306,8 +13609,9 @@ def _image_pool(a1111_candidates, comfy_candidates, model_filter, marks, last_ho
     sbh = {s.get("server"): s for s in a1111_candidates}
     sbh.update({s.get("server"): s for s in comfy_candidates})
 
+    rr = rerank_scores()
     def _drop(h):
-        return _norm_host(h) in _session_skip_hosts or f"{h} {IMG_KEY}" in incompat
+        return f"{h} {IMG_KEY}" in incompat
 
     def _chain_pref(h):
         if len(chain) <= 1:
@@ -13321,7 +13625,8 @@ def _image_pool(a1111_candidates, comfy_candidates, model_filter, marks, last_ho
         return len(chain)
 
     def _key(h):
-        return (0 if _norm_host(h) in _session_prefer_hosts else 1,
+        # reranker first (net>0 to the front, net<0 to the back — image == text), then caps
+        return (-rr.get(_norm_host(h), 0),
                 capability_tier(h, IMG_KEY, marks, last_host),
                 _chain_pref(h),
                 _inflight.get(h, 0) + (1 if is_active(h) else 0))
@@ -13623,8 +13928,8 @@ async def handle_txt2img(request):
     # ----- ONE candidate pool, ONE tiered race ---------------------------------
     # Image routing is NOT a separate scheme from text. a1111 + comfyui hosts are
     # pooled and ordered by, in priority:
-    #   1. 👎 session-skip hard-DROPPED (host-wide "do not go back"); 👍 to the front
-    #      — the SAME _session_skip_hosts / _session_prefer_hosts text routing uses.
+    #   1. reranker: 👎 (-1) sinks a host to the back, 👍 (+1) floats it to the front
+    #      — the SAME rerank_scores() reorder text routing uses (image == text).
     #   2. STRUCTURAL failures hard-DROPPED (auth 401/403, missing model) via
     #      load_incompatible() — the same hard-exclude text applies.
     #   3. reputation tier (capability_tier: sticky > good > maybe_good > unknown >
@@ -15972,7 +16277,9 @@ async def _run_video_job(session, jid):
         await _unregister_worker(job_wid, ok=True)
         return
 
-    await _unregister_worker(job_wid)
+    # ok=False: a video job that found a host and then failed the render is a
+    # failure, not the default found-a-host "ok" that mislabels the worker record.
+    await _unregister_worker(job_wid, ok=False)
     reasons = collections.Counter(e.split(": ", 1)[1] if ": " in e else e for e in errors)
     job["status"] = "failed"
     job["error"] = ("; ".join(f"{c}x {r}" for r, c in reasons.most_common())
@@ -19015,14 +19322,17 @@ def _build_music_workflow(info, fam, enc_cls, lat_cls, style, lyrics, seconds, s
 
 
 def _find_music_hosts(target_host=None):
-    """ComfyUI hosts carrying an audio/music-class model. Whether they can
-    actually generate music is decided by probing /object_info at submit time —
-    a model class alone never implies capability."""
+    """ComfyUI hosts carrying a music GENERATION model (the `music` class — a
+    loadable text-to-music checkpoint), not merely any audio-class model. A
+    TTS-only host, or one with the AceStep nodes but no checkpoint, is not a
+    candidate: it could only ever fail with "no matching model to load". Whether
+    a selected host can finish is still decided by probing /object_info at submit
+    time — model presence narrows the field, it doesn't promise success."""
     if target_host:
-        return [target_host] if _host_has_class(target_host, _AUDIO_CLASSES) else []
+        return [target_host] if _host_has_class(target_host, _MUSIC_MODEL_CLASS) else []
     hosts = [s.get("server") for s in load_servers()
              if s.get("service") == "comfyui" and s.get("server")
-             and _host_has_class(s.get("server"), _AUDIO_CLASSES)]
+             and _host_has_class(s.get("server"), _MUSIC_MODEL_CLASS)]
     bad, good = load_bad(), load_good()
     hosts.sort(key=lambda h: 0 if f"{h} {MUSIC_KEY}" in good else (1 if f"{h} {MUSIC_KEY}" not in bad else 2))
     last = get_last(MUSIC_KEY)
@@ -19091,53 +19401,104 @@ async def _poll_comfy_audio(session, host, prompt_id, timeout=900):
         raise _MusicError(str(e))
 
 
+async def _music_attempt(session, host, job):
+    """One host's turn in the music race: probe /object_info, pick a family, build
+    the graph, and submit. Returns the Outcome the race reads — `accepted` carries
+    (host, prompt_id, family, model); anything else is a failure verdict. The race
+    engine records reputation from the verdict, so this records none itself."""
+    p = job.get("params") or {}
+    info = await _get_object_info(session, host)
+    if not info:
+        return unreachable_host("unreachable")
+    fam, enc, lat = _music_family_on_host(info)
+    if not fam:
+        return unsuitable("no known music nodes")
+    try:
+        graph, model_ref = _build_music_workflow(
+            info, fam, enc, lat, job["style"], job.get("lyrics") or "",
+            job["seconds"], job["seed"], int(p.get("steps", 50)), float(p.get("cfg", 5.0)))
+    except _MusicError as e:
+        return unsuitable(str(e) or "music build failed")
+    try:
+        pid = await comfy_submit(session, host, graph)
+    except (ComfyError, asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
+        return render_verdict(e)
+    return accepted((host, pid, fam["name"], model_ref), model_ref)
+
+
 async def _run_music_job(session, jid):
+    """Generate music by racing the WHOLE audio-host pool through the shared
+    `_race_hosts` engine — the same routing chat/image/video/speech use (bounded
+    concurrent worker pool, reputation tiers, host leasing, no candidate cap),
+    with `_music_attempt` as the only music-specific part. The race finds a host
+    that accepts the submit; we poll that host for the audio and, if it
+    accepted-then-failed, re-race the rest. Mirrors `_run_video_job`."""
     job = _MUSIC_JOBS.get(jid)
     if not job:
         return
     job["status"] = "in_progress"
     _music_job_save()
-    p = job.get("params") or {}
     label = f"music: {job.get('style', '')[:40]}"
-    t0 = time.time()
-    host = None
+    hosts = list(job.get("hosts") or [])
     errors = []
+    job_wid = await _register_worker(job.get("model") or "*", len(hosts),
+                                     lambda: None, kind="music")
+
+    async def attempt(host, wid, done):
+        await broadcast_activity(host, label, "trying", label, wid=wid)
+        t0 = time.time()
+        out = await _music_attempt(session, host, job)
+        if out.verdict == V_ACCEPTED:
+            await broadcast_activity(host, label, "connected", label,
+                                     duration=time.time() - t0, wid=wid, rmodel=out.result[3])
+        else:
+            errors.append(f"{host}: {out.detail or out.verdict}")
+            await broadcast_activity(host, label, "failed",
+                                     f"{label}: {out.detail or out.verdict}",
+                                     duration=time.time() - t0, wid=wid)
+        return out
+
+    completed = False
+    tried = set()
     try:
-        for cand in job.get("hosts") or []:
-            info = await _get_object_info(session, cand)
-            if not info:
-                errors.append(f"{cand}: unreachable")
-                continue
-            fam, enc, lat = _music_family_on_host(info)
-            if not fam:
-                errors.append(f"{cand}: no known music nodes")
-                continue
-            try:
-                graph, model_ref = _build_music_workflow(
-                    info, fam, enc, lat, job["style"], job.get("lyrics") or "",
-                    job["seconds"], job["seed"], int(p.get("steps", 50)), float(p.get("cfg", 5.0)))
-            except _MusicError as e:
-                log.warning(f"music build: {cand}: {e}")
-                errors.append(f"{cand}: {e}")
-                continue
-            host = cand
+        while True:
+            pool = [h for h in hosts if h not in tried]
+            if not pool:
+                break
+            # Lease each host exclusively so concurrent renders spread across the
+            # pool (the text race's one-job-per-host rule); busy-beats-none fallback.
+            starved = []
+            result, stopped, _tried, _tally = await _race_hosts(
+                pool, attempt, MUSIC_KEY, job_wid=job_wid, banker_key=MUSIC_KEY,
+                starved_out=starved, defer_good=True)
+            if result is None and starved and not stopped:
+                result, stopped, _t2, _ta2 = await _race_hosts(
+                    starved, attempt, MUSIC_KEY, job_wid=job_wid, defer_good=True)
+            if not result or stopped:
+                break
+            host, pid, fam_name, model_ref = result
+            tried.add(host)
             job["host"] = host
-            job["family"] = fam["name"]
+            job["family"] = fam_name
             job["model"] = model_ref
-            _music_job_save()
-            await broadcast_activity(host, label, "trying", label, rmodel=model_ref)
-            try:
-                pid = await comfy_submit(session, host, graph)
-            except ComfyError as e:
-                # The reason the host said no is worth keeping — "rejected the
-                # graph" hid whether the nodes were missing or it was just down.
-                errors.append(f"{host}: {e}")
-                host = None
-                continue
             job["comfyui_prompt_id"] = pid
+            job["phase"] = "composing"
+            job["phase_at"] = time.time()
             _music_job_save()
-            async with _waiting_worker(label, host, "composing", model=model_ref):
+            mark_worker_found(job_wid, host, model_ref)
+            _set_worker_phase(job_wid, "composing")
+            try:
                 content, filename = await _poll_comfy_audio(session, host, pid)
+            except (_MusicError, ComfyError, asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
+                # took the job then couldn't finish — record it so the host stops
+                # looking good, and re-race the remaining hosts.
+                record_verdict(host, MUSIC_KEY, render_verdict(e))
+                err = str(e) or type(e).__name__
+                errors.append(f"{host}: {err}")
+                log.warning(f"music: {host}: took the job then failed: {err}")
+                await broadcast_activity(host, label, "failed", f"{label}: {err}")
+                _set_worker_phase(job_wid, None)
+                continue
             os.makedirs(MUSIC_JOBS_DIR, exist_ok=True)
             content_path = os.path.join(MUSIC_JOBS_DIR, f"{jid}.bin")
             with open(content_path, "wb") as f:
@@ -19145,25 +19506,31 @@ async def _run_music_job(session, jid):
             job["content_path"] = content_path
             job["filename"] = filename
             job["status"] = "completed"
+            job["phase"] = None
             job["unsigned_urls"] = [f"/v1/music/{jid}/content"]
-            add_good(host, MUSIC_KEY)
+            # GOOD on completion, not on accept (the race ran defer_good).
+            record_verdict(host, MUSIC_KEY, accepted(None, model_ref), sticky_key=MUSIC_KEY)
             set_last(MUSIC_KEY, host, model_ref)
-            await broadcast_activity(host, label, "done", label, duration=time.time() - t0,
-                                     rmodel=model_ref)
+            await broadcast_activity(host, label, "done", label, rmodel=model_ref)
             _music_job_save()
-            return
-        raise _MusicError("; ".join(errors) if errors else "no music-capable host answered")
-    except (_MusicError, asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
-        job["status"] = "failed"
-        job["error"] = str(e) or type(e).__name__
-        if host:
-            log.warning(f"music: {host}: {job['error']}")
-            # A timeout on music gen is alive-but-slow (rendering is slow) -> SOFT-fail; a real
-            # fault/connection error -> add_bad.
-            (add_soft_fail if isinstance(e, asyncio.TimeoutError) else add_bad)(
-                host, MUSIC_KEY, reason=f"music: {job['error']}")
-            await broadcast_activity(host, label, "failed", f"{label}: {job['error']}", duration=time.time() - t0)
-        _music_job_save()
+            completed = True
+            break
+    except Exception as e:                                  # never leak the worker
+        log.warning(f"music {jid}: unexpected: {e}")
+        errors.append(f"{job.get('host') or '?'}: {e}")
+
+    if completed:
+        await _unregister_worker(job_wid, ok=True)
+        return
+    # ok=False explicitly: this media job FOUND a host (the race accepted) but the
+    # render then failed, so the default "found a host => ok" (a streaming-text
+    # assumption) would mislabel the worker record won/completed on a real failure.
+    await _unregister_worker(job_wid, ok=False)
+    reasons = collections.Counter(e.split(": ", 1)[1] if ": " in e else e for e in errors)
+    job["status"] = "failed"
+    job["error"] = ("; ".join(f"{c}x {r}" for r, c in reasons.most_common())
+                    or "no music-capable host answered")
+    _music_job_save()
 
 
 async def handle_music_post(request):
@@ -19241,7 +19608,7 @@ async def handle_music_post(request):
     model_filter = str(body.get("model") or "")
     if model_filter:
         hosts = [h for h in hosts if _pick_music_model(h, model_filter)] or hosts
-    job = {"id": None, "status": "pending", "hosts": hosts[:8], "host": None,
+    job = {"id": None, "status": "pending", "hosts": hosts, "host": None,
            "model": None, "family": None, "style": style, "lyrics": lyrics,
            "seconds": seconds, "seed": seed, "params": dict(body),
            "created": time.time(), "unsigned_urls": []}
@@ -19258,12 +19625,77 @@ def _pick_music_model(host, model_filter=None):
         if s.get("server") != host:
             continue
         for m in s.get("models") or []:
-            if not (model_classes(m) & _AUDIO_CLASSES):
+            if not (model_classes(m) & _MUSIC_MODEL_CLASS):
                 continue
             if model_filter and not match_model(m, model_filter):
                 continue
             return m
     return None
+
+
+async def handle_music_list(request):
+    """
+    Recent music jobs
+    ---
+    tags: [Music]
+    summary: GET /v1/music — the recent job list, newest first
+    description: |
+      Metadata only; the bytes are at `/v1/music/{id}/content`. `content_url` is
+      set only for a completed job that actually wrote a clip, so an in-flight or
+      failed job never advertises a dead URL. In-flight and failed jobs are listed
+      too, so the gallery can show what is cooking and what went wrong.
+    responses:
+      '200':
+        description: Job list
+    """
+    # _MUSIC_JOBS is loaded lazily; without this the gallery comes up EMPTY when
+    # GET /v1/music is the first music endpoint hit after a restart (mirrors the
+    # video gallery's same fix).
+    _load_music_jobs()
+    out = []
+    for jid, job in _MUSIC_JOBS.items():
+        if not isinstance(job, dict):
+            continue
+        host = job.get("host") or ""
+        out.append({
+            "id": jid,
+            "status": job.get("status"),
+            "prompt": job.get("style") or "",          # named `prompt` like the video list
+            "style": job.get("style") or "",
+            "lyrics": job.get("lyrics") or "",
+            "model": job.get("model") or "",
+            "host": host,
+            "family": job.get("family") or "",
+            "service": service_of(host) if host else "",
+            "seconds": job.get("seconds"),
+            "created": job.get("created"),
+            "error": job.get("error"),
+            "content_url": (f"/v1/music/{jid}/content" if job.get("content_path") else None),
+        })
+    out.sort(key=lambda j: j.get("created") or 0, reverse=True)
+    return web.json_response(out)
+
+
+async def handle_music_delete(request):
+    """
+    Delete a music job
+    ---
+    tags: [Music]
+    summary: GET /v1/music/{id}/delete — remove a job and its clip
+    responses:
+      '200':
+        description: Deleted
+    """
+    jid = request.match_info.get("id", "")
+    _load_music_jobs()
+    job = _MUSIC_JOBS.pop(jid, None)
+    if job and job.get("content_path"):
+        try:
+            os.remove(job["content_path"])
+        except OSError:
+            pass
+    _music_job_save()
+    return web.json_response({"deleted": bool(job)})
 
 
 async def handle_music_get(request):
@@ -19338,49 +19770,6 @@ async def handle_music_content(request):
     with open(path, "rb") as f:
         return web.Response(body=f.read(), content_type=ctype,
                             headers={"Content-Disposition": f'inline; filename="{name}"'})
-
-
-async def handle_music_models(request):
-    """
-    List music-capable hosts and the families they run
-    ---
-    tags: [Music]
-    summary: GET /v1/music/models — probe audio hosts for known music node families
-    responses:
-      '200':
-        description: Per-host music capability
-    """
-    resp = await _check_local(request)
-    if resp:
-        return resp
-    session = request.app["session"]
-    hosts = _find_music_hosts(request.query.get("host"))
-    if not hosts:
-        return web.json_response({"hosts": [], "families": []})
-
-    async def probe(host):
-        info = await _get_object_info(session, host)
-        if not info:
-            return None
-        fam, enc, lat = _music_family_on_host(info)
-        if not fam:
-            return None
-        return {"host": _norm_host(host), "family": fam["name"],
-                "encode_node": enc, "latent_node": lat,
-                "models": [m for m in (_host_models(host) or [])
-                           if model_classes(m) & _AUDIO_CLASSES]}
-
-    found = [r for r in await asyncio.gather(*(probe(h) for h in hosts[:12]),
-                                             return_exceptions=True) if isinstance(r, dict)]
-    return web.json_response({"hosts": found,
-                              "families": sorted({f["family"] for f in found})})
-
-
-def _host_models(host):
-    for s in load_servers():
-        if s.get("server") == host:
-            return s.get("models") or []
-    return []
 
 
 def _task_stack_1line(t):
@@ -19544,6 +19933,7 @@ def make_app():
         response.headers["X-Robots-Tag"] = "noindex, nofollow, noarchive, nosnippet"
 
     app.on_response_prepare.append(_no_index)
+    app.on_response_prepare.append(_stamp_server)
     app.on_startup.append(on_startup)
     app.on_shutdown.append(on_shutdown)
 
@@ -19616,7 +20006,6 @@ def make_app():
     swagger.add_get("/v1/images/edit-models", handle_edit_models)
     swagger.add_get("/v1/audio/voices", handle_audio_voices)
     app.router.add_get("/v1/audio/clips/{name}", handle_audio_clip)
-    swagger.add_get("/v1/music/models", handle_music_models)
     # Registered on the plain router (not swagger) so path params and the
     # sendBeacon POST body aren't subject to swagger request validation.
     app.router.add_post("/v1/web/fetch", handle_web_fetch)
@@ -19642,6 +20031,8 @@ def make_app():
     app.router.add_get("/v1/videos/{id}", handle_videos_get)
     app.router.add_get("/v1/videos/{id}/content", handle_videos_content)
     app.router.add_post("/v1/music", handle_music_post)
+    swagger.add_get("/v1/music", handle_music_list)
+    app.router.add_get("/v1/music/{id}/delete", handle_music_delete)
     app.router.add_get("/v1/music/{id}", handle_music_get)
     app.router.add_get("/v1/music/{id}/content", handle_music_content)
 

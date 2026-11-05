@@ -269,8 +269,9 @@ Responses echo `X-Dyva-Session`, `X-Dyva-Session-Host`, `X-Dyva-Session-Model`,
 and `X-Dyva-Session-Rebind: 1` when the pin moved. Streamed replies also record
 the full assistant text into the transcript (same as non-stream).
 
-`X-Dyva-Session-Repin: 1` clears the pin and session-skips the prior host for
-this process so the next race must pick a different one. It is **off by
+`X-Dyva-Session-Repin: 1` clears the pin and sinks the prior host to the back of
+the pool (a temporary 👎-style rerank) so the next race tries other hosts first;
+it stays a last resort if nothing else answers. It is **off by
 default** (ops footgun): enable with `--session-allow-repin`, settings
 `session_allow_repin`, or env `DYVA_SESSION_ALLOW_REPIN=1`.
 
