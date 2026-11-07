@@ -1131,6 +1131,9 @@ table.sheet input.sheet-in:focus{outline:2px solid var(--accent);outline-offset:
    and attach/send stay two separate buttons. */
 .composer{margin-bottom:0;border:1px solid var(--border);border-radius:var(--r-lg);background:var(--surface);padding:var(--sp-2) var(--sp-3) var(--sp-3);transition:border-color .12s}
 .composer:focus-within{border-color:var(--border-focus)}
+/* Drag an image (or any file) over the composer box: accent the whole box so it
+   reads as the drop target. Transient — set on dragenter, cleared on drop/leave. */
+.composer.drop-active{border-color:var(--border-focus);border-style:dashed;box-shadow:0 0 0 2px var(--border-focus)}
 .field{margin-bottom:var(--sp-2)}
 /* Inside the box the textarea IS the box's surface — drop its own border/fill so it reads as one
    composer, not a box-in-a-box; no inner focus outline either (the box ring covers it). */
@@ -8171,11 +8174,11 @@ document.getElementById('docToggle').addEventListener('click',function(){
 
 var attachments=[];
 var chatFilesInput=document.getElementById('chatFiles');
-document.getElementById('chatAttach').addEventListener('click',function(e){e.preventDefault();chatFilesInput.click();});
-chatFilesInput.addEventListener('change',function(){
-  var files=Array.prototype.slice.call(chatFilesInput.files);
-  chatFilesInput.value='';
-  files.forEach(function(f){
+// One ingest for every way a file enters the composer — the paperclip picker and
+// drag-and-drop below both call this, so an attachment is built identically either
+// way (image -> thumbnail chip in renderAttachments; other files -> name chip).
+function addChatFiles(fileList){
+  Array.prototype.slice.call(fileList||[]).forEach(function(f){
     var r=new FileReader();
     r.onload=function(){
       attachments.push({name:f.name,type:f.type,size:f.size,dataUrl:r.result,
@@ -8184,7 +8187,42 @@ chatFilesInput.addEventListener('change',function(){
     };
     r.readAsDataURL(f);
   });
+}
+document.getElementById('chatAttach').addEventListener('click',function(e){e.preventDefault();chatFilesInput.click();});
+chatFilesInput.addEventListener('change',function(){
+  addChatFiles(chatFilesInput.files);
+  chatFilesInput.value='';
 });
+// Drag-and-drop onto the composer box. dragover MUST preventDefault or the browser
+// just opens the dropped file instead. A depth counter keeps the highlight steady
+// as the pointer crosses child elements (each child fires its own enter/leave), and
+// we only react to an actual file drag (types includes 'Files'), not dragged text.
+(function(){
+  var composer=document.querySelector('.composer');
+  if(!composer)return;
+  var depth=0;
+  function hasFiles(e){
+    var t=e.dataTransfer&&e.dataTransfer.types;
+    return !!t&&Array.prototype.indexOf.call(t,'Files')>=0;
+  }
+  composer.addEventListener('dragenter',function(e){
+    if(!hasFiles(e))return;
+    e.preventDefault();depth++;composer.classList.add('drop-active');
+  });
+  composer.addEventListener('dragover',function(e){
+    if(!hasFiles(e))return;
+    e.preventDefault();try{e.dataTransfer.dropEffect='copy';}catch(_){}
+  });
+  composer.addEventListener('dragleave',function(e){
+    if(!hasFiles(e))return;
+    depth--;if(depth<=0){depth=0;composer.classList.remove('drop-active');}
+  });
+  composer.addEventListener('drop',function(e){
+    if(!hasFiles(e))return;
+    e.preventDefault();depth=0;composer.classList.remove('drop-active');
+    if(e.dataTransfer.files&&e.dataTransfer.files.length)addChatFiles(e.dataTransfer.files);
+  });
+})();
 // Sending an image as *vision* needs a model that can see, which rules out
 // most hosts. But an image is also just something to work on — the edit tool
 // reads it straight off the conversation — so the model often only needs to
