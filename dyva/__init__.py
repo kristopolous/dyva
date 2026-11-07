@@ -10831,6 +10831,10 @@ async def handle_settings_get(request):
                               "admin_pw_set": bool(ADMIN_PW),
                               "model_list": MODEL_LIST, "model_list_on": MODEL_LIST_ON,
                               "gossiper_url": GOSSIPER_URL, "gossiper_enabled": GOSSIPER_ENABLED,
+                              "affinity_prefix_msgs": AFFINITY_PREFIX_MSGS, "affinity_min_tokens": AFFINITY_MIN_TOKENS,
+                              "affinity_ttl_secs": AFFINITY_TTL_SECS, "affinity_max_entries": AFFINITY_MAX_ENTRIES,
+                              "affinity_floor_hosts": AFFINITY_FLOOR_HOSTS,
+                              "rerank_busy_secs": RERANK_BUSY_SECS, "rerank_up_secs": RERANK_UP_SECS, "rerank_down_secs": RERANK_DOWN_SECS,
                               "admin": True, "sources": _stored_sources(),
                               "source_toggles": _source_toggles()})
 
@@ -10845,7 +10849,7 @@ async def handle_settings_post(request):
       '200':
         description: Updated settings
     """
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION, RERANK_BUSY_SECS, RERANK_UP_SECS, RERANK_DOWN_SECS, AFFINITY_PREFIX_MSGS, AFFINITY_MIN_TOKENS, AFFINITY_TTL_SECS, AFFINITY_MAX_ENTRIES, AFFINITY_FLOOR_HOSTS
     resp = await _check_local(request) or _check_admin(request)
     if resp:
         return resp
@@ -10911,6 +10915,24 @@ async def handle_settings_post(request):
         GOSSIPER_URL = body["gossiper_url"].strip()
     if isinstance(body.get("gossiper_enabled"), bool):
         GOSSIPER_ENABLED = body["gossiper_enabled"]
+    # Host-matching knobs — read live, so these take effect for the next request without a
+    # restart. See brainstorm/host-affinity.md and brainstorm/reranker.md.
+    if isinstance(body.get("affinity_prefix_msgs"), int) and body["affinity_prefix_msgs"] >= 1:
+        AFFINITY_PREFIX_MSGS = min(body["affinity_prefix_msgs"], 50)
+    if isinstance(body.get("affinity_min_tokens"), (int, float)) and body["affinity_min_tokens"] >= 0:
+        AFFINITY_MIN_TOKENS = int(body["affinity_min_tokens"])
+    if isinstance(body.get("affinity_ttl_secs"), (int, float)) and body["affinity_ttl_secs"] >= 0:
+        AFFINITY_TTL_SECS = int(body["affinity_ttl_secs"])
+    if isinstance(body.get("affinity_max_entries"), int) and body["affinity_max_entries"] >= 1:
+        AFFINITY_MAX_ENTRIES = min(body["affinity_max_entries"], 100000)
+    if isinstance(body.get("affinity_floor_hosts"), int) and body["affinity_floor_hosts"] >= 0:
+        AFFINITY_FLOOR_HOSTS = body["affinity_floor_hosts"]
+    if isinstance(body.get("rerank_busy_secs"), (int, float)) and body["rerank_busy_secs"] >= 0:
+        RERANK_BUSY_SECS = int(body["rerank_busy_secs"])
+    if isinstance(body.get("rerank_up_secs"), (int, float)) and body["rerank_up_secs"] >= 0:
+        RERANK_UP_SECS = int(body["rerank_up_secs"])
+    if isinstance(body.get("rerank_down_secs"), (int, float)) and body["rerank_down_secs"] >= 0:
+        RERANK_DOWN_SECS = int(body["rerank_down_secs"])
     # admin_pw: only when the key is present. A non-empty value sets/changes the
     # password (stored hashed); an explicit empty string clears protection. The
     # plaintext is never stored or echoed back.
@@ -10948,6 +10970,10 @@ async def handle_settings_post(request):
                               "admin_pw_set": bool(ADMIN_PW),
                               "model_list": MODEL_LIST, "model_list_on": MODEL_LIST_ON,
                               "gossiper_url": GOSSIPER_URL, "gossiper_enabled": GOSSIPER_ENABLED,
+                              "affinity_prefix_msgs": AFFINITY_PREFIX_MSGS, "affinity_min_tokens": AFFINITY_MIN_TOKENS,
+                              "affinity_ttl_secs": AFFINITY_TTL_SECS, "affinity_max_entries": AFFINITY_MAX_ENTRIES,
+                              "affinity_floor_hosts": AFFINITY_FLOOR_HOSTS,
+                              "rerank_busy_secs": RERANK_BUSY_SECS, "rerank_up_secs": RERANK_UP_SECS, "rerank_down_secs": RERANK_DOWN_SECS,
                               "admin": True, "sources": _stored_sources(),
                               "source_toggles": _source_toggles(),
                               "refreshed": sources_changed})

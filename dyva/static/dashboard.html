@@ -1882,6 +1882,19 @@ body.dragging-image .hist-item{cursor:grabbing}
 <div class="settings-actions"><span class="settings-status"></span><button type="button" class="settings-save">Save</button></div>
 </div>
 <div class="settings-card">
+<div class="settings-card-title">Host matching<span class="dirty-flag">needs save</span></div>
+<div class="rc-hint">Temporary, expiring reorders layered on top of the reputation tiers &mdash; they never rewrite a host's reputation and clear themselves. <b>Affinity</b> keeps a large conversation on the one host that already has its context warm (a cold host-hop re-processes the whole prompt). <b>Votes</b> are the 👍/👎 and busy-signal nudges. All take effect live (no restart).</div>
+<label class="setting"><span class="setting-text"><span class="setting-name">Affinity engage size (tokens)</span><small class="setting-help">Only pin a conversation to its host once the prompt is at least this big &mdash; below it a cold hop is cheap and not worth protecting. Measured as a fast chars/4 estimate. <b>0</b> pins everything; the default (8000) targets the long contexts where re-processing the prompt on a new host actually hurts.</small></span><input type="number" id="setAffinityMinTokens" min="0" step="500"></label>
+<label class="setting"><span class="setting-text"><span class="setting-name">Affinity key length (messages)</span><small class="setting-help">How many of the first <em>user</em> messages form the fingerprint that identifies a conversation. The early, human-authored turns are the stable prefix a host keeps warm; later turns and the model's replies don't change the key. Larger = a more specific match (fewer collisions, but it only settles once that many messages exist).</small></span><input type="number" id="setAffinityPrefixMsgs" min="1" max="50" step="1"></label>
+<label class="setting"><span class="setting-text"><span class="setting-name">Affinity lifetime (s)</span><small class="setting-help">How long a conversation stays pinned to its host after each turn &mdash; a proxy for how long the host keeps the context warm. Refreshed on every hit (a sliding window), so an active chat stays pinned; an idle one lets go. Default 300.</small></span><input type="number" id="setAffinityTtl" min="0" step="30"></label>
+<label class="setting"><span class="setting-text"><span class="setting-name">Affinity cache size</span><small class="setting-help">How many conversations can be pinned at once (oldest-dropped past the cap). Each entry is tiny; this just bounds memory. Default 40.</small></span><input type="number" id="setAffinityMaxEntries" min="1" step="1"></label>
+<label class="setting"><span class="setting-text"><span class="setting-name">Affinity host floor</span><small class="setting-help">Protecting warm hosts can crowd a request onto worse ones, so affinity will <b>never</b> hold back more than it must: at least this many good hosts stay freely available as cold-start landing pads for a fresh large conversation. Default 5.</small></span><input type="number" id="setAffinityFloor" min="0" step="1"></label>
+<label class="setting"><span class="setting-text"><span class="setting-name">Busy demotion (s)</span><small class="setting-help">When a host answers 503 &ldquo;busy&rdquo;, sink it to the back of the line for this long so the banker stops leading with it, then it recovers on its own. Default 1800 (30&nbsp;min).</small></span><input type="number" id="setRerankBusy" min="0" step="60"></label>
+<label class="setting"><span class="setting-text"><span class="setting-name">👍 lifetime (s)</span><small class="setting-help">How long a thumbs-up floats a host to the front of the line. A temporary preference, not a reputation change &mdash; it expires by itself. Default 43200 (12&nbsp;h).</small></span><input type="number" id="setRerankUp" min="0" step="3600"></label>
+<label class="setting"><span class="setting-text"><span class="setting-name">👎 lifetime (s)</span><small class="setting-help">How long a thumbs-down sinks a host to the back (still a last-resort candidate, not a hard ban). Expires by itself. Default 43200 (12&nbsp;h).</small></span><input type="number" id="setRerankDown" min="0" step="3600"></label>
+<div class="settings-actions"><span class="settings-status"></span><button type="button" class="settings-save">Save</button></div>
+</div>
+<div class="settings-card">
 <div class="settings-card-title">Behavior<span class="dirty-flag">needs save</span></div>
 <label class="setting"><span class="setting-text"><span class="setting-name">Explore mode</span><small class="setting-help">Discover more of the unknown network: route hosts we haven't visited (unknown state) to the front of the line, ahead of known-good ones. Deliberately slower — a request may probe cold hosts first — but it maps out the pool. Off by default. <b>Caution:</b> the unvisited frontier is where the canary honeypots live, and poking a burst of fresh IPs is exactly what trips Cloudflare/WAF reputation — so this raises the chance of a soft IP ban on your egress. Use it for deliberate survey passes, not routine routing.</small></span><input type="checkbox" id="setExplore" onchange="updateExploreLogo()"></label>
 <div class="setting"><span class="setting-text"><span class="setting-name">Thinking token key</span><small class="setting-help">For OpenAI <code>/v1</code> requests, which key(s) carry the model's reasoning. Every ticked key is emitted with the same text. OpenAI never standardized this field, so clones diverged — tick what <b>your</b> client reads. Emitting more than one can break a strict client that rejects unknown fields, so the default is the single OpenAI key. (The ollama <code>/api/chat</code> path always uses <code>thinking</code> and is unaffected.)</small>
@@ -10438,6 +10451,15 @@ function populateSettings(s){
   document.getElementById('setBasePath').value=s.base_path||'';
   document.getElementById('setGossiperEnabled').checked=s.gossiper_enabled!==false;   // default ON
   document.getElementById('setGossiperUrl').value=s.gossiper_url||'';
+  // Host matching (affinity + reranker vote lifetimes); fall back to the code defaults if absent.
+  document.getElementById('setAffinityMinTokens').value=('affinity_min_tokens' in s)?s.affinity_min_tokens:8000;
+  document.getElementById('setAffinityPrefixMsgs').value=('affinity_prefix_msgs' in s)?s.affinity_prefix_msgs:4;
+  document.getElementById('setAffinityTtl').value=('affinity_ttl_secs' in s)?s.affinity_ttl_secs:300;
+  document.getElementById('setAffinityMaxEntries').value=('affinity_max_entries' in s)?s.affinity_max_entries:40;
+  document.getElementById('setAffinityFloor').value=('affinity_floor_hosts' in s)?s.affinity_floor_hosts:5;
+  document.getElementById('setRerankBusy').value=('rerank_busy_secs' in s)?s.rerank_busy_secs:1800;
+  document.getElementById('setRerankUp').value=('rerank_up_secs' in s)?s.rerank_up_secs:43200;
+  document.getElementById('setRerankDown').value=('rerank_down_secs' in s)?s.rerank_down_secs:43200;
   setModelList(s.model_list||[],s.model_list_on);
   document.getElementById('setLocal').checked=!!s.local;
   document.getElementById('setExplore').checked=!!s.explore;
@@ -10571,8 +10593,24 @@ function saveSettings(){
     explore:document.getElementById('setExplore').checked,
     hide_dyva:document.getElementById('setHideDyva').checked,
     reasoning_keys:collectReasoningKeys(),
-    cloudskip:_collectCloudSkip()
+    cloudskip:_collectCloudSkip(),
+    affinity_min_tokens:parseInt(document.getElementById('setAffinityMinTokens').value,10),
+    affinity_prefix_msgs:parseInt(document.getElementById('setAffinityPrefixMsgs').value,10),
+    affinity_ttl_secs:parseInt(document.getElementById('setAffinityTtl').value,10),
+    affinity_max_entries:parseInt(document.getElementById('setAffinityMaxEntries').value,10),
+    affinity_floor_hosts:parseInt(document.getElementById('setAffinityFloor').value,10),
+    rerank_busy_secs:parseInt(document.getElementById('setRerankBusy').value,10),
+    rerank_up_secs:parseInt(document.getElementById('setRerankUp').value,10),
+    rerank_down_secs:parseInt(document.getElementById('setRerankDown').value,10)
   };
+  if(isNaN(body.affinity_min_tokens)||body.affinity_min_tokens<0)delete body.affinity_min_tokens;
+  if(isNaN(body.affinity_prefix_msgs)||body.affinity_prefix_msgs<1)delete body.affinity_prefix_msgs;
+  if(isNaN(body.affinity_ttl_secs)||body.affinity_ttl_secs<0)delete body.affinity_ttl_secs;
+  if(isNaN(body.affinity_max_entries)||body.affinity_max_entries<1)delete body.affinity_max_entries;
+  if(isNaN(body.affinity_floor_hosts)||body.affinity_floor_hosts<0)delete body.affinity_floor_hosts;
+  if(isNaN(body.rerank_busy_secs)||body.rerank_busy_secs<0)delete body.rerank_busy_secs;
+  if(isNaN(body.rerank_up_secs)||body.rerank_up_secs<0)delete body.rerank_up_secs;
+  if(isNaN(body.rerank_down_secs)||body.rerank_down_secs<0)delete body.rerank_down_secs;
   if(isNaN(body.workers)||body.workers<1)delete body.workers;
   if(isNaN(body.timeout)||body.timeout<1)delete body.timeout;
   if(isNaN(body.hedge_delay)||body.hedge_delay<0)delete body.hedge_delay;
@@ -10622,6 +10660,14 @@ function saveSettings(){
       setPwState(!!s.admin_pw_set);
       document.getElementById('setSources').value=JSON.stringify(s.sources||[],null,2);
       renderSrcToggles(s.source_toggles||[]);
+      if('affinity_min_tokens' in s)document.getElementById('setAffinityMinTokens').value=s.affinity_min_tokens;
+      if('affinity_prefix_msgs' in s)document.getElementById('setAffinityPrefixMsgs').value=s.affinity_prefix_msgs;
+      if('affinity_ttl_secs' in s)document.getElementById('setAffinityTtl').value=s.affinity_ttl_secs;
+      if('affinity_max_entries' in s)document.getElementById('setAffinityMaxEntries').value=s.affinity_max_entries;
+      if('affinity_floor_hosts' in s)document.getElementById('setAffinityFloor').value=s.affinity_floor_hosts;
+      if('rerank_busy_secs' in s)document.getElementById('setRerankBusy').value=s.rerank_busy_secs;
+      if('rerank_up_secs' in s)document.getElementById('setRerankUp').value=s.rerank_up_secs;
+      if('rerank_down_secs' in s)document.getElementById('setRerankDown').value=s.rerank_down_secs;
       _clearDirty();   // one POST committed every card
       st.style.color='var(--ok)';st.textContent=s.refreshed?'saved · sources re-pulled':'saved';setTimeout(function(){st.textContent=''},3000);
     })
