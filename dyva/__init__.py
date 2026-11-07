@@ -437,6 +437,18 @@ CONTINUATION_HEDGE_PROBE = 45
 # host is probably cold/evicted (prompt cache gone, maybe the box rebooted), so the
 # hedge's reason to prefer it is stale — drop the stickiness and race normally.
 STICKY_TTL = 2 * 3600   # 2 hours
+# Opt-in CLIENT-session pinning. Distinct from STICKY_TTL / get_last (query-keyed
+# last-good shared across clients). Header X-Dyva-Session or body dyva_session
+# pins resolved (host, full) for SESSION_TTL with a local transcript for re-seed.
+# SESSION_STICKY auto-mints an id when omitted. Default False = unchanged routing.
+SESSION_STICKY = False
+SESSION_TTL = 3600
+SESSION_MSG_CAP = 200
+# Force-repin via X-Dyva-Session-Repin is an ops footgun (clears the pin and
+# session-skips the prior host). Off by default; enable with --session-allow-repin,
+# settings session_allow_repin, or env DYVA_SESSION_ALLOW_REPIN=1.
+SESSION_ALLOW_REPIN = False
+_sessions = {}
 MIN_COUNT = 0   # hide models served by fewer than this many hosts (0/1 = show all)
 EXPLORE_MODE = False   # route UNKNOWN/unvisited hosts first to map more of the pool (slower)
 # "Hide dyva": when on, a remote bot/curl GET of a WEB PAGE (the dashboard/HTML, not
@@ -757,6 +769,7 @@ def load_settings():
         RERANK_UP_SECS = s["rerank_up_secs"]
     if isinstance(s.get("rerank_down_secs"), (int, float)) and s["rerank_down_secs"] >= 0:
         RERANK_DOWN_SECS = s["rerank_down_secs"]
+    _apply_session_setting_keys(s)
     if isinstance(s.get("affinity_prefix_msgs"), int) and s["affinity_prefix_msgs"] >= 1:
         AFFINITY_PREFIX_MSGS = s["affinity_prefix_msgs"]
     if isinstance(s.get("affinity_min_tokens"), (int, float)) and s["affinity_min_tokens"] >= 0:
@@ -788,6 +801,8 @@ def save_settings(extra=None):
                  "cloudskip": sorted(CLOUD_SKIP), "base_path": BASE_PATH,
                  "gossiper_url": GOSSIPER_URL, "gossiper_enabled": GOSSIPER_ENABLED,
                  "rerank_busy_secs": RERANK_BUSY_SECS, "rerank_up_secs": RERANK_UP_SECS, "rerank_down_secs": RERANK_DOWN_SECS,
+                 "session_sticky": SESSION_STICKY, "session_ttl": SESSION_TTL,
+                 "session_allow_repin": SESSION_ALLOW_REPIN,
                  "affinity_prefix_msgs": AFFINITY_PREFIX_MSGS, "affinity_min_tokens": AFFINITY_MIN_TOKENS,
                  "affinity_ttl_secs": AFFINITY_TTL_SECS, "affinity_max_entries": AFFINITY_MAX_ENTRIES,
                  "affinity_floor_hosts": AFFINITY_FLOOR_HOSTS})
@@ -4313,6 +4328,186 @@ def clear_last(host, full=None):
         save_last()
 
 
+
+def _session_expired(entry):
+    return (not entry) or (time.time() - entry.get("atime", 0) > SESSION_TTL)
+
+
+def session_get(sid):
+    if not sid:
+        return None
+    entry = _sessions.get(sid)
+    if _session_expired(entry):
+        _sessions.pop(sid, None)
+        return None
+    return entry
+
+
+def session_touch(sid, host=None, full=None, query=None):
+    """Create/update a session entry. host/full/query are optional overlays."""
+    now = time.time()
+    entry = _sessions.get(sid)
+    if entry is None or _session_expired(entry):
+        entry = {
+            "host": None, "full": None, "query": query or "",
+            "ctime": now, "atime": now, "messages": [], "rebinds": 0,
+        }
+    if host is not None:
+        prev = entry.get("host")
+        if prev and prev != host:
+            entry["rebinds"] = entry.get("rebinds", 0) + 1
+        entry["host"] = host
+    if full is not None:
+        entry["full"] = full
+    if query is not None:
+        entry["query"] = query
+    entry["atime"] = now
+    _sessions[sid] = entry
+    return entry
+
+
+def session_clear_pin(sid):
+    entry = _sessions.get(sid)
+    if not entry:
+        return
+    entry["host"] = None
+    entry["full"] = None
+    entry["atime"] = time.time()
+
+
+def session_set_messages(sid, messages):
+    """Replace the local transcript with `messages` (capped)."""
+    entry = session_get(sid) or session_touch(sid)
+    msgs = list(messages or [])
+    if len(msgs) > SESSION_MSG_CAP:
+        msgs = msgs[-SESSION_MSG_CAP:]
+    entry["messages"] = msgs
+    entry["atime"] = time.time()
+    return entry
+
+
+def session_merge_messages(stored, incoming):
+    """Prefer client-supplied history when it already covers us; else extend."""
+    stored = list(stored or [])
+    incoming = list(incoming or [])
+    if not stored:
+        return incoming
+    if not incoming:
+        return stored
+    if len(incoming) >= len(stored) and incoming[:len(stored)] == stored:
+        return incoming
+    n = 0
+    for a, b in zip(stored, incoming):
+        if a != b:
+            break
+        n += 1
+    if n == 0:
+        return stored + incoming
+    return stored + incoming[n:]
+
+
+def _session_headers(sid, host=None, full=None, rebind=False):
+    h = {"X-Dyva-Session": sid}
+    if host:
+        h["X-Dyva-Session-Host"] = re.sub(r"^https?://", "", host)
+    if full:
+        h["X-Dyva-Session-Model"] = full
+    if rebind:
+        h["X-Dyva-Session-Rebind"] = "1"
+    return h
+
+
+def _apply_session_headers(resp, sid, host=None, full=None, rebind=False):
+    if not sid or resp is None:
+        return
+    for k, v in _session_headers(sid, host, full, rebind).items():
+        resp.headers[k] = v
+    expose = resp.headers.get("Access-Control-Expose-Headers", "")
+    extra = "X-Dyva-Session, X-Dyva-Session-Host, X-Dyva-Session-Model, X-Dyva-Session-Rebind"
+    if expose:
+        parts = [p.strip() for p in (expose + ", " + extra).split(",") if p.strip()]
+        seen, out = set(), []
+        for p in parts:
+            pl = p.lower()
+            if pl not in seen:
+                seen.add(pl)
+                out.append(p)
+        resp.headers["Access-Control-Expose-Headers"] = ", ".join(out)
+    else:
+        resp.headers["Access-Control-Expose-Headers"] = (
+            "X-Dyva-Host, X-Dyva-Model, X-Dyva-Service, " + extra)
+
+
+def _session_commit(sid, sess, host, full, query, messages, resp, rebind=False):
+    """Pin (host, model), store transcript, stamp response headers.
+
+    Shared by the SSE/ndjson stream binds and the non-stream completion path so
+    those three call sites don't restate the same sequence. Returns (rebind, sess).
+    """
+    if not sid:
+        return rebind, sess
+    prev = (sess or {}).get("host")
+    if prev and prev != host:
+        rebind = True
+    session_touch(sid, host=host, full=full, query=query)
+    session_set_messages(sid, list(messages or []))
+    _apply_session_headers(resp, sid, host, full, rebind)
+    return rebind, session_get(sid)
+
+
+
+async def _keepalive_then_stream(racer, request, session, model, servers, opayload, req_caps,
+                                 job_wid, openai_format, cancel, hedge_delay, sid, sess,
+                                 session_rebind, query, skip=None):
+    """Race under keepalive, pin the sticky session on a win, then stream.
+
+    Shared by the SSE and ndjson branches of _proxy_chat so those call sites
+    stay one-liners. Returns (response, None, stopped) after a successful stream,
+    or (ka_resp, error_msg, stopped) when no host answered — the caller writes
+    its dialect-specific in-stream error onto ka_resp.
+    """
+    ka_resp, result, errors, stopped = await racer(
+        request, session, model, servers, opayload, req_caps, job_wid,
+        hedge_delay=hedge_delay)
+    if result:
+        if sid:
+            _session_commit(sid, sess, result[1], result[2], query,
+                            opayload.get("messages"), ka_resp, session_rebind)
+        out = await _stream_chat_failover(
+            request, session, model, servers, opayload,
+            openai_format, req_caps, job_wid, result, cancel, response=ka_resp,
+            skip=skip, sid=sid)
+        return out, None, stopped
+    msg = "worker manually stopped" if stopped else "all servers failed"
+    if errors:
+        msg += ": " + "; ".join(dict.fromkeys(errors))
+    return ka_resp, msg, stopped
+
+
+def session_append_assistant(sid, content, host=None, full=None):
+    """Append one assistant turn to the session transcript (stream completion)."""
+    if not sid or not content:
+        return
+    session_touch(sid, host=host, full=full)
+    entry = session_get(sid)
+    base = list((entry or {}).get("messages") or [])
+    if not (base and base[-1].get("role") == "assistant"
+            and base[-1].get("content") == content):
+        base.append({"role": "assistant", "content": content})
+    session_set_messages(sid, base)
+
+
+def _apply_session_setting_keys(src):
+    """Copy session_* keys from a settings/body dict onto module globals."""
+    global SESSION_STICKY, SESSION_TTL, SESSION_ALLOW_REPIN
+    if isinstance(src.get("session_sticky"), bool):
+        SESSION_STICKY = src["session_sticky"]
+    if isinstance(src.get("session_ttl"), (int, float)) and src["session_ttl"] > 0:
+        SESSION_TTL = int(src["session_ttl"])
+    if isinstance(src.get("session_allow_repin"), bool):
+        SESSION_ALLOW_REPIN = src["session_allow_repin"]
+
+
 def match_model(model_name, pattern):
     # A trailing "$" (borrowed from regex) anchors the END of the name: "qwen3.8:27b$"
     # matches that name exactly and NOT "...:27b-abliterated" or other quant/finetune
@@ -5163,6 +5358,11 @@ def _split_fallback(q):
     return parts or [(q or "").strip()]
 
 
+# Specialty non-chat name tokens (OCR / rerank / ASR / TTS). Same contract as the
+# embed substring filter inside _find_servers_raw: drop unless the query asks.
+_NON_CHAT_TOKENS = ("ocr", "rerank", "whisper", "asr", "stt", "tts", "xtts")
+
+
 def _find_servers_raw(sub, caps=None):
     chain = _split_fallback(sub)
     if len(chain) > 1:
@@ -5222,16 +5422,17 @@ def _find_servers_raw(sub, caps=None):
         ms = [m for m in models if match_model(m, sub)]
         if not ms:
             continue
-        # Embedding models can't chat, so a plain text query ("qwen3") must not
-        # sweep in "qwen3-embedding:0.6b" just because the name contains the
-        # pattern. Routing is symmetric on the "embed" substring: ask for embed
-        # and you get embedders; don't, and they're dropped. Per-MODEL (not
-        # whole-host) — a host may serve qwen3:8b AND qwen3-embedding:0.6b, both
-        # matching "qwen3"; keep the chat one, drop the embedder.
-        if "embed" not in sub:
-            ms = [m for m in ms if "embed" not in m.lower()]
-            if not ms:
-                continue
+        # Specialty non-chat models can't answer a plain text query. Routing is
+        # symmetric on each name token: ask for it and you keep those models;
+        # don't, and they're dropped. Per-MODEL (not whole-host) — a host may
+        # serve qwen3:8b AND qwen3-embedding / an OCR GGUF; keep the chat one.
+        # VL/vision chat models are unaffected (no token hit). "embed" kept first
+        # for the historical contract; OCR/rerank/ASR/TTS follow.
+        for _tok in ("embed",) + _NON_CHAT_TOKENS:
+            if _tok not in sub:
+                ms = [m for m in ms if _tok not in m.lower()]
+        if not ms:
+            continue
         if any(re.search(r"[:-]cloud", m) for m in ms) and not re.search(r"[:-]cloud", sub):
             continue
         host = s.get("server", "")
@@ -8375,7 +8576,7 @@ def _resume_dropped_stream(tool_arg_chars, tool_resume=None):
     return tool_arg_chars <= 0 or bool(tool_resume)
 
 
-async def _race_sse_keepalive(request, session, model, servers, payload, req_caps, job_wid):
+async def _race_sse_keepalive(request, session, model, servers, payload, req_caps, job_wid, hedge_delay=None):
     """Race for a host while keeping a streaming SSE client's connection warm.
 
     dyva adds pre-first-token latency raw ollama doesn't (the race, hedge delay,
@@ -8399,7 +8600,8 @@ async def _race_sse_keepalive(request, session, model, servers, payload, req_cap
         return response, None, [], False
     task = asyncio.ensure_future(_race_servers(
         session, model, servers, payload, do_stream=True,
-        remote=request.remote, caps=req_caps, job_wid=job_wid, hedge_delay=HEDGE_DELAY))
+        remote=request.remote, caps=req_caps, job_wid=job_wid,
+        hedge_delay=HEDGE_DELAY if hedge_delay is None else hedge_delay))
     while True:
         done_set, _pending = await asyncio.wait({task}, timeout=KEEPALIVE_INTERVAL)
         if done_set:
@@ -8419,7 +8621,7 @@ async def _race_sse_keepalive(request, session, model, servers, payload, req_cap
     return response, result, errors, stopped
 
 
-async def _race_ndjson_keepalive(request, session, model, servers, payload, req_caps, job_wid):
+async def _race_ndjson_keepalive(request, session, model, servers, payload, req_caps, job_wid, hedge_delay=None):
     """ndjson (/api/chat) twin of _race_sse_keepalive: keep an ollama-dialect streaming client
     warm during the pre-first-token wait (race + hedge + warming + prefill) so its idle timeout
     doesn't bail before the first token. The keepalive is an EMPTY assistant chunk
@@ -8437,7 +8639,8 @@ async def _race_ndjson_keepalive(request, session, model, servers, payload, req_
         return response, None, [], False
     task = asyncio.ensure_future(_race_servers(
         session, model, servers, payload, do_stream=True,
-        remote=request.remote, caps=req_caps, job_wid=job_wid, hedge_delay=HEDGE_DELAY))
+        remote=request.remote, caps=req_caps, job_wid=job_wid,
+        hedge_delay=HEDGE_DELAY if hedge_delay is None else hedge_delay))
     ka = (json.dumps({"model": model, "created_at": _now_iso(),
                       "message": {"role": "assistant", "content": ""}, "done": False}) + "\n").encode()
     while True:
@@ -8461,7 +8664,7 @@ async def _race_ndjson_keepalive(request, session, model, servers, payload, req_
 
 async def _stream_chat_failover(request, session, model, servers, opayload,
                                 openai_format, req_caps, job_wid, result, cancel=None,
-                                response=None, skip=None):
+                                response=None, skip=None, sid=None):
     """Stream a chat answer, and if an upstream drops mid-stream WITHOUT a terminal
     done token, seamlessly fail over to the next server — the SAME client connection
     stays open — carrying the work so far as context (with the window bumped to fit),
@@ -8676,6 +8879,9 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
     if (len(partial[0]) + partial[1]) > 0:
         with contextlib.suppress(Exception):
             _banker.served(model, host)
+    # Sticky-session transcript: capture streamed assistant text for re-pin replay.
+    with contextlib.suppress(Exception):
+        session_append_assistant(sid, partial[0], host=host, full=full)
     return response
 
 
@@ -9356,6 +9562,44 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
             return web.json_response(err_obj(f"no available servers for '{model_in}'", "model_not_found"), status=404)
         return _info_response(model_list[0], info, do_stream=do_stream, openai_format=openai_format)
 
+    # --- Opt-in sticky session (X-Dyva-Session / body dyva_session) ---
+    # No sid => identical to historical routing. Header presence alone activates
+    # pinning even when SESSION_STICKY (auto-mint) is False.
+    sid = request.headers.get("X-Dyva-Session")
+    if not sid and isinstance(opayload, dict):
+        _body_sid = opayload.pop("dyva_session", None)
+        if isinstance(_body_sid, str) and _body_sid.strip():
+            sid = _body_sid.strip()
+    if isinstance(sid, str):
+        sid = sid.strip() or None
+    if not sid and SESSION_STICKY:
+        sid = uuid.uuid4().hex
+    sess = session_get(sid) if sid else None
+    session_rebind = False
+
+    # Force re-pin hook: clear pin and sink the previous host to the back of the
+    # pool (a temporary -1 rerank, same as 👎) so the race tries other hosts first
+    # (failover tests / ops). Gated —
+    # SESSION_ALLOW_REPIN or env DYVA_SESSION_ALLOW_REPIN must be on, otherwise
+    # the header is ignored (avoids a wide-open ops footgun).
+    _want_repin = request.headers.get("X-Dyva-Session-Repin", "").strip().lower() in ("1", "true", "yes")
+    if sid and _want_repin:
+        _env_repin = os.environ.get("DYVA_SESSION_ALLOW_REPIN", "").strip().lower() in ("1", "true", "yes")
+        if SESSION_ALLOW_REPIN or _env_repin:
+            if sess and sess.get("host"):
+                add_rerank(sess["host"], -1, RERANK_DOWN_SECS)
+                log.info("session %s: force-repin, sinking host %s", sid, sess.get("host"))
+            session_clear_pin(sid)
+            sess = session_get(sid)
+            session_rebind = True
+        else:
+            log.warning("session %s: X-Dyva-Session-Repin ignored (enable --session-allow-repin "
+                        "or DYVA_SESSION_ALLOW_REPIN=1)", sid)
+
+    if sess and isinstance(opayload.get("messages"), list):
+        opayload = dict(opayload, messages=session_merge_messages(
+            sess.get("messages"), opayload["messages"]))
+
     # Host-affinity context for THIS request: key off the stable prefix (first N user messages)
     # and the prompt size. find_servers (just below) reads it to keep a large thread on its warm
     # host; record_verdict reads it on a win to remember that host. Rides a contextvar so no race
@@ -9368,6 +9612,23 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
     _affinity_ctx.set((_affinity_key(_amsgs),
                        len(json.dumps(_amsgs, ensure_ascii=False)) // 4 if _amsgs else 0))
     _servers = find_servers(model_in, req_caps)
+    pin_hedge = HEDGE_DELAY
+    if sess and sess.get("host"):
+        match = next((s for s in _servers if s[1] == sess["host"]), None)
+        if match:
+            _prio, _host, ms = match
+            full_pin = sess.get("full")
+            if full_pin and full_pin in ms:
+                ms = [full_pin] + [m for m in ms if m != full_pin]
+            _servers = [(TIER_PREFER, _host, ms)] + [s for s in _servers if s[1] != _host]
+            pin_hedge = CONTINUATION_HEDGE
+            log.debug("session %s: pinned to %s / %s", sid, _host, full_pin)
+        else:
+            session_clear_pin(sid)
+            sess = session_get(sid)
+            session_rebind = True
+            log.info("session %s: pin missed pool — will rebind", sid)
+
     total = len(_servers)
     cancel = asyncio.Event()   # manual-stop signal; armed onto the worker for the stream
     skip = asyncio.Event()     # manual-skip signal; re-armed onto the worker per streaming leg
@@ -9394,15 +9655,12 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                 # short idle timeout doesn't bail while dyva is still finding a host. This
                 # prepares the response early, so a no-host outcome is written in-stream
                 # (the 200 is already committed) rather than returned as a 502.
-                ka_resp, result, errors, stopped = await _race_sse_keepalive(
-                    request, session, model, _servers, opayload, req_caps, job_wid)
-                if result:
-                    return await _stream_chat_failover(
-                        request, session, model, _servers, opayload,
-                        openai_format, req_caps, job_wid, result, cancel, response=ka_resp, skip=skip)
-                msg = "worker manually stopped" if stopped else "all servers failed"
-                if errors:
-                    msg += ": " + "; ".join(dict.fromkeys(errors))
+                ka_resp, msg, stopped = await _keepalive_then_stream(
+                    _race_sse_keepalive, request, session, model, _servers, opayload, req_caps,
+                    job_wid, openai_format, cancel, pin_hedge, sid, sess,
+                    session_rebind, model_list[0], skip=skip)
+                if msg is None:
+                    return ka_resp
                 with contextlib.suppress(Exception):
                     # OpenAI-shaped error object ({"error":{"message":...}}) — a raw
                     # {"error":"string"} fails strict clients' schema (opencode rejects it
@@ -9418,15 +9676,12 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                 # than returned as a 502. Like SSE, a no-host on a non-last fallback model is
                 # reported here instead of falling through to the next model; single-model
                 # queries (the common case) are unaffected. Opens no upstream connection.
-                ka_resp, result, errors, stopped = await _race_ndjson_keepalive(
-                    request, session, model, _servers, opayload, req_caps, job_wid)
-                if result:
-                    return await _stream_chat_failover(
-                        request, session, model, _servers, opayload,
-                        openai_format, req_caps, job_wid, result, cancel, response=ka_resp, skip=skip)
-                msg = "worker manually stopped" if stopped else "all servers failed"
-                if errors:
-                    msg += ": " + "; ".join(dict.fromkeys(errors))
+                ka_resp, msg, stopped = await _keepalive_then_stream(
+                    _race_ndjson_keepalive, request, session, model, _servers, opayload, req_caps,
+                    job_wid, openai_format, cancel, pin_hedge, sid, sess,
+                    session_rebind, model_list[0], skip=skip)
+                if msg is None:
+                    return ka_resp
                 with contextlib.suppress(Exception):
                     await ka_resp.write((json.dumps({"model": model, "created_at": _now_iso(),
                         "error": msg}) + "\n").encode())
@@ -9447,7 +9702,7 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                     if nctx_pin:
                         send_payload["options"] = dict(send_payload.get("options") or {},
                                                        num_ctx=nctx_pin)
-                    result, errors, stopped = await _race_servers(session, model, _servers, send_payload, do_stream=True, remote=request.remote, caps=req_caps, job_wid=job_wid, hedge_delay=HEDGE_DELAY)
+                    result, errors, stopped = await _race_servers(session, model, _servers, send_payload, do_stream=True, remote=request.remote, caps=req_caps, job_wid=job_wid, hedge_delay=pin_hedge)
                     if not result:
                         break
                     _, host, full, resp, first_line, first, _oai = result
@@ -9473,6 +9728,9 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                             f"stream stalled: {host}@{model} — no tokens for {TIMEOUT}s",
                             wid=job_wid)
                         _servers = [s for s in _servers if s[1] != host]
+                        if sid:
+                            session_clear_pin(sid)
+                            session_rebind = True
                         _set_worker_phase(job_wid, None)
                         if _servers:
                             continue                    # re-race the remaining pool
@@ -9493,6 +9751,17 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                     out.headers["X-Dyva-Model"] = full
                     out.headers["X-Dyva-Service"] = service_of(host)
                     out.headers["Access-Control-Expose-Headers"] = "X-Dyva-Host, X-Dyva-Model, X-Dyva-Service"
+                    if sid:
+                        asst = data.get("message")
+                        if not isinstance(asst, dict):
+                            asst = {"role": "assistant", "content": data.get("response") or ""}
+                        else:
+                            asst = {"role": asst.get("role") or "assistant",
+                                    "content": asst.get("content") or ""}
+                        session_rebind, sess = _session_commit(
+                            sid, sess, host, full, model_list[0],
+                            list(send_payload.get("messages") or []) + [asst],
+                            out, session_rebind)
                     return out
 
         msg = "worker manually stopped" if stopped else "all servers failed"
@@ -10831,6 +11100,8 @@ async def handle_settings_get(request):
                               "admin_pw_set": bool(ADMIN_PW),
                               "model_list": MODEL_LIST, "model_list_on": MODEL_LIST_ON,
                               "gossiper_url": GOSSIPER_URL, "gossiper_enabled": GOSSIPER_ENABLED,
+                              "session_sticky": SESSION_STICKY, "session_ttl": SESSION_TTL,
+                              "session_allow_repin": SESSION_ALLOW_REPIN,
                               "affinity_prefix_msgs": AFFINITY_PREFIX_MSGS, "affinity_min_tokens": AFFINITY_MIN_TOKENS,
                               "affinity_ttl_secs": AFFINITY_TTL_SECS, "affinity_max_entries": AFFINITY_MAX_ENTRIES,
                               "affinity_floor_hosts": AFFINITY_FLOOR_HOSTS,
@@ -10915,6 +11186,7 @@ async def handle_settings_post(request):
         GOSSIPER_URL = body["gossiper_url"].strip()
     if isinstance(body.get("gossiper_enabled"), bool):
         GOSSIPER_ENABLED = body["gossiper_enabled"]
+    _apply_session_setting_keys(body)
     # Host-matching knobs — read live, so these take effect for the next request without a
     # restart. See brainstorm/host-affinity.md and brainstorm/reranker.md.
     if isinstance(body.get("affinity_prefix_msgs"), int) and body["affinity_prefix_msgs"] >= 1:
@@ -20041,6 +20313,10 @@ def main():
                              "that mark, and '--hosts bad __tts__ del' to clear them")
     parser.add_argument("--curlify", action="store_true", help="print curl commands of upstream requests to stderr")
     parser.add_argument("--log", action="store_true", help="persist the activity feed to a date-stamped JSONL on disk (~/.cache/free-ollama/activity-YYYY-MM-DD.jsonl); off by default")
+    parser.add_argument("--session-sticky", action="store_true",
+                        help="auto-mint X-Dyva-Session when the client omits one")
+    parser.add_argument("--session-allow-repin", action="store_true",
+                        help="honor X-Dyva-Session-Repin (force re-pin + skip prior host); off by default")
     parser.add_argument("-v", "--version",  action="store_true", help="show version information")
     parser.add_argument("--virgin", action="store_true", help=argparse.SUPPRESS)  # say it out loud
     args = parser.parse_args()
@@ -20076,6 +20352,7 @@ def main():
     if args.version:
         sys.exit(0)
 
+    global SESSION_STICKY, SESSION_ALLOW_REPIN
     WORKER_COUNT = args.workers
     TIMEOUT = args.timeout
     PORT = args.port
@@ -20097,6 +20374,12 @@ def main():
         log.info("Logging ON -> " + os.path.join(_logdir, "activity-<UTC-date>.jsonl")
                  + " (feed) + " + os.path.join(_logdir, "dyva-<UTC-date>.log") + " (requests/errors)")
     load_settings()   # persisted dashboard settings override the CLI defaults
+    if getattr(args, "session_sticky", False):
+        SESSION_STICKY = True
+    if getattr(args, "session_allow_repin", False):
+        SESSION_ALLOW_REPIN = True
+    if os.environ.get("DYVA_SESSION_ALLOW_REPIN", "").strip().lower() in ("1", "true", "yes"):
+        SESSION_ALLOW_REPIN = True
     if args.local:       # an explicit -l flag always wins over saved settings
         _LOCAL = True
     if args.base is not None:   # --base always wins over the saved base_path
