@@ -4,6 +4,7 @@ import asyncio
 import base64
 import collections
 import contextlib
+import contextvars
 import datetime
 import fnmatch
 import csv
@@ -26,6 +27,7 @@ import urllib.parse
 import uuid
 import requests
 import sqlite3
+import zlib
 import importlib.metadata
 
 import aiohttp
@@ -361,6 +363,15 @@ WARMING_RETRY = 5
 RERANK_BUSY_SECS = 1800       # a 503-busy host sinks to the back for ~30 min, recovers on its own
 RERANK_UP_SECS = 43200        # 👍 floats a host to the front for ~12 h
 RERANK_DOWN_SECS = 43200      # 👎 sinks a host to the back for ~12 h
+# Host-affinity cache (keep a LARGE context resident on the host that already has its KV warm
+# — a cold host-hop re-prefills the whole prompt, which is swap-thrashing at 100k tokens). A
+# soft, expiring, IN-MEMORY reorder on top of the tiers; see brainstorm/host-affinity.md. All
+# overridable in settings.json.
+AFFINITY_PREFIX_MSGS = 4      # key = crc32 of the first N USER messages (the stable warm prefix)
+AFFINITY_MIN_TOKENS = 8000    # engage gate: only pin prompts this big (a small cold hop is cheap)
+AFFINITY_TTL_SECS = 300       # sliding KV-warmth window per entry; refreshed on every hit
+AFFINITY_MAX_ENTRIES = 40     # L1 cache cap (LRU-evicted)
+AFFINITY_FLOOR_HOSTS = 5      # good hosts affinity may NEVER reserve away (cold-start landing pads)
 # A race that's still SEARCHING (no host found) past this many seconds logs its internal
 # state every RACE_WATCHDOG seconds — tried/started/permit/n, the fan-out task's liveness
 # and any exception — so a wedged search (e.g. a continuation pinned to a dead warm host,
@@ -683,7 +694,7 @@ def model_modalities(model):
 def load_settings():
     """Apply persisted runtime settings (workers/timeout/min_count/local) over
     the CLI defaults, so changes made in the dashboard survive restarts."""
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION, RERANK_BUSY_SECS, RERANK_UP_SECS, RERANK_DOWN_SECS
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION, RERANK_BUSY_SECS, RERANK_UP_SECS, RERANK_DOWN_SECS, AFFINITY_PREFIX_MSGS, AFFINITY_MIN_TOKENS, AFFINITY_TTL_SECS, AFFINITY_MAX_ENTRIES, AFFINITY_FLOOR_HOSTS
     if not os.path.exists(SETTINGS_FILE):
         return
     try:
@@ -746,6 +757,16 @@ def load_settings():
         RERANK_UP_SECS = s["rerank_up_secs"]
     if isinstance(s.get("rerank_down_secs"), (int, float)) and s["rerank_down_secs"] >= 0:
         RERANK_DOWN_SECS = s["rerank_down_secs"]
+    if isinstance(s.get("affinity_prefix_msgs"), int) and s["affinity_prefix_msgs"] >= 1:
+        AFFINITY_PREFIX_MSGS = s["affinity_prefix_msgs"]
+    if isinstance(s.get("affinity_min_tokens"), (int, float)) and s["affinity_min_tokens"] >= 0:
+        AFFINITY_MIN_TOKENS = s["affinity_min_tokens"]
+    if isinstance(s.get("affinity_ttl_secs"), (int, float)) and s["affinity_ttl_secs"] >= 0:
+        AFFINITY_TTL_SECS = s["affinity_ttl_secs"]
+    if isinstance(s.get("affinity_max_entries"), int) and s["affinity_max_entries"] >= 1:
+        AFFINITY_MAX_ENTRIES = s["affinity_max_entries"]
+    if isinstance(s.get("affinity_floor_hosts"), int) and s["affinity_floor_hosts"] >= 0:
+        AFFINITY_FLOOR_HOSTS = s["affinity_floor_hosts"]
 
 
 def save_settings(extra=None):
@@ -766,7 +787,10 @@ def save_settings(extra=None):
                  "admin_pw": ADMIN_PW, "model_list": MODEL_LIST, "model_list_on": MODEL_LIST_ON,
                  "cloudskip": sorted(CLOUD_SKIP), "base_path": BASE_PATH,
                  "gossiper_url": GOSSIPER_URL, "gossiper_enabled": GOSSIPER_ENABLED,
-                 "rerank_busy_secs": RERANK_BUSY_SECS, "rerank_up_secs": RERANK_UP_SECS, "rerank_down_secs": RERANK_DOWN_SECS})
+                 "rerank_busy_secs": RERANK_BUSY_SECS, "rerank_up_secs": RERANK_UP_SECS, "rerank_down_secs": RERANK_DOWN_SECS,
+                 "affinity_prefix_msgs": AFFINITY_PREFIX_MSGS, "affinity_min_tokens": AFFINITY_MIN_TOKENS,
+                 "affinity_ttl_secs": AFFINITY_TTL_SECS, "affinity_max_entries": AFFINITY_MAX_ENTRIES,
+                 "affinity_floor_hosts": AFFINITY_FLOOR_HOSTS})
     if isinstance(extra, dict):
         data.update(extra)
     try:
@@ -3957,6 +3981,121 @@ def rerank_scores():
 # 👎 is now a -1 (sink to the back, still a last resort — no longer a hard-drop), 👍 a +1
 # (float to the front). Both fold into routing via _rerank_prio(). See brainstorm/reranker.md.
 
+# Host-affinity cache: keep a LARGE context on the one host that already has its KV warm, so a
+# long thread stops thrashing (every host-hop re-prefills the whole prompt from cold). A soft,
+# expiring reorder ON TOP of the tiers — NEVER a reputation write, NEVER a hard pin (a down/busy
+# host still falls through). IN-MEMORY on purpose: host KV is ephemeral (dies on restart / host
+# re-probe), so a persisted pairing would just hand out stale affinity on boot. Keyed by a crc
+# of the first N USER messages — the stable, human-authored prefix that survives a thread's
+# rounds. The request's (crc, prompt-size) rides a contextvar: find_servers reads it to reorder,
+# record_verdict reads it on a win to record the warm host. See brainstorm/host-affinity.md.
+_affinity = {}                                      # crc:int -> (host_norm, expire_at); insertion order = LRU
+# (crc, size) for THIS request, or None. Annotated so the type-checker knows .get() is optional.
+_affinity_ctx: "contextvars.ContextVar[tuple[int | None, int] | None]" = \
+    contextvars.ContextVar("affinity_ctx", default=None)
+
+
+def _affinity_key(messages, n=None):
+    """crc32 of the first N user-message contents — the stable prefix a thread keeps warm.
+    None when there are no user messages (nothing to key on)."""
+    n = AFFINITY_PREFIX_MSGS if n is None else n
+    parts = []
+    for m in (messages or []):
+        if (m or {}).get("role") != "user":
+            continue
+        c = m.get("content")
+        parts.append(c if isinstance(c, str) else json.dumps(c, sort_keys=True, ensure_ascii=False))
+        if len(parts) >= n:
+            break
+    if not parts:
+        return None
+    return zlib.crc32("\x00".join(parts).encode("utf-8", "replace")) & 0xffffffff
+
+
+def _affinity_size_ok(size):
+    """Engage gate: only big prompts are worth pinning (a small cold hop costs nothing)."""
+    return size is not None and size >= AFFINITY_MIN_TOKENS
+
+
+def affinity_touch(crc, host, size):
+    """Record/refresh `crc -> host` (the host now holding this prefix warm), sliding TTL.
+    CREATION is size-gated — small prompts never make entries. LRU-bounded. Best-effort: a
+    cache hiccup must never break the request path."""
+    try:
+        if crc is None or not _affinity_size_ok(size):
+            return
+        h = _norm_host(host)
+        if not h:
+            return
+        _affinity.pop(crc, None)                    # re-insert so this crc is most-recent (LRU)
+        _affinity[crc] = (h, time.time() + AFFINITY_TTL_SECS)
+        while len(_affinity) > AFFINITY_MAX_ENTRIES:
+            _affinity.pop(next(iter(_affinity)))     # drop the oldest / least-recently-touched
+    except Exception as e:
+        log.debug(f"affinity_touch failed: {e}")
+
+
+def affinity_view(crc, now=None):
+    """(match_host, {foreign_host: freshest_expire_at}) over ACTIVE entries only. `match_host`
+    is this crc's warm host ('' if none); the rest are hosts holding OTHER threads' warm
+    prefixes (to be protected). A host serving several crcs keeps its freshest TTL; the match
+    host is never listed as foreign-reserved against its own request."""
+    now = time.time() if now is None else now
+    match = ""
+    reserved = {}
+    try:
+        for k, (h, exp) in list(_affinity.items()):
+            if exp <= now:
+                continue
+            if k == crc:
+                match = h
+            elif exp > reserved.get(h, 0):
+                reserved[h] = exp
+    except Exception:
+        return "", {}
+    reserved.pop(match, None)
+    return match, reserved
+
+
+def _affinity_plan(match, reserved, cand_hosts, floor):
+    """Pure. Decide the reorder for one request over its candidate hosts (all _norm_host'd, in
+    tier order). `match` = this crc's warm host (or ''), `reserved` = {foreign_host: expire_at}.
+    Returns (match_in_cands_or_'', demote_set). Demote the FRESHEST-TTL foreign reservations
+    (most recently warmed = most worth protecting from this request) but never so many that
+    fewer than `floor` candidates stay non-demoted — a fresh big context needs landing pads."""
+    cand = list(cand_hosts)
+    m = match if match and match in cand else ""
+    res_cand = sorted((h for h in cand if h != m and h in reserved),
+                      key=lambda h: reserved[h], reverse=True)
+    max_demote = max(0, len(cand) - floor)
+    return m, set(res_cand[:max_demote])
+
+
+def _affinity_candidates(cand_hosts):
+    """Thin wrapper: read this request's affinity context + the live store and run the planner.
+    HONORING is universal (any chat request reorders around reservations — deflecting a small
+    request off a warm host is nearly-free insurance); only CREATION (affinity_touch) is
+    size-gated. No context (e.g. non-chat callers) -> no-op."""
+    aff = _affinity_ctx.get()
+    if aff is None:
+        return "", set()
+    crc, _size = aff
+    if crc is None:
+        return "", set()
+    match, reserved = affinity_view(crc)
+    if not match and not reserved:
+        return "", set()
+    return _affinity_plan(match, reserved, cand_hosts, AFFINITY_FLOOR_HOSTS)
+
+
+def _affinity_touch_ctx(host):
+    """On a win, record the serving host under this request's affinity key (size-gated inside)."""
+    aff = _affinity_ctx.get()
+    if aff is not None:
+        crc, size = aff
+        affinity_touch(crc, host, size)
+
+
 # (norm-host, resolved-model) pairs that answered with ONLY reasoning — the whole reply
 # went into the `thinking` channel and `content` came back empty (an ollama/custom-GGUF
 # template bug: the model reasons but never emits the answer). think:false fixes it. We
@@ -5198,12 +5337,27 @@ def _find_servers_raw(sub, caps=None):
             # Within the normal UNKNOWN tier, most-recently-checked first; other tiers
             # keep their order via a constant secondary key (stable sort).
             crank = _checked_rank(s) if prio == TIER_UNKNOWN else 0
-        # Reranker: a temporary, expiring reorder on top of the earned tier (a human 👍/👎 or
-        # a transient busy signal). Applied LAST so it is the final word — net>0 floats the
-        # host above every tier, net<0 sinks it below every tier; it expires on its own and
-        # never touches reputation. See rerank_scores() / _rerank_prio().
-        prio = _rerank_prio(prio, rr.get(_norm_host(host), 0))
         matched.append((cap_known, prio, crank, host, ms))
+    # Two temporary, expiring reorders ON TOP of the earned tier, folded here (the final word
+    # before the sort), in this order:
+    #   1. HOST-AFFINITY — keep a large context on the host that already has its KV warm: this
+    #      thread's warm host floats to the front, hosts holding OTHER threads' warm prefixes
+    #      sink to the back (protected), bounded by the floor. Needs the whole candidate set
+    #      (the floor), so it's a post-pass, not a per-host fold. See brainstorm/host-affinity.md.
+    #   2. RERANKER — a human 👍/👎 or a transient busy signal. Applied LAST so a vote or live
+    #      busyness OVERRIDES the cache guess. net>0 floats above every tier, net<0 sinks below.
+    # Both expire on their own and NEVER touch reputation. See rerank_scores() / _rerank_prio().
+    aff_match, aff_demote = _affinity_candidates([_norm_host(h) for _ck, _p, _c, h, _m in matched])
+    folded = []
+    for cap_known, prio, crank, host, ms in matched:
+        nh = _norm_host(host)
+        if nh == aff_match:
+            prio = _rerank_prio(prio, 1)      # warm for this thread -> float to the front
+        elif nh in aff_demote:
+            prio = _rerank_prio(prio, -1)     # holding a foreign warm prefix -> sink to the back
+        prio = _rerank_prio(prio, rr.get(nh, 0))   # reranker last = overrides affinity
+        folded.append((cap_known, prio, crank, host, ms))
+    matched = folded
     # REPUTATION FIRST, capability a within-tier hint. Sorting by cap_known BEFORE tier let an
     # imperfect capability FLAG (a survey/classifier guess, unreliable for the many engines that
     # don't self-report caps — and faked wholesale by honeypots) override PROVEN reputation: a
@@ -5558,6 +5712,7 @@ def record_verdict(host, key, outcome, sticky_key=None):
     if v == V_ACCEPTED:
         add_good(host, key)
         set_last(sticky_key, host, outcome.extra or "")
+        _affinity_touch_ctx(host)   # this host served the thread -> remember it as the warm one
     elif v == V_UNREACHABLE:
         # host-wide, so it isn't re-probed as "unknown" for every other key...
         mark_unreachable(host)
@@ -9201,6 +9356,17 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
             return web.json_response(err_obj(f"no available servers for '{model_in}'", "model_not_found"), status=404)
         return _info_response(model_list[0], info, do_stream=do_stream, openai_format=openai_format)
 
+    # Host-affinity context for THIS request: key off the stable prefix (first N user messages)
+    # and the prompt size. find_servers (just below) reads it to keep a large thread on its warm
+    # host; record_verdict reads it on a win to remember that host. Rides a contextvar so no race
+    # primitive signature changes, and it's request-scoped (child race tasks inherit the copy).
+    # Non-chat callers never set it -> affinity is a no-op for them. See brainstorm/host-affinity.md.
+    _amsgs = opayload.get("messages") or []
+    # Size for the engage gate only needs to be ROUGH (is this prompt big enough to be worth
+    # pinning?), so a cheap chars/4 estimate — never a full tiktoken encode, which would block
+    # the event loop on exactly the 100k-token prompts this feature targets.
+    _affinity_ctx.set((_affinity_key(_amsgs),
+                       len(json.dumps(_amsgs, ensure_ascii=False)) // 4 if _amsgs else 0))
     _servers = find_servers(model_in, req_caps)
     total = len(_servers)
     cancel = asyncio.Event()   # manual-stop signal; armed onto the worker for the stream
