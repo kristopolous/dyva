@@ -303,6 +303,7 @@ body.chat{height:100vh;height:100dvh}
 .status-connected{color:var(--ok)}
 .status-failed{color:var(--err)}
 .status-warming{color:var(--warn)}
+.status-affinity{color:#8b5cf6}
 .status-abandoned{color:var(--text-faint)}
 .content-line{padding:2px 0;color:var(--text-2)}
 .done-line{color:var(--text-faint);font-style:italic}
@@ -8206,34 +8207,52 @@ chatFilesInput.addEventListener('change',function(){
   addChatFiles(chatFilesInput.files);
   chatFilesInput.value='';
 });
-// Drag-and-drop onto the composer box. dragover MUST preventDefault or the browser
-// just opens the dropped file instead. A depth counter keeps the highlight steady
-// as the pointer crosses child elements (each child fires its own enter/leave), and
-// we only react to an actual file drag (types includes 'Files'), not dragged text.
+// Fetch an image URL (an in-app asset, or a link dragged from another tab) and attach it,
+// the same shape the edit panel's drop zone uses. Non-images are ignored. Best-effort.
+async function _attachChatFromUrl(url,name){
+  try{
+    var r=await fetch(url);if(!r.ok)return;
+    var b=await r.blob();
+    if(b.type.indexOf('image/')!==0&&!/\.(png|jpe?g|webp|gif|avif)$/i.test(name||''))return;
+    addChatFiles([new File([b],name||'image.png',{type:b.type||'image/png'})]);
+  }catch(e){/* a drag that can't be fetched just doesn't attach */}
+}
+// Drag-and-drop onto the composer box. dragover MUST preventDefault or the browser just opens
+// the dropped item instead. Accepts the three ways an IMAGE arrives (mirrors #editDrop): an OS
+// file, an in-app image drag (application/x-dyva-image = a generated/gallery image), or a URL
+// (text/uri-list, e.g. dragged from another tab). Plain-text drags are left alone so text can
+// still be dropped into the textarea. A depth counter keeps the highlight steady as the pointer
+// crosses child elements (each fires its own enter/leave).
 (function(){
   var composer=document.querySelector('.composer');
   if(!composer)return;
   var depth=0;
-  function hasFiles(e){
-    var t=e.dataTransfer&&e.dataTransfer.types;
-    return !!t&&Array.prototype.indexOf.call(t,'Files')>=0;
+  function dragHasImage(e){
+    var t=e.dataTransfer&&e.dataTransfer.types;if(!t)return false;
+    function has(x){return Array.prototype.indexOf.call(t,x)>=0;}
+    return has('Files')||has('application/x-dyva-image')||has('text/uri-list');
   }
   composer.addEventListener('dragenter',function(e){
-    if(!hasFiles(e))return;
+    if(!dragHasImage(e))return;
     e.preventDefault();depth++;composer.classList.add('drop-active');
   });
   composer.addEventListener('dragover',function(e){
-    if(!hasFiles(e))return;
+    if(!dragHasImage(e))return;
     e.preventDefault();try{e.dataTransfer.dropEffect='copy';}catch(_){}
   });
   composer.addEventListener('dragleave',function(e){
-    if(!hasFiles(e))return;
+    if(!dragHasImage(e))return;
     depth--;if(depth<=0){depth=0;composer.classList.remove('drop-active');}
   });
   composer.addEventListener('drop',function(e){
-    if(!hasFiles(e))return;
+    if(!dragHasImage(e))return;
     e.preventDefault();depth=0;composer.classList.remove('drop-active');
-    if(e.dataTransfer.files&&e.dataTransfer.files.length)addChatFiles(e.dataTransfer.files);
+    var dt=e.dataTransfer;
+    if(dt.files&&dt.files.length){addChatFiles(dt.files);return;}
+    var internal=dt.getData('application/x-dyva-image');
+    if(internal){_attachChatFromUrl('sdapi/v1/images/'+encodeURIComponent(internal),internal);return;}
+    var uri=(dt.getData('text/uri-list')||dt.getData('text/plain')||'').split(/[\r\n]/)[0].trim();
+    if(uri)_attachChatFromUrl(uri,decodeURIComponent(uri.split('/').pop().split('?')[0])||'image.png');
   });
 })();
 // Sending an image as *vision* needs a model that can see, which rules out

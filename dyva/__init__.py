@@ -4096,6 +4096,37 @@ def _affinity_touch_ctx(host):
         affinity_touch(crc, host, size)
 
 
+def _affinity_match_host():
+    """The warm host this request's affinity key currently points at ('' if none) — read for
+    the activity feed, BEFORE the win's affinity_touch overwrites it, so it's the host we
+    actually handed out at routing time."""
+    aff = _affinity_ctx.get()
+    if aff is None or aff[0] is None:
+        return ""
+    return affinity_view(aff[0])[0]
+
+
+async def _affinity_handout(servers, model, wid):
+    """Routing-time feed line: if this request matched the affinity cache, note that we're
+    leading with the warm host. Resolved in place later by _affinity_resolve (same aid)."""
+    am = _affinity_match_host()
+    if am and any(_norm_host(h) == am for _p, h, _m in servers):
+        await broadcast_activity(am, model, "affinity",
+                                 "affinity: leading with the warm host",
+                                 wid=wid, aid="aff:" + str(wid))
+
+
+async def _affinity_resolve(host, model, wid):
+    """Win-time feed line: resolve the handout to whether the warm host actually served
+    (stuck) or the request fell through to a different host. No-op if this wasn't a handout."""
+    am = _affinity_match_host()
+    if am:
+        await broadcast_activity(am, model, "affinity",
+                                 "affinity: stuck - warm host served" if _norm_host(host) == am
+                                 else "affinity: warm host fell through, served elsewhere",
+                                 wid=wid, aid="aff:" + str(wid))
+
+
 # (norm-host, resolved-model) pairs that answered with ONLY reasoning — the whole reply
 # went into the `thinking` channel and `content` came back empty (an ollama/custom-GGUF
 # template bug: the model reasons but never emits the answer). think:false fixes it. We
@@ -7612,6 +7643,7 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
             log.debug(f"  \u2713 {tag}")
             await broadcast_activity(host, model, "connected",
                 f"success: {host}@{model}", duration=dur, wid=wid, rmodel=full)
+            await _affinity_resolve(host, model, wid)
             return accepted(("ok", host, full, data), extra=full)
 
         try:
@@ -7683,6 +7715,7 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
         log.debug(f"  \u2713 {tag}")
         await broadcast_activity(host, model, "connected",
             f"success: {host}@{model}", duration=dur, wid=wid, rmodel=full)
+        await _affinity_resolve(host, model, wid)
         return accepted(("ok_stream", host, full, resp, first_line, first, oai), extra=full)
 
     # Queueing theory: with several requests in flight for the SAME model, each
@@ -9377,6 +9410,7 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
     # host answers — stash it so the active card can show it during the search/fan-out
     # phase (the MEASURED num_ctx replaces it once a host reports tokens).
     _stash_want_ctx(job_wid, opayload)
+    await _affinity_handout(_servers, model_list[0], job_wid)
     try:
         # The sticky (last-good) host is already sorted first in _servers, so
         # the hedged race tries it alone for HEDGE_DELAY seconds and only fans
