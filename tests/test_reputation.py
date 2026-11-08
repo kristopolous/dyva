@@ -83,6 +83,31 @@ def test_image_http_401_from_good_goes_straight_to_bad(monkeypatch):
     assert _state(conn) == "bad"
 
 
+def test_comfy_model_type_undetectable_is_structural():
+    # ComfyUI's UNETLoader/CheckpointLoader reports "Could not detect model type of: <file>"
+    # when this host's ComfyUI can't load that diffusion file at all — the arch is newer than
+    # its build, or the file is a foreign quant (e.g. a SwarmUI int8_convrot). Permanent for
+    # THIS (host, model) pair, so it must be STRUCTURAL and hard-excluded, not re-raced forever.
+    assert dyva._STRUCTURAL_FAIL_RE.search(
+        "UNETLoader#1: ERROR: Could not detect model type of: "
+        "/mnt/designai/iat-23091/SwarmUI/Models/diffusion_models/flux3_image_klein_bf16.safetensors")
+    assert dyva._STRUCTURAL_FAIL_RE.search(
+        "UNETLoader#1: ERROR: Could not detect model type of: "
+        "/mnt/designai/iat-23091/SwarmUI/Models/diffusion_models/flux3_image_klein_int8_convrot.safetensors")
+    # An out-of-memory load is TRANSIENT (smaller prompt / less-busy host may fit) — must NOT
+    # be swept in as structural by this signature.
+    assert not dyva._STRUCTURAL_FAIL_RE.search("UNETLoader#1: ERROR: Device out of memory")
+
+
+def test_comfy_model_type_undetectable_from_good_goes_straight_to_bad(monkeypatch):
+    conn = _db("good")
+    monkeypatch.setattr(dyva, "_status_db", conn, raising=False)
+    dyva.add_bad(H, M, reason=(
+        "UNETLoader#1: ERROR: Could not detect model type of: "
+        "/mnt/designai/iat-23091/SwarmUI/Models/diffusion_models/flux3_image_klein_bf16.safetensors"))
+    assert _state(conn) == "bad"
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))

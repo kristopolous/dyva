@@ -126,6 +126,60 @@ def bogus_score_from_payload(payload):
     return bogus_score_from_models(models or [])
 
 
+# Closed-weight proprietary model FAMILIES whose weights are NOT publicly downloadable — a
+# SELF-HOSTED inference endpoint (ollama/llama.cpp/vllm/localai/...) cannot actually run them.
+# Advertising them is a tell: a costume/honeypot that parrots frontier names (157.245.193.55
+# answered "I'm claude-opus-5.5, hosted with LocalAI" to a verbatim-echo probe), OR a real host
+# someone polluted with fake entries — "probably junk" either way, so dyva low-ranks it. Matched
+# on the bare family AFTER stripping a vendor prefix ("anthropic/claude", "cc/claude", "ag/...").
+# The OPEN lookalikes are excluded BY CONSTRUCTION, never flagged: `gpt-?[0-9]` needs a digit so
+# gpt-oss (Apache-2.0) misses; `gemini` never matches gemma (open); llama/qwen/mistral/deepseek/
+# phi/kimi/command-r are open weights a real host legitimately serves.
+_CLOSED_FAMILY_RE = re.compile(
+    r"""^(?:
+          claude          # Anthropic Claude — never released
+        | gpt-?[0-9]      # OpenAI GPT-3/4/4o/4.1/5/6...  (NOT gpt-oss: needs a digit here)
+        | o[134](?:$|[-:.])  # OpenAI o1 / o3 / o4 reasoning series, standalone
+        | gemini          # Google Gemini  (NOT gemma)
+        | grok            # xAI Grok
+    )""",
+    re.VERBOSE,
+)
+
+
+def _closed_family(name):
+    """True if `name` is a closed-weight proprietary model a self-hosted endpoint cannot run.
+    Drops a vendor prefix ("anthropic/claude..." -> "claude...") and lowercases; open lookalikes
+    (gpt-oss, gemma) are excluded by the pattern itself. Tolerates None / non-str."""
+    if not isinstance(name, str):
+        return False
+    base = name.rsplit("/", 1)[-1].strip().lower()   # drop "anthropic/", "cc/", "ag/", ...
+    return bool(_CLOSED_FAMILY_RE.match(base))
+
+
+def closed_catalog_score_from_models(models):
+    """How many of a host's advertised models are closed-weight names it cannot self-host
+    (per host, additive; 0 = clean). A positive count means the catalogue is a costume or a
+    polluted real host — low-rank it. Reconstitutable: recomputed from the raw model list, so
+    like bogus_score it needs no persisted state. Accepts either dialect's model objects."""
+    n = 0
+    for m in models or []:
+        if _closed_family(_fp_model_name(m)):
+            n += 1
+    return n
+
+
+def closed_catalog_score_from_payload(payload):
+    """closed_catalog_score for a raw check payload — ollama /api/tags (`models`) or openai
+    /v1/models (`data`)."""
+    if not isinstance(payload, dict):
+        return 0
+    models = payload.get("models")
+    if models is None:
+        models = payload.get("data")
+    return closed_catalog_score_from_models(models or [])
+
+
 def _latest_check_dir(session=None):
     base = "/tmp/graflex"
     if session:
@@ -159,6 +213,7 @@ def score_bogus(session=None, name=None):
                   + (f" for session {session}" if session else ""))
         return
     scores = {}
+    closed_flagged = 0
     for fn in os.listdir(check_dir):
         if not fn.endswith(".json"):
             continue
@@ -167,13 +222,22 @@ def score_bogus(session=None, name=None):
             continue
         host = snap.get("host")
         if host:
-            scores[host.rstrip("/")] = bogus_score_from_payload(snap.get("payload") or {})
+            payload = snap.get("payload") or {}
+            # bogus_score sums every survey-time "this host is junk" signal, additively:
+            #   - clone fingerprints (a cloned honeypot image reuses the same model+timestamp)
+            #   - closed-catalogue claims (self-hosting Claude/GPT/Gemini weights is impossible)
+            # Both recomputed from the raw payload, so the stamp stays reconstitutable.
+            closed = closed_catalog_score_from_payload(payload)
+            if closed:
+                closed_flagged += 1
+            scores[host.rstrip("/")] = bogus_score_from_payload(payload) + closed
     dist = {}
     for s in scores.values():
         dist[s] = dist.get(s, 0) + 1
     flagged = sum(v for k, v in dist.items() if k > 0)
     log.info(f"score-bogus: {len(scores)} hosts from {check_dir} | "
-             f"clean={dist.get(0, 0)} bogus={flagged} | dist={dict(sorted(dist.items()))}")
+             f"clean={dist.get(0, 0)} bogus={flagged} (closed-catalogue={closed_flagged}) "
+             f"| dist={dict(sorted(dist.items()))}")
     # Full bogus list to a file (sorted worst-first) so the hundreds are inspectable
     # without scrolling the terminal.
     bogus_sorted = sorted(((s, h) for h, s in scores.items() if s), reverse=True)

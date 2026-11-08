@@ -1765,6 +1765,11 @@ async def _unregister_worker(wid, ok=None):
             "prompt_tokens": w.get("ptoks"),
             "completion_tokens": w.get("ctoks"),
             "num_ctx": w.get("num_ctx"),
+            # Host-affinity audit: the conversation fingerprint (crc of the first N user
+            # messages) and the warm host it was handed to ('' = no handout / first turn).
+            # Group rows by affinity_crc to confirm a thread's turns stick to one host.
+            "affinity_crc": w.get("affinity_crc"),
+            "affinity_match": w.get("affinity_match"),
             "tally": dict(w.get("race_tally") or {}),
             # Terminal race state + a derived stall flag: a FAILED job whose candidate list
             # was never exhausted (spent False) and tried far fewer than it had (tried <
@@ -3134,6 +3139,12 @@ _STRUCTURAL_FAIL_RE = re.compile(
     # request. A later success (e.g. after a hardware/quant change, re-probed by graflex)
     # flips it back out of 'bad' automatically.
     r"|process has terminated"
+    # ComfyUI's UNETLoader/CheckpointLoader: "Could not detect model type of: <file>" — this
+    # host's ComfyUI can't load that diffusion file at all (arch newer than its build, or a
+    # foreign quant like a SwarmUI int8_convrot it doesn't understand). Permanent for THIS
+    # (host, model) pair, so hard-exclude it instead of re-racing the same doomed render every
+    # request; a host upgrade / re-quant is picked up by graflex's re-probe, which flips it back.
+    r"|could not detect model type"
     # Auth-gated: a 401/403 means the host needs credentials we don't have — permanent for US, so
     # record once and hard-exclude instead of re-probing it every request. The quick-test phrases it
     # "status 401: …"; the comfy/a1111 image path phrases it "HTTP 401" (e.g. "/models/checkpoints
@@ -4055,6 +4066,21 @@ def affinity_view(crc, now=None):
         return "", {}
     reserved.pop(match, None)
     return match, reserved
+
+
+def affinity_forget(host):
+    """Drop EVERY affinity pin pointing at `host` — the affinity-map analogue of clear_last.
+    Called when a host stalls/fails (timeout/unreachable/fault) so a thread stops LEADING with a
+    stuck host round after round: the pin re-forms on whichever host next serves (affinity_touch
+    on the next win). Best-effort; a cache hiccup must never break the verdict path."""
+    try:
+        h = _norm_host(host)
+        if not h:
+            return
+        for k in [k for k, (hh, _exp) in list(_affinity.items()) if hh == h]:
+            _affinity.pop(k, None)
+    except Exception as e:
+        log.debug(f"affinity_forget failed: {e}")
 
 
 def _affinity_plan(match, reserved, cand_hosts, floor):
@@ -5749,6 +5775,7 @@ def record_verdict(host, key, outcome, sticky_key=None):
         mark_unreachable(host)
         add_bad(host, key, "conn", reason=outcome.detail)  # ...plus the per-key mark
         clear_last(host)                                   # and stop leading with it (any model)
+        affinity_forget(host)                              # ...including the warm-affinity pin
     elif v == V_TIMEOUT:
         # Alive but didn't deliver (read timeout / stream stall). SOFT demote — good -> maybe_good,
         # never -> bad: a slow/stalling host is sometimes-good, not offline. Keeps it out of the
@@ -5758,10 +5785,13 @@ def record_verdict(host, key, outcome, sticky_key=None):
         clear_last(host, key)   # a stall/timeout must drop the sticky LEAD too — it's checked
                                 # ahead of the tier, so the demotion alone wouldn't stop the host
                                 # getting the exclusive hedge lead (and stalling ~TIMEOUT s) again
+        affinity_forget(host)   # and the affinity pin, for the same reason: a stuck warm host
+                                # fronted by affinity would keep eating the lead window each turn
     elif v in (V_UNSUITABLE, V_FAILED):   # a real fault — this key shows who failed it
         add_bad(host, key, _failure_kind(v, outcome.detail), reason=outcome.detail)
         clear_last(host, key)   # likewise: the sticky outranks the bad tier, so clear it or the
                                 # failed host keeps being tried first
+        affinity_forget(host)   # drop the warm pin too, so it stops fronting the failed host
     # V_SKIP records nothing on purpose
 
 
@@ -9398,8 +9428,8 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
     # Size for the engage gate only needs to be ROUGH (is this prompt big enough to be worth
     # pinning?), so a cheap chars/4 estimate — never a full tiktoken encode, which would block
     # the event loop on exactly the 100k-token prompts this feature targets.
-    _affinity_ctx.set((_affinity_key(_amsgs),
-                       len(json.dumps(_amsgs, ensure_ascii=False)) // 4 if _amsgs else 0))
+    _acrc = _affinity_key(_amsgs)
+    _affinity_ctx.set((_acrc, len(json.dumps(_amsgs, ensure_ascii=False)) // 4 if _amsgs else 0))
     _servers = find_servers(model_in, req_caps)
     total = len(_servers)
     cancel = asyncio.Event()   # manual-stop signal; armed onto the worker for the stream
@@ -9410,6 +9440,13 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
     # host answers — stash it so the active card can show it during the search/fan-out
     # phase (the MEASURED num_ctx replaces it once a host reports tokens).
     _stash_want_ctx(job_wid, opayload)
+    # Stamp the affinity key + the warm host we're leading with onto the job record, so
+    # worker-jobs.jsonl can CONFIRM the operation: group rows by affinity_crc to see one
+    # conversation's turns, and check they land on the host affinity_match named.
+    _wj = _workers.get(job_wid)
+    if _wj is not None:
+        _wj["affinity_crc"] = _acrc
+        _wj["affinity_match"] = _affinity_match_host()
     await _affinity_handout(_servers, model_list[0], job_wid)
     try:
         # The sticky (last-good) host is already sorted first in _servers, so
