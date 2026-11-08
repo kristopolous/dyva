@@ -230,5 +230,32 @@ def test_match_host_empty_when_no_entry(store):
     assert dyva._affinity_match_host() == ""
 
 
+# ---- forget on host failure (the affinity analogue of clear_last) ---------
+# When the pinned host stalls/fails, its pin must be dropped so the thread stops LEADING with a
+# stuck host every round; the pin re-forms on whichever host next serves (affinity_touch on win).
+
+def test_forget_drops_every_pin_to_host(store):
+    dyva.affinity_touch(1, "http://dead:1", 50)        # two threads pinned to the stuck host
+    dyva.affinity_touch(2, "http://dead:1", 50)
+    dyva.affinity_touch(3, "http://live:1", 50)
+    dyva.affinity_forget("http://dead:1")
+    assert dyva.affinity_view(1)[0] == ""              # both the stuck host's own pins are gone
+    assert dyva.affinity_view(2)[0] == ""
+    assert dyva.affinity_view(3)[0] == NH("http://live:1")   # other hosts' pins untouched
+    assert NH("http://dead:1") not in dyva.affinity_view(3)[1]   # dead host no longer reserved
+
+
+def test_forget_unknown_host_is_noop(store):
+    dyva.affinity_touch(1, "http://live:1", 50)
+    dyva.affinity_forget("http://never:1")
+    assert dyva.affinity_view(1)[0] == NH("http://live:1")
+
+
+def test_forget_blank_host_is_noop(store):
+    dyva.affinity_touch(1, "http://live:1", 50)
+    dyva.affinity_forget("")
+    assert dyva.affinity_view(1)[0] == NH("http://live:1")
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
