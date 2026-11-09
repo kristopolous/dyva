@@ -8,6 +8,11 @@
 </p>
 
 ---
+
+
+https://github.com/user-attachments/assets/9417c9fc-2e13-4844-9b17-5fc4cdbefcee
+
+
 **Dyva** is a dynamic proxy that routes to  [Ollama](https://ollama.com/), [vLLM](https://github.com/vllm-project/vllm), [LM Studio](https://lmstudio.ai/), [LocalAI](https://localai.io/), [SGLang](https://github.com/sgl-project/sglang), [KTransformers](https://github.com/kvcache-ai/ktransformers), [MLX](https://github.com/ml-explore/mlx), [llama.cpp](https://github.com/ggml-org/llama.cpp), [ds4 (DwarfStar)](https://github.com/antirez/ds4), [Colibrì](https://github.com/JustVugg/colibri), [Fooocus](https://github.com/lllyasviel/Fooocus), [Strata](https://github.com/Niko1221/Strata), [A1111 (stable-diffusion-webui)](https://github.com/AUTOMATIC1111/stable-diffusion-webui), [Gradio](https://gradio.app/), and [ComfyUI](https://comfy.org) hosts from [Shodan](https://www.shodan.io/), [ZoomEye](https://www.zoomeye.org/), [Censys](https://search.censys.io/), [hunter.how](https://hunter.how/) and [FOFA](https://fofa.info/) with graceful failover, context-window scaling, and honeypot detection. 
 
 Capable of text generation, embeddings, systemone (JEV) decision models, vision, tool calling, image generation and editing, video generation, TTS, and music generation in a unified interface with state of the art, real-time tunable router providing sub 1s latency. 
