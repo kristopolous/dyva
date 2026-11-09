@@ -344,6 +344,10 @@ SURVEY_FILE = os.path.join(CACHE_DIR, "survey.json")
 TIMEOUT = 60
 BACKOFF = 11
 MAX_BACKOFF = 300
+# A single FOFA query that keeps timing out is slow-walked server-side, not a dead
+# session — but don't retry it forever. Once one query has burned this many seconds in
+# timeout-retries, drop just that query (the run is resumable via --id) and move on.
+TIMEOUT_GIVEUP_S = 900
 SLEEP_DEFAULT = 4
 STATS_EVERY = 50
 # Partial results reach dyva by re-exporting the current service's json mid-sweep, but the
@@ -359,12 +363,6 @@ def _clean_cookie(value):
 
 FOFA_COOKIE = os.getenv("FOFA_COOKIE", "")
 FOFA_WEB = "https://en.fofa.info/result"
-# Public root, fetched WITHOUT a cookie to tell "FOFA/network is down" apart from
-# "our session is bad". The login-button / daily-limit / access-denied checks only
-# catch auth trouble when FOFA returns a readable page; a stale cookie that instead
-# surfaces as timeouts/connection errors slips past them, so a liveness probe here
-# is the backstop (see _fofa_reachable).
-FOFA_ROOT = "https://en.fofa.info/"
 # Appended to the FOFA result URL to bias toward recently-seen (likelier-alive)
 # hosts. Trial — set to "" to back out. It does NOT affect the cache-file label
 # (which is built from the query axes), so a resumed session still skips pages it
@@ -1553,24 +1551,6 @@ def _shodan_path(label, run_ts, svc="any"):
     return os.path.join("/tmp/graflex", run_ts, "shodan", f"{svc}-{label}.txt")
 
 
-def _fofa_reachable():
-    """Probe FOFA's public root with NO cookie, to split "FOFA (or our network) is
-    down" from "our FOFA session is bad". A 200 means FOFA itself is up and
-    answering, so repeated failures on our authenticated search requests are almost
-    certainly an auth problem — a stale/expired FOFA_COOKIE — not an outage. Returns
-    True if the root is up, False if even the no-cookie root fails (genuinely down /
-    we're offline). Deliberately no cookie and a short timeout; never raises."""
-    import requests
-    try:
-        r = requests.get(
-            FOFA_ROOT, timeout=10, allow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                                   "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"})
-        return r.status_code == 200
-    except Exception:
-        return False
-
-
 def _fetch_web(dry, service, combined, country=None, port=None, server=None, run_ts=None, curlify=False, label="", pname="any"):
     import base64
     import re
@@ -1605,6 +1585,7 @@ def _fetch_web(dry, service, combined, country=None, port=None, server=None, run
     backoff = BACKOFF
     attempt = 0
     timeouts = 0
+    timeout_waited = 0
     while True:
         try:
             resp = requests.get(url, headers=headers, timeout=30)
@@ -1679,30 +1660,28 @@ def _fetch_web(dry, service, combined, country=None, port=None, server=None, run
                 log.error(f"FOFA web request failed on query {combined!r} [{pname}]: {e}")
                 return None
         except requests.exceptions.Timeout as e:
-            # Read/connect timeouts are transient network conditions — retry
-            # with backoff instead of silently dropping the query. This branch
-            # retries indefinitely (the run is resumable; dropping a query loses
-            # its hosts), so the message names the query and the running count so
-            # a single stuck query is distinguishable from cache progress.
+            # A read timeout means FOFA accepted the request but is slow-walking THIS
+            # authenticated search (a heavy multi-facet query, or server-side throttling)
+            # — NOT a bad session. A stale/expired cookie makes FOFA serve the logged-OUT
+            # page, which the `login-button` check above catches deterministically and
+            # fast; a dead cookie does not time out. So retry with backoff, but bound it:
+            # once one query has burned TIMEOUT_GIVEUP_S in retries, drop just that query
+            # (return None — the run is resumable; it wrote no cache file, so a later --id
+            # run re-fetches it) instead of spinning forever. We never probe the no-cookie
+            # root to guess "stale cookie" and hard-stop the whole run: that inference is
+            # invalid (the landing page says nothing about the authenticated search
+            # endpoint) and kills a long survey over a single slow query.
             timeouts += 1
+            if timeout_waited >= TIMEOUT_GIVEUP_S:
+                log.error(f"FOFA query {combined!r} [{pname}] still timing out after "
+                          f"{_fmt_duration(timeout_waited)} ({timeouts} timeouts) — "
+                          f"dropping this query; resume with --id {run_ts} to retry it.")
+                return None
             waited = f", {timeouts} timeouts so far" if timeouts > 1 else ""
             log.warning(f"timeout ({type(e).__name__}) reading FOFA for query "
                         f"{combined!r} [{pname}]{waited}, retrying in {backoff}s")
-            # A stale cookie can surface as a read timeout rather than the logged-out
-            # page, so the login-button check never sees it and this branch would
-            # otherwise retry forever. After a couple of timeouts (and periodically
-            # after), probe FOFA's root with NO cookie: if the root is up, FOFA isn't
-            # down — our session is. That's a hard stop, same as the logged-out page.
-            if timeouts == 2 or (timeouts > 2 and timeouts % 8 == 0):
-                if _fofa_reachable():
-                    log.error(f"FOFA root responds (200) without a cookie but our "
-                              f"authenticated requests keep timing out — almost "
-                              f"certainly a stale FOFA_COOKIE, not an outage. Refresh "
-                              f"FOFA_COOKIE in .env, then resume with --id {run_ts}")
-                    raise SystemExit(3)
-                log.warning("FOFA root unreachable too — treating as a real outage, "
-                            "still retrying")
             time.sleep(backoff)
+            timeout_waited += backoff
             backoff = min(int(backoff * 1.2), MAX_BACKOFF)
             continue
         except Exception as e:
