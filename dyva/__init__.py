@@ -8373,7 +8373,8 @@ async def _pump_stream(response, resp, first_line, host, full, openai_format,
 
 
 async def _forward_stream(request, response, resp, first_line, host, full, openai_format,
-                          upstream_openai=False, wid=None, num_ctx=None):
+                          upstream_openai=False, wid=None, num_ctx=None,
+                          cancel=None, skip=None):
     content_type = "text/event-stream" if openai_format else "application/x-ndjson"
     response.headers["Content-Type"] = content_type
     response.headers["Cache-Control"] = "no-cache"
@@ -8387,12 +8388,26 @@ async def _forward_stream(request, response, resp, first_line, host, full, opena
         log.debug("Client disconnected before response headers sent")
         await resp.release()
         return
+    # Re-arm the worker's Stop/Skip handles onto THIS committed stream (mirrors the
+    # chat path's _stream_chat_failover). The race left them pointed at its own, now
+    # finished, cancel — so without this both buttons fire a dead signal once a host
+    # is committed, which is exactly what left /api/generate's Stop and Skip no-ops.
+    if wid:
+        _w = _workers.get(wid)
+        if _w is not None:
+            if cancel is not None:
+                _w["stop"] = cancel.set
+            if skip is not None:
+                _w["skip"] = skip.set
     # This path has no continue/retry machinery, so any status that SWALLOWED the
-    # upstream done ('length'/'truncated'/'capped'/'empty', or an operator 'stopped')
-    # would leave the client hanging. Close the stream with a terminal done unless it
-    # already ended cleanly ('done') or the client is gone ('client').
+    # upstream done ('length'/'truncated'/'capped'/'empty', or an operator 'stopped'/
+    # 'skip') would leave the client hanging. Close the stream with a terminal done
+    # unless it already ended cleanly ('done') or the client is gone ('client'). Skip
+    # has no failover here, so it simply ends the stream — content is undefined (zero
+    # guarantees, esp. mid tool-call); the one promise is the connection isn't dropped.
     status = await _pump_stream(response, resp, first_line, host, full, openai_format,
-                                upstream_openai, wid, num_ctx, ["", 0])
+                                upstream_openai, wid, num_ctx, ["", 0],
+                                cancel=cancel, skip=skip)
     if status not in ("done", "client"):
         with contextlib.suppress(Exception):
             await _write_terminal_done(response, full, openai_format)
@@ -9761,9 +9776,13 @@ async def _proxy_generate(request, session):
                 # unchanged. (A native-ollama upstream already streams generate shape; the
                 # proxy's per-line translate is a no-op on those.)
                 gen_out = _GenerateShapeResponse(stream_resp)
+                # Live Stop/Skip for the committed stream: _forward_stream re-arms the
+                # worker's buttons onto these and _pump_stream races them each read.
+                gen_cancel, gen_skip = asyncio.Event(), asyncio.Event()
                 await _forward_stream(request, gen_out, resp, first_line, host, full,
                                       openai_format=False, upstream_openai=_oai,
-                                      wid=job_wid, num_ctx=_effective_num_ctx(body))
+                                      wid=job_wid, num_ctx=_effective_num_ctx(body),
+                                      cancel=gen_cancel, skip=gen_skip)
                 await gen_out.flush_tail()
                 return stream_resp
             msg = "worker manually stopped" if stopped else "all servers failed"
