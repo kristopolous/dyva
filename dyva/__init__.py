@@ -180,6 +180,60 @@ def _permissive_ssl():
 INSECURE_SSL = _permissive_ssl()
 log.setLevel(getattr(logging, LOGLEVEL, logging.INFO))
 
+# ---- Outbound proxy (SOCKS/HTTP) for ALL upstream egress -------------------------------
+# dyva opens every upstream connection (inference, probes, the hedged race, embeddings, web
+# read/search, link-unfurl) through ONE shared aiohttp connector. With SOCKS_PROXY set, that
+# connector tunnels all of it through the proxy — the knob for routing egress off a different
+# IP (dodging the soft-ban canaries, or just privacy). None = direct, the default. Set in
+# main() from --socks / $DYVA_SOCKS / $SOCKS_PROXY. aiohttp has NO native proxy-env support,
+# so this is the only path; there is no transparent `SOCKS_PROXY=… ./dyva`.
+SOCKS_PROXY = None
+# curl-style socks5h/socks4a (remote DNS) are accepted and normalized to socks5/socks4 for
+# python-socks in _make_connector — rdns=True already gives the remote DNS the `h`/`a` means.
+# https (TLS-to-proxy) isn't supported by the backend, so it's rejected with a clear message.
+_SOCKS_SCHEMES = ("socks5", "socks5h", "socks4", "socks4a", "http")
+_SOCKS_NORMALIZE = {"socks5h": "socks5", "socks4a": "socks4"}
+
+
+def _resolve_socks(cli, env):
+    """Resolve the proxy URL (or None) for all upstream egress. Precedence: the --socks CLI
+    value, then $DYVA_SOCKS, then $SOCKS_PROXY. A set-but-malformed value RAISES — a typo must
+    fail loud, never silently fall through to a DIRECT connection that leaks the egress the
+    proxy was meant to hide."""
+    url = (cli or env.get("DYVA_SOCKS") or env.get("SOCKS_PROXY") or "").strip()
+    if not url:
+        return None
+    if urllib.parse.urlparse(url).scheme.lower() not in _SOCKS_SCHEMES:
+        raise ValueError(
+            f"unsupported proxy URL {url!r}: scheme must be one of {', '.join(_SOCKS_SCHEMES)} "
+            f"(e.g. socks5h://127.0.0.1:1080)")
+    return url
+
+
+def _make_connector():
+    """The shared outbound connector. With SOCKS_PROXY set, EVERY upstream connection tunnels
+    through it, rdns=True so DNS resolves AT the proxy — the ~2k hostname hosts in the pool must
+    not resolve locally when you're proxying egress, or you leak exactly what the proxy was for.
+    FAIL CLOSED: a requested proxy whose library is missing RAISES; we never silently fall back
+    to a direct connection. Without a proxy it's the tuned direct TCPConnector (async c-ares DNS
+    + a wide pool — see on_startup for why limit=0 and AsyncResolver)."""
+    if SOCKS_PROXY:
+        try:
+            from aiohttp_socks import ProxyConnector
+        except ImportError as e:
+            raise RuntimeError(
+                f"proxy requested ({SOCKS_PROXY}) but aiohttp-socks is not installed "
+                f"— `uv add aiohttp-socks`") from e
+        url = SOCKS_PROXY
+        scheme = urllib.parse.urlparse(url).scheme.lower()
+        if scheme in _SOCKS_NORMALIZE:            # curl-style socks5h/socks4a -> python-socks form
+            url = _SOCKS_NORMALIZE[scheme] + url[len(scheme):]
+        return ProxyConnector.from_url(
+            url, rdns=True, ssl=INSECURE_SSL, keepalive_timeout=120, limit=0)
+    return aiohttp.TCPConnector(
+        ssl=INSECURE_SSL, keepalive_timeout=120, limit=0,
+        resolver=aiohttp.AsyncResolver(), use_dns_cache=True, ttl_dns_cache=300)
+
 access_logger = logging.getLogger("aiohttp.access")
 access_logger.propagate = False
 access_logger.addHandler(logging.StreamHandler(sys.stderr))
@@ -10327,7 +10381,7 @@ async def handle_unfurl(request):
     _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
            "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
     try:
-        conn = aiohttp.TCPConnector(ssl=INSECURE_SSL)
+        conn = _make_connector()   # proxied too when SOCKS_PROXY is set — a preview fetch is egress
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6), connector=conn) as s:
             async with s.get(url, headers={"User-Agent": _UA, "Accept": "text/html,*/*"},
                              allow_redirects=True, max_redirects=3) as resp:
@@ -19860,10 +19914,9 @@ def make_app():
             # (c-ares/aiodns) resolves fully async: thousands of slow lookups in flight
             # cost ~0 threads and never block the loop. ttl_dns_cache=300 stops us
             # re-resolving the same names every 10s (the default).
-            connector=aiohttp.TCPConnector(
-                ssl=INSECURE_SSL, keepalive_timeout=120, limit=0,
-                resolver=aiohttp.AsyncResolver(),
-                use_dns_cache=True, ttl_dns_cache=300),
+            # Direct TCPConnector by default; a SOCKS/HTTP ProxyConnector when SOCKS_PROXY is
+            # set, so the entire pipeline below egresses through the proxy. See _make_connector.
+            connector=_make_connector(),
             timeout=aiohttp.ClientTimeout(total=None),
         )
         app["semaphore"] = asyncio.Semaphore(WORKER_COUNT)
@@ -20087,7 +20140,7 @@ def banner():
             time.sleep(0.04)
 
 def main():
-    global TIMEOUT, PORT, WORKER_COUNT, _LOCAL, _CURLIFY, BASE_PATH, ACTIVITY_LOG
+    global TIMEOUT, PORT, WORKER_COUNT, _LOCAL, _CURLIFY, BASE_PATH, ACTIVITY_LOG, SOCKS_PROXY
 
     parser = argparse.ArgumentParser(description="dumpster-dyva - Like the Ollama :cloud models, but you don't pay.")
     parser.add_argument("-p", "--port",     type=int, default=PORT, help=f"port to listen on (default: {PORT})")
@@ -20101,6 +20154,7 @@ def main():
     parser.add_argument("--cleanse", nargs="*", metavar="TYPE", help="expunge fake MODEL entries from the pool (hosts are never removed; removals logged to free-ollama.cleansed.json): '--cleanse' dry-run report of all; '--cleanse fake|cloud|junk|all [apply]' to act on one type")
     parser.add_argument("-w", "--workers",  type=int, default=3, help="number of workers (default: 3)")
     parser.add_argument("-l", "--local",    action="store_true", help="restrict inference endpoints to localhost only")
+    parser.add_argument("--socks", type=str, default=None, metavar="URL", help="route ALL upstream connections through a SOCKS/HTTP proxy, e.g. --socks socks5h://127.0.0.1:1080 (DNS resolves at the proxy, no leak). Also honored: $DYVA_SOCKS, $SOCKS_PROXY.")
     parser.add_argument("--source", nargs="+", metavar=("CMD"),
                         help="manage host sources: '--source list', '--source add <url>', "
                              "'--source disable <name>|all', '--source enable <name>|all' "
@@ -20118,6 +20172,12 @@ def main():
     if args.virgin:
         print("🤷 Made by Chris McKenzie")
         return
+    try:
+        SOCKS_PROXY = _resolve_socks(args.socks, os.environ)   # all upstream egress; None = direct
+    except ValueError as e:
+        parser.error(str(e))
+    if SOCKS_PROXY:
+        log.info(f"routing all upstream egress through proxy {SOCKS_PROXY} (DNS at the proxy)")
     if args.config:      # repoint every store BEFORE any command/server touches disk
         _apply_cache_dir(args.config)
     PORT = args.port     # so early ops (e.g. --cleanse apply's reload poke) target the right port
