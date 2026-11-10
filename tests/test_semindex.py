@@ -165,6 +165,27 @@ def test_semantic_search_ranks_docs(sem, monkeypatch):
     assert hits and hits[0]["ref"] == "README.md#Basil"
 
 
+def test_build_prioritizes_searched_kind_under_budget(sem, monkeypatch):
+    # Many docs (listed first by _corpus_items) + a few chats. With a tiny build budget,
+    # a chat search must still index the chats — docs must not starve them.
+    def corpus():
+        docs = [{"kind": "doc", "ref": "D#%d" % i, "title": "d%d" % i,
+                 "text": "doc tomato %d" % i, "hash": dyva._sem_hash("doc tomato %d" % i)}
+                for i in range(10)]
+        chats = [{"kind": "chat", "ref": "c1", "title": "Garden",
+                  "text": "tomato plants", "hash": dyva._sem_hash("tomato plants")},
+                 {"kind": "chat", "ref": "c2", "title": "More",
+                  "text": "tomato sauce", "hash": dyva._sem_hash("tomato sauce")}]
+        return docs + chats
+    monkeypatch.setattr(dyva, "_corpus_items", corpus)
+    monkeypatch.setattr(dyva, "_embed_text", _fake_embedder())
+    monkeypatch.setattr(dyva, "SEM_MAX_BUILD", 3)      # smaller than the 10 docs
+    hits = asyncio.run(dyva._semantic_search(None, "embed-model", "tomato",
+                                             kinds=("chat",), limit=8))
+    assert hits is not None
+    assert {h["ref"] for h in hits} == {"c1", "c2"}    # chats indexed despite the doc flood
+
+
 def test_semantic_search_none_when_no_embedding_host(sem, monkeypatch):
     async def _no_host(session, model, text):
         return None

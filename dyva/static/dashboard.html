@@ -675,7 +675,11 @@ button.stop:hover{background:var(--btn-danger-hover)}
 .msg .actions .act{cursor:pointer;color:var(--accent);font-size:1rem;line-height:1;height:1.5rem;min-width:1.5rem;margin:-.375rem 0;padding:0 4px;border-radius:var(--r-sm);user-select:none;display:inline-flex;align-items:center;justify-content:center}
 .msg .actions .act:hover{background:var(--accent-bg-active)}
 .msg .editbox{width:100%;min-height:3em;background:var(--bg-inset);border:1px solid var(--border-strong);border-radius:var(--r-md);color:var(--text);padding:.5em;font-size:var(--fs-md);font-family:var(--font-mono);outline:none;resize:vertical}
-.msg.user .role{color:var(--accent)}
+/* No "You" label on user rows, so pack the edit/retry buttons + timestamp to the right.
+   Zero the global .msg-time margin-left:auto here — two auto margins in one flex row split
+   the free space and strand .actions in the middle; justify-content:flex-end packs instead. */
+.msg.user .role{color:var(--accent);justify-content:flex-end}
+.msg.user .msg-time{margin-left:0}
 /* speak button: sits left of the ASSISTANT label, quiet until hovered */
 .speak-btn{flex-shrink:0;order:-1;background:none;border:none;padding:0;margin:0 .1em 0 0;color:var(--text-faint);cursor:pointer;display:flex;align-items:center;line-height:0}
 .speak-btn:hover{color:var(--accent)}
@@ -686,7 +690,7 @@ button.stop:hover{background:var(--btn-danger-hover)}
 .copy-btn.ok{color:var(--accent)}
 .msg .speak-out{margin-top:var(--sp-2);max-width:420px}
 .msg-time{margin-left:auto;color:var(--text-faint);font-size:var(--fs-2xs);letter-spacing:0;text-transform:none;font-weight:400;flex-shrink:0}
-.msg .body{background:var(--surface);border-radius:var(--r-lg);padding:.7em;font-size:var(--fs-lg);overflow-wrap:anywhere;line-height:var(--line-body)}
+.msg .body{border-radius:var(--r-lg);padding:.7em;font-size:var(--fs-lg);overflow-wrap:anywhere;line-height:var(--line-body)}
 .msg .body .error{color:var(--err)}
 /* Wide math can't wrap (katex is white-space:nowrap); scroll it inside the
    bubble instead of letting it stretch the chat column, same as .body pre. */
@@ -698,7 +702,7 @@ button.stop:hover{background:var(--btn-danger-hover)}
 #snackbar{position:fixed;left:50%;bottom:var(--sp-6);transform:translateX(-50%) translateY(8px);display:flex;align-items:center;gap:10px;background:var(--surface);border:1px solid var(--border-strong);color:var(--text-2);border-radius:var(--r-lg);padding:10px var(--sp-5);font-size:var(--fs-md);box-shadow:var(--shadow-pop);z-index:250;opacity:0;pointer-events:none;transition:opacity .2s,transform .2s}
 #snackbar.show{opacity:1;transform:translateX(-50%) translateY(0)}
 #snackbar .snack-spin{width:14px;height:14px;border:2px solid var(--border-strong);border-top-color:var(--accent);border-radius:var(--r-full);animation:spin .8s linear infinite;flex-shrink:0}
-.msg.user .body{background:var(--a-900);white-space:pre-wrap}
+.msg.user .body{background:var(--a-900);white-space:pre-wrap;max-width:80%;margin-left:auto;width:fit-content}
 .msg.note{margin:.4em 0 .8em}
 .msg.note .body{background:transparent;border-left:2px solid var(--border-accent);border-radius:0;padding:.15em 0 .15em .7em;font-size:var(--fs-md);color:var(--text-dim)}
 .msg.note .note-cmd{display:block;font-family:var(--font-mono);font-size:var(--fs-2xs);color:var(--accent);letter-spacing:0;margin-bottom:.1em}
@@ -4106,8 +4110,12 @@ function addMsg(role,text,index){
   }
   var d=document.createElement('div');d.className='msg '+role;
   var r=document.createElement('div');r.className='role';
-  var lbl=document.createElement('span');lbl.className='role-label';lbl.textContent=role==='user'?'You':'Assistant';
-  r.appendChild(lbl);
+  // User messages are right-justified and bubbled, so a "You" label is redundant; only
+  // the assistant keeps a role label (ASSISTANT + host/model meta via setAssistantLabel).
+  if(role!=='user'){
+    var lbl=document.createElement('span');lbl.className='role-label';lbl.textContent='Assistant';
+    r.appendChild(lbl);
+  }
   if(role==='assistant'&&index!==undefined){
     // read from the record, not the captured string, so it reflects edits
     r.appendChild(makeSpeakBtn(function(){

@@ -13501,7 +13501,8 @@ def _chats_search(query, limit=8):
 # embedded -> the search functions return None and the callers fall back to keyword search.
 _sem_db = None
 SEM_TEXT_CHARS = 2000      # cap per-item text fed to the embedder (and stored for snippets)
-SEM_MAX_BUILD = 200        # cap items (re)embedded per search, so one search can't stall
+SEM_MAX_BUILD = 400        # cap items (re)embedded per search; first build does the corpus
+SEM_BUILD_CONCURRENCY = 16  # embeds fanned out at once (serial over a corpus takes minutes)
 
 
 def _sem_hash(text):
@@ -13698,22 +13699,43 @@ async def _embed_text(session, model, text):
     return None
 
 
-async def _sem_build(session, model, max_embed=SEM_MAX_BUILD):
+async def _sem_build(session, model, kinds=None, max_embed=None):
     """Bring the index in line with the live corpus under the pinned `model`: prune dropped
-    items, then embed up to `max_embed` new/changed ones. Best-effort — if the embedding
-    host goes away mid-build the rest is left for the next search. Returns items embedded."""
+    items, then embed new/changed ones (up to SEM_MAX_BUILD, or `max_embed`). The items of
+    the kind(s) being searched are embedded FIRST, so a chat search is never starved by the
+    hundreds of doc sections _corpus_items lists ahead of the chats. Embeds run concurrently
+    (SEM_BUILD_CONCURRENCY at a time) — serial embedding of a whole corpus takes minutes.
+    Best-effort: hosts that fail are skipped and left for the next search. Returns the count
+    embedded."""
     db = _get_sem_db()
     if db is None:
         return 0
+    cap = SEM_MAX_BUILD if max_embed is None else max_embed
     _sem_check_model(db, model)
     to_delete, to_embed = _sem_plan(db, _corpus_items())
     _sem_remove(db, to_delete)
     db.commit()
+    if kinds:                                       # searched kind first, order stable otherwise
+        to_embed.sort(key=lambda it: 0 if it["kind"] in kinds else 1)
+    if cap:
+        to_embed = to_embed[:cap]
+    if not to_embed:
+        return 0
+
+    gate = asyncio.Semaphore(SEM_BUILD_CONCURRENCY)
+
+    async def _one(it):
+        async with gate:
+            try:
+                return it, await _embed_text(session, model, it["text"])
+            except Exception:
+                return it, None
+
+    # Network embeds fan out concurrently; the sqlite writes below stay single-threaded.
     embedded = 0
-    for it in to_embed[:max_embed] if max_embed else to_embed:
-        vec = await _embed_text(session, model, it["text"])
-        if vec is None:
-            break                                   # host gone; stop, resume next time
+    for it, vec in await asyncio.gather(*[_one(it) for it in to_embed]):
+        if not vec:
+            continue
         nv = _sem_normalize(vec)
         if nv is None:
             continue
@@ -13744,7 +13766,7 @@ async def _semantic_search(session, model, query, kinds=None, limit=8):
     # rather than 500-ing a search — this tool is a convenience, not a critical path.
     try:
         try:
-            await _sem_build(session, model)        # opportunistic, bounded top-up
+            await _sem_build(session, model, kinds=kinds)   # searched kind first, bounded
         except Exception:
             log.exception("semantic index build failed")
         nq = _sem_normalize(qvec)
