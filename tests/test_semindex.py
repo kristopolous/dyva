@@ -186,6 +186,40 @@ def test_build_prioritizes_searched_kind_under_budget(sem, monkeypatch):
     assert {h["ref"] for h in hits} == {"c1", "c2"}    # chats indexed despite the doc flood
 
 
+def test_build_persists_partial_progress_on_interrupt(sem, monkeypatch, tmp_path):
+    # The live failure: a slow real-embedder build blocked the search request long enough that
+    # the client disconnected, aiohttp cancelled the handler, and _sem_build (which committed
+    # only at the very end) persisted NOTHING — so the index stayed empty forever. The build
+    # must store+commit AS embeds complete, so an interrupt keeps the progress already made.
+    import re
+    monkeypatch.setattr(dyva, "SEM_BUILD_CONCURRENCY", 1)      # deterministic completion order
+    corpus = [{"kind": "chat", "ref": "c%d" % i, "title": "t%d" % i,
+               "text": "item %d" % i, "hash": dyva._sem_hash("item %d" % i)} for i in range(10)]
+    monkeypatch.setattr(dyva, "_corpus_items", lambda: corpus)
+
+    STOP_AT = 4
+    done = {"n": 0}
+    async def _emb(session, model, text):
+        if done["n"] >= STOP_AT:
+            raise asyncio.CancelledError()        # the client disconnected mid-build
+        done["n"] += 1
+        k = int(re.search(r"\d+", text).group())
+        v = [0.0] * 32
+        v[k % 32] = 1.0
+        return v
+    monkeypatch.setattr(dyva, "_embed_text", _emb)
+
+    try:
+        asyncio.run(dyva._sem_build(None, "m"))
+    except asyncio.CancelledError:
+        pass
+
+    # A SEPARATE connection sees only COMMITTED rows — the 4 embedded before the interrupt
+    # must have been persisted, not lost with the cancelled transaction.
+    other = sqlite3.connect(str(tmp_path / "sem.db"))
+    assert other.execute("SELECT COUNT(*) FROM items").fetchone()[0] == STOP_AT
+
+
 def test_semantic_search_none_when_no_embedding_host(sem, monkeypatch):
     async def _no_host(session, model, text):
         return None

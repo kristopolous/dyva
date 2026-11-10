@@ -12499,6 +12499,20 @@ async def handle_api_embeddings(request):
         # same availability-first racing, reputation and failover as everything else.
         _p, host, ms = item
         full = ms[0]
+        # Embedding-quality gate — screen each host ONCE before trusting it, same as _embed_text.
+        # Without this the endpoint counts a fake's well-formed noise as a success and add_good's
+        # it back to state='good', undoing the _embed_verify add_bad and letting the fastest fake
+        # keep winning every race.
+        if (host, full) in _embed_failed:
+            return skip("embed smoke: known fake")
+        if (host, full) not in _embed_verified:
+            sok = await _embed_verify(session, host, full, model, wid=wid)
+            if sok is False:
+                _embed_failed.add((host, full))
+                return skip("failed embed smoke: fake/random vectors")
+            if sok is None:
+                return skip("embed smoke inconclusive")
+            _embed_verified.add((host, full))
         t0 = time.time()
         await broadcast_activity(host, model, "trying", f"trying: {host}@{model}", wid=wid)
         try:
@@ -13589,6 +13603,7 @@ _sem_db = None
 SEM_TEXT_CHARS = 2000      # cap per-item text fed to the embedder (and stored for snippets)
 SEM_MAX_BUILD = 400        # cap items (re)embedded per search; first build does the corpus
 SEM_BUILD_CONCURRENCY = 16  # embeds fanned out at once (serial over a corpus takes minutes)
+SEM_COMMIT_EVERY = 16       # commit every N stores so an interrupted build keeps its progress
 
 
 def _sem_hash(text):
@@ -13827,23 +13842,40 @@ async def _sem_build(session, model, kinds=None, max_embed=None):
         async with gate:
             try:
                 return it, await _embed_text(session, model, it["text"])
+            except asyncio.CancelledError:
+                raise                               # a real cancel must propagate, not be swallowed
             except Exception:
                 return it, None
 
-    # Network embeds fan out concurrently; the sqlite writes below stay single-threaded.
+    # Network embeds fan out concurrently; the sqlite writes stay single-threaded. Crucially the
+    # store+commit happens AS EACH embed completes (not after gathering them all), and we commit
+    # every SEM_COMMIT_EVERY plus once in `finally`. A real-embedder build can take minutes, long
+    # enough for the search's client to disconnect and aiohttp to cancel this handler mid-build;
+    # committing incrementally means the embeds finished so far PERSIST, and the next search picks
+    # up where this one left off (the hash diff skips what's already stored) instead of restarting
+    # from empty forever.
+    tasks = [asyncio.ensure_future(_one(it)) for it in to_embed]
     embedded = 0
-    for it, vec in await asyncio.gather(*[_one(it) for it in to_embed]):
-        if not vec:
-            continue
-        nv = _sem_normalize(vec)
-        if nv is None:
-            continue
-        dim = _sem_ensure_vec(db, len(nv))
-        if len(nv) != dim:                          # model changed dimension mid-flight; skip
-            continue
-        _sem_store(db, it, nv)
-        embedded += 1
-    db.commit()
+    try:
+        for fut in asyncio.as_completed(tasks):
+            it, vec = await fut
+            if not vec:
+                continue
+            nv = _sem_normalize(vec)
+            if nv is None:
+                continue
+            dim = _sem_ensure_vec(db, len(nv))
+            if len(nv) != dim:                      # model changed dimension mid-flight; skip
+                continue
+            _sem_store(db, it, nv)
+            embedded += 1
+            if embedded % SEM_COMMIT_EVERY == 0:
+                db.commit()
+    finally:
+        db.commit()                                 # persist whatever completed, even on cancel
+        for t in tasks:                             # don't leak the embeds still in flight
+            if not t.done():
+                t.cancel()
     return embedded
 
 
