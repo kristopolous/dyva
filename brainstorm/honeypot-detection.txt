@@ -139,6 +139,56 @@ Validation (real data, 2026-09-12):
       above are confirmed table seeds.
 
 --------------------------------------------------------------------------------
+SIGNAL C — EMBEDDING RELATIVE-GEOMETRY TEST  (behavioural; BUILT 2026-11-10)
+--------------------------------------------------------------------------------
+A NEW MODALITY the signals above miss entirely. A, B and the smoke test all probe
+TEXT GENERATION; an embedding host returns a vector, not prose, so none of them
+apply to it. And embeddings had NO quality gate at all — dyva counted "returned a
+vector" as success, the embedding analog of a bare smoke PASS: necessary, never
+sufficient. So a fake embedder stayed state='good' on its own fabricated output.
+
+The fake (observed, 67.219.104.59): a /api/embeddings host that returns a correctly
+shaped (768-float), fast (0.42s, no inference), DETERMINISTIC-per-input vector that
+is semantic NOISE. cos(dog,puppy) = -0.04 where a real nomic gives +0.79; identical
+text -> cos 1.0 (so it looks "consistent," which is exactly why 22 fake "successes"
+re-promoted it to good despite fail_smoke=1 since September). It poisons the whole
+semantic index — every KNN search then ranks by noise. This host is a blatant
+honeypot by its /api/tags alone (x/pwn, x/exploit, x/massiveleak, fabricated .gguf
+paths), but it won every embed race because dyva races by LATENCY and a template
+that skips inference is always fastest.
+
+The test (fits the philosophy — information-destroying + negative). Embed a known-
+SIMILAR pair and one DISSIMILAR item; assert the similar pair is measurably CLOSER
+(a cosine margin). This DISCARDS the absolute vector values and tests only relative
+topology — the part a fake can't fabricate without actually embedding. Random
+vectors -> ~0 margin -> BOGUS. A CONSTANT embedder (same vector for everything) ->
+cos 1.0 for every pair -> ~0 margin -> BOGUS. It asserts bogus, never asserts good
+(a pass is just "plausibly a real embedder," not a quality score).
+
+Why it's STRONGER than the Signal-B class (important asymmetry): in chat, the free
+fake — varied random text — ESCAPES to "unknown" (Signal B caveat). In embeddings
+there is no cheap "varied random" escape that ALSO preserves semantic geometry:
+random vectors are varied AND caught. To pass you must run a real embedding model,
+which is precisely the expensive thing we're forcing — and then you're serving real
+embeddings, the thing we wanted. So the free fake is CAUGHT here, not merely left
+unknown. Residual defeat is the usual tripwire one: hardcode the fixed probe pair's
+geometry. Mitigation is the usual one (rotate/expand the probe pairs — "rotating the
+question restarts the clock"); still cheaper for us than for them, since they must
+carry a real embedder to clear a rotating set.
+
+Verdict is per-(host, model), per the OPEN section's leaning: a fake embedder is
+add_bad'd on that (host, model) pair only — a honeypot can serve a real chat model
+beside a fake embedder (the 9ol.es lesson), so don't condemn the host on the embed
+fail alone. find_servers then routes every embedding consumer around the pair.
+
+Built: _embed_quality_ok (the pure discriminator) + _embed_verify (probes a host,
+add_bad on a conclusive fake) gating _embed_text, so the index build and every query
+screen a host ONCE before trusting its vectors. Tests: tests/test_embed_smoke.py.
+Live pool check: 25/26 reachable nomic hosts are REAL (cos(dog,puppy)=0.79) — real
+embedders are abundant; the fake just won on latency. Probe strings and thresholds
+(min_sim 0.30, min_margin 0.10) live next to the code.
+
+--------------------------------------------------------------------------------
 HOW THE SIGNALS COMBINE — the escalation ladder
 --------------------------------------------------------------------------------
   1. FINGERPRINT (built, primary): cheap, structural, zero queries, already-pulled
@@ -161,6 +211,11 @@ HOW THE SIGNALS COMBINE — the escalation ladder
      are disposable tripwires; the FINGERPRINT is the only structural signal with
      teeth (and even it only catches CLONES — a lone host with unique timestamps AND
      varied output beats everything, but that's high-effort, low-yield per box).
+  4. EMBEDDING GEOMETRY (built, embedding models only): orthogonal to 1-3, which all
+     test text generation. For a (host, embedding-model) pair the relative-geometry
+     test (Signal C) is the gate — and unlike the behavioural chat tiers it has teeth,
+     because the free fake (random vectors) is CAUGHT, not escaped: clearing it needs
+     a real embedder. Per-(host, model), negative-only, same as the rest.
 
 --------------------------------------------------------------------------------
 OPEN: PER-HOST vs PER-(HOST, MODEL)  (revisit — new evidence)
