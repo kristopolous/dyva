@@ -32,6 +32,10 @@ import importlib.metadata
 
 import aiohttp
 import aiosqlite
+try:
+    import sqlite_vec           # loadable SQLite KNN extension (vec0); optional at runtime
+except ImportError:             # pragma: no cover - semantic search falls back to keyword
+    sqlite_vec = None
 from aiohttp import web, web_log
 from aiohttp_swagger3 import SwaggerDocs, SwaggerInfo, SwaggerUiSettings
 
@@ -321,6 +325,14 @@ IMG_HISTORY_FILE = os.path.join(IMG_DIR, "history.json")
 THUMB_DIR = os.path.join(IMG_DIR, "thumbs")
 CHATS_FILE = os.path.join(CACHE_DIR, "chats.json")   # legacy blob, migrated into CHATS_DB
 CHATS_DB = os.path.join(CACHE_DIR, "chats.db")
+# Semantic search index (sqlite-vec vec0) over docs + chats — one embedding model pins
+# the whole thing so every vector is comparable; see the "_sem_*" section near chats.
+SEMINDEX_DB = os.path.join(CACHE_DIR, "semindex.db")
+# The ONE embedding model the semantic index is built with. Heterogeneous pool: different
+# hosts serve different embedders at different dimensions, so the index MUST pin one model
+# or its vectors aren't comparable. Change it (settings `embed_model` / $DYVA_EMBED_MODEL)
+# and the index rebuilds itself on the next search.
+EMBED_MODEL = os.environ.get("DYVA_EMBED_MODEL", "nomic-embed-text").strip() or "nomic-embed-text"
 # Generation jobs — a generic, host-independent "print queue" for proxied
 # generations (see the jobs section below). Deliberately NOT tied to chats.db:
 # a job is router-level delivery state, and this table is keyed by `kind`
@@ -630,7 +642,7 @@ def _apply_cache_dir(path):
     so they're intentionally left alone."""
     global CACHE_DIR, CACHE_FILE, NOTWORKING_FILE, BAD_FILE, GOOD_FILE, STATUS_DB
     global LAST_FILE, STATS_FILE, STATS_DB, KNOWN_FILE, PROBE_FILE, IMG_DIR, AUDIO_DIR, IMG_HISTORY_FILE, THUMB_DIR
-    global CHATS_FILE, CHATS_DB, JOBS_DB, RERANKER_DB, SETTINGS_FILE, VIDEO_JOBS_FILE
+    global CHATS_FILE, CHATS_DB, SEMINDEX_DB, JOBS_DB, RERANKER_DB, SETTINGS_FILE, VIDEO_JOBS_FILE
     global VIDEO_JOBS_DIR, CLEANSED_FILE, SURVEY_FILE, MUSIC_JOBS_FILE, MUSIC_JOBS_DIR
     CACHE_DIR = os.path.abspath(os.path.expanduser(path))
     CACHE_FILE = os.path.join(CACHE_DIR, "free-ollama.json")
@@ -649,6 +661,7 @@ def _apply_cache_dir(path):
     THUMB_DIR = os.path.join(IMG_DIR, "thumbs")
     CHATS_FILE = os.path.join(CACHE_DIR, "chats.json")
     CHATS_DB = os.path.join(CACHE_DIR, "chats.db")
+    SEMINDEX_DB = os.path.join(CACHE_DIR, "semindex.db")
     JOBS_DB = os.path.join(CACHE_DIR, "jobs.db")
     RERANKER_DB = os.path.join(CACHE_DIR, "reranker.db")
     SETTINGS_FILE = os.path.join(CACHE_DIR, "settings.json")
@@ -748,7 +761,7 @@ def model_modalities(model):
 def load_settings():
     """Apply persisted runtime settings (workers/timeout/min_count/local) over
     the CLI defaults, so changes made in the dashboard survive restarts."""
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION, RERANK_BUSY_SECS, RERANK_UP_SECS, RERANK_DOWN_SECS, AFFINITY_PREFIX_MSGS, AFFINITY_MIN_TOKENS, AFFINITY_TTL_SECS, AFFINITY_MAX_ENTRIES, AFFINITY_FLOOR_HOSTS
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION, RERANK_BUSY_SECS, RERANK_UP_SECS, RERANK_DOWN_SECS, AFFINITY_PREFIX_MSGS, AFFINITY_MIN_TOKENS, AFFINITY_TTL_SECS, AFFINITY_MAX_ENTRIES, AFFINITY_FLOOR_HOSTS, EMBED_MODEL
     if not os.path.exists(SETTINGS_FILE):
         return
     try:
@@ -801,6 +814,8 @@ def load_settings():
         CLOUD_SKIP = {x.lower() for x in s["cloudskip"] if isinstance(x, str) and x.strip()}
     if isinstance(s.get("base_path"), str):
         BASE_PATH = _normalize_base(s["base_path"])
+    if isinstance(s.get("embed_model"), str) and s["embed_model"].strip():
+        EMBED_MODEL = s["embed_model"].strip()
     if isinstance(s.get("gossiper_url"), str):
         GOSSIPER_URL = s["gossiper_url"].strip()
     if isinstance(s.get("gossiper_enabled"), bool):
@@ -840,6 +855,7 @@ def save_settings(extra=None):
                  "min_count": MIN_COUNT, "local": _LOCAL, "explore": EXPLORE_MODE, "hide_dyva": HIDE_DYVA,
                  "admin_pw": ADMIN_PW, "model_list": MODEL_LIST, "model_list_on": MODEL_LIST_ON,
                  "cloudskip": sorted(CLOUD_SKIP), "base_path": BASE_PATH,
+                 "embed_model": EMBED_MODEL,
                  "gossiper_url": GOSSIPER_URL, "gossiper_enabled": GOSSIPER_ENABLED,
                  "rerank_busy_secs": RERANK_BUSY_SECS, "rerank_up_secs": RERANK_UP_SECS, "rerank_down_secs": RERANK_DOWN_SECS,
                  "affinity_prefix_msgs": AFFINITY_PREFIX_MSGS, "affinity_min_tokens": AFFINITY_MIN_TOKENS,
@@ -4776,6 +4792,181 @@ def load_gguf_labels():
         except (ValueError, OSError):
             pass
     return _gguf_labels
+
+
+# --- project documentation index (read_docs / get_doc_section chat tools) ----------
+# The chat can answer questions about dyva from its OWN prose docs. _DOC_FILES is a hard
+# WHITELIST — an explicit, auditable list, NOT a glob/find and NOT reachable from any user
+# input. read_docs/get_doc_section only ever see sections parsed from exactly these files;
+# the query and section args match already-indexed headings/text, never a path, so there
+# is no way to make these tools read anything else on disk. To add a doc, edit this list.
+# To keep the chat context lean the tools ship a heading list, one section, or a short
+# ranked snippet — never a whole file.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_DOC_FILES = (
+    "README.md", "dyva/README.md", "graflex/README.md",
+    "docs/architecture.md", "docs/freeollama.md", "docs/gossiper.md",
+    "docs/survey.md", "docs/video-script.md",
+    "docs/video/README.md", "docs/video/animation-pipeline.md", "docs/video/story.md",
+    "docs/superpowers/plans/2026-10-04-graflex-sqlite-host-store.md",
+    "docs/superpowers/plans/2026-11-03-ctx-size-routing.md",
+    "docs/superpowers/specs/2026-10-04-graflex-sqlite-host-store-design.md",
+    "docs/superpowers/specs/2026-10-19-oversized-prompt-client-compaction-nudge.md",
+    "docs/superpowers/specs/2026-11-03-ctx-size-routing-design.md",
+    "brainstorm/README.md", "brainstorm/auth-required-hosts.md",
+    "brainstorm/canary-detection.md", "brainstorm/dumb-gateway-split.md",
+    "brainstorm/honeypot-score.md", "brainstorm/host-affinity.md",
+    "brainstorm/lora-first-image-gen.md", "brainstorm/reranker.md",
+    "brainstorm/self-update-tab.md", "brainstorm/skip-to-next-host.md",
+)
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
+_docs_cache = None
+
+
+def _md_sections(text, path):
+    """Split markdown at ATX headings into ordered {path,heading,level,body} sections.
+    Any text before the first heading is kept as a preamble (heading ""); an empty
+    preamble is dropped."""
+    sections, buf = [], []
+    cur = {"path": path, "heading": "", "level": 0, "body": ""}
+    for line in str(text or "").splitlines():
+        m = _HEADING_RE.match(line)
+        if m:
+            cur["body"] = "\n".join(buf).strip()
+            sections.append(cur)
+            buf = []
+            cur = {"path": path, "heading": m.group(2).strip(),
+                   "level": len(m.group(1)), "body": ""}
+        else:
+            buf.append(line)
+    cur["body"] = "\n".join(buf).strip()
+    sections.append(cur)
+    if sections and not sections[0]["heading"] and not sections[0]["body"]:
+        sections = sections[1:]
+    return sections
+
+
+def _docs_list(sections):
+    """Headings only — for navigation; no bodies (so the no-arg get_doc_section stays tiny)."""
+    return [{"path": s["path"], "heading": s["heading"], "level": s["level"]}
+            for s in sections if s["heading"]]
+
+
+def _docs_get(sections, name):
+    """The one section whose heading best matches `name` (exact, else a loose contains
+    either way), as {path,heading,body}; None if nothing matches."""
+    q = str(name or "").strip().lower()
+    if not q:
+        return None
+    best = None
+    for s in sections:
+        h = s["heading"].lower()
+        if not h:
+            continue
+        if h == q:
+            return {"path": s["path"], "heading": s["heading"], "body": s["body"]}
+        if best is None and (q in h or h in q):
+            best = s
+    if best is not None:
+        return {"path": best["path"], "heading": best["heading"], "body": best["body"]}
+    return None
+
+
+def _doc_snippet(body, words, width=300):
+    """A short window of `body` around the first matched word, bounded to ~width."""
+    b = body or ""
+    low = b.lower()
+    pos = -1
+    for w in words:
+        i = low.find(w)
+        if i >= 0 and (pos < 0 or i < pos):
+            pos = i
+    if pos < 0:
+        return b[:width].strip()
+    start = max(0, pos - width // 3)
+    snip = b[start:start + width].strip()
+    if start > 0:
+        snip = "…" + snip
+    if start + width < len(b):
+        snip = snip + "…"
+    return snip
+
+
+def _docs_search(sections, query, limit=3):
+    """Rank sections by query-word hits (a hit in the heading weighs 5x a body hit) and
+    return up to `limit` {path,heading,snippet}. Empty/again-empty query -> []."""
+    words = [w for w in re.split(r"\W+", str(query or "").lower()) if w]
+    if not words:
+        return []
+    scored = []
+    for s in sections:
+        if not s["heading"] and not s["body"]:
+            continue
+        h, b = s["heading"].lower(), s["body"].lower()
+        score = sum(5 * h.count(w) + b.count(w) for w in words)
+        if score > 0:
+            scored.append((score, s))
+    scored.sort(key=lambda x: -x[0])
+    return [{"path": s["path"], "heading": s["heading"],
+             "snippet": _doc_snippet(s["body"], words)} for _, s in scored[:limit]]
+
+
+def _docs_index():
+    """All documentation sections across the _DOC_FILES whitelist, read once and cached.
+    No globbing: exactly the listed files, each confined to the repo root (defence in
+    depth). An unreadable/missing file is skipped, never fatal."""
+    global _docs_cache
+    if _docs_cache is None:
+        root = os.path.realpath(_REPO_ROOT)
+        out = []
+        for rel in _DOC_FILES:
+            fp = os.path.realpath(os.path.join(root, rel))
+            # never read outside the repo root, whatever the list says
+            if fp != root and not fp.startswith(root + os.sep):
+                continue
+            try:
+                with open(fp, encoding="utf-8") as f:
+                    out.extend(_md_sections(f.read(), rel))
+            except OSError:
+                continue
+        _docs_cache = out
+    return _docs_cache
+
+
+async def handle_dyva_docs(request):
+    """Project documentation for the read_docs / get_doc_section chat tools (PUBLIC —
+    README-class info, no admin gate). `?q=` ranked search with snippets; `?section=` one
+    section by heading; no arg -> the heading list. Context-lean by construction: a whole
+    file is never returned in one call, and the only inputs are a query and a heading name
+    (matched against the in-memory index), never a filesystem path."""
+    secs = _docs_index()
+    q = (request.query.get("q") or "").strip()
+    section = (request.query.get("section") or "").strip()
+    if q:
+        try:
+            limit = max(1, min(5, int(request.query.get("limit", "3"))))
+        except (ValueError, TypeError):
+            limit = 3
+        # Semantic first; falls back to the word-hit ranker when no embedding host is up.
+        hits = await _semantic_search(request.app["session"], EMBED_MODEL, q,
+                                      kinds=("doc",), limit=limit)
+        if hits is None:
+            return web.json_response({"hits": _docs_search(secs, q, limit)})
+        out = []
+        for h in hits:
+            path, _sep, heading = h["ref"].partition("#")
+            out.append({"path": path, "heading": heading, "snippet": h["snippet"]})
+        return web.json_response({"hits": out})
+    if section:
+        got = _docs_get(secs, section)
+        if got is None:
+            return web.json_response(
+                {"error": "no section matching " + repr(section),
+                 "sections": [x["heading"] for x in _docs_list(secs)]}, status=404)
+        if len(got["body"]) > 4000:   # cap one section so a call can't flood the context
+            got = dict(got, body=got["body"][:4000] + "…", truncated=True)
+        return web.json_response(got)
+    return web.json_response({"sections": _docs_list(secs)})
 
 
 MODEL_PRICES_FILE = os.path.join(os.path.dirname(__file__), "model-prices.json")
@@ -10499,6 +10690,42 @@ async def handle_guide(request):
     return web.FileResponse(path, headers={"Cache-Control": "no-cache"})
 
 
+# Cloudflare quick-tunnels (`cloudflared tunnel --url`) mint a fresh random hostname
+# like loan-violin-cute-occurred.trycloudflare.com on every restart, so one ollama
+# behind a tunnel churns through dozens of throwaway hostnames and can advertise a huge
+# model list under each. The name-keyed defences (junk/stub suppression, GGUF-digest
+# collapse) don't catch it — the names look real and vary — so these fold by HOST DOMAIN
+# instead: any model that lives ONLY on *.trycloudflare.com collapses into one row.
+_TCF_RE = re.compile(r"(^|\.)trycloudflare\.com(:\d+)?$")
+
+
+def _is_trycloudflare(host):
+    """True if a pool `server` value is an ephemeral Cloudflare quick-tunnel. Accepts a
+    bare host, host:port, or full URL; matches only the real domain suffix, so a
+    lookalike (nottrycloudflare.com, …trycloudflare.com.evil.net) is rejected."""
+    h = (host or "").strip().lower()
+    if "://" in h:
+        h = h.split("://", 1)[1]
+    h = h.split("/", 1)[0]          # netloc only
+    if "@" in h:
+        h = h.rsplit("@", 1)[1]
+    return bool(_TCF_RE.search(h))
+
+
+def _trycloudflare_fold(model_hosts):
+    """model_hosts maps each model NAME to the set of hosts serving it. A model is
+    'tunnel-only' when it has >=1 host and EVERY host is a *.trycloudflare.com tunnel —
+    a model also served by a real host is left alone so its real presence stays visible.
+    Returns (tunnel_only, host_union): the tunnel-only names and the union of their
+    tunnel hosts (how many distinct tunnels the folded row stands for)."""
+    tunnel_only, host_union = set(), set()
+    for m, hosts in model_hosts.items():
+        if hosts and all(_is_trycloudflare(h) for h in hosts):
+            tunnel_only.add(m)
+            host_union |= hosts
+    return tunnel_only, host_union
+
+
 async def handle_dashboard_models(request):
     """
     Dashboard models (JSON)
@@ -10552,6 +10779,7 @@ async def handle_dashboard_models(request):
     agg = {}            # model id -> {"count": n, "image": bool}
     dig_members = {}    # gguf digest -> set of model names sharing it
     dig_hosts = {}      # gguf digest -> set of hosts serving any member
+    model_hosts = {}    # model name -> set of hosts serving it (for the tunnel fold)
     for s in servers:
         host = s.get("server")
         if not host:
@@ -10575,6 +10803,7 @@ async def handle_dashboard_models(request):
             a["count"] += 1
             if is_img:
                 a["image"] = True
+            model_hosts.setdefault(m, set()).add(host)
             dg = _model_digest(m)
             if dg:
                 dig_members.setdefault(dg, set()).add(m)
@@ -10587,6 +10816,18 @@ async def handle_dashboard_models(request):
             f"SELECT model, state, COUNT(*) FROM host_status "
             f"WHERE state IN ('good','bad') AND {_LIVE_REAL} GROUP BY model, state").fetchall():
         gb.setdefault(model, {})[state] = n
+    # Fold the ephemeral tunnels FIRST: every model that lives only on *.trycloudflare.com
+    # drops out of the per-model view and the GGUF families (so a tunnel's churn can't
+    # inflate a real family's host count) and is replaced by one synthetic row below.
+    tunnel_only, tcf_hosts = _trycloudflare_fold(model_hosts)
+    if tunnel_only:
+        for m in tunnel_only:
+            agg.pop(m, None)
+        for dg in list(dig_members):
+            dig_members[dg] -= tunnel_only
+            if not dig_members[dg]:
+                dig_members.pop(dg, None)
+                dig_hosts.pop(dg, None)
     # Collapse rename families: when FAMILY_MIN+ distinct model NAMES share one GGUF
     # digest, they're one base under junk names — emit a SINGLE row instead of
     # hundreds. The surviving row is keyed on a real member name (so the host
@@ -10624,6 +10865,12 @@ async def handle_dashboard_models(request):
         if a["image"] and is_nsfw_model(m):   # label image checkpoints only
             _row["nsfw"] = True
         out.append(_row)
+    # One synthetic row standing in for every tunnel-only model: `aka` is how many names
+    # folded in, `count` how many distinct tunnels they came from, `tunnel` lets the
+    # client label it for what it is. Emitted only when there's something to fold.
+    if tunnel_only:
+        out.append({"id": "trycloudflare.com", "count": len(tcf_hosts), "image": False,
+                    "good": 0, "bad": 0, "aka": len(tunnel_only), "tunnel": True})
     # ship the survey's per-model sizes so the client filter understands ">10gb",
     # and the release-date lookup so it understands ">2026-02" (fuzzy-matched
     # client-side, same as the server does for routing).
@@ -10993,7 +11240,7 @@ async def handle_settings_post(request):
       '200':
         description: Updated settings
     """
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION, RERANK_BUSY_SECS, RERANK_UP_SECS, RERANK_DOWN_SECS, AFFINITY_PREFIX_MSGS, AFFINITY_MIN_TOKENS, AFFINITY_TTL_SECS, AFFINITY_MAX_ENTRIES, AFFINITY_FLOOR_HOSTS
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION, RERANK_BUSY_SECS, RERANK_UP_SECS, RERANK_DOWN_SECS, AFFINITY_PREFIX_MSGS, AFFINITY_MIN_TOKENS, AFFINITY_TTL_SECS, AFFINITY_MAX_ENTRIES, AFFINITY_FLOOR_HOSTS, EMBED_MODEL
     resp = await _check_local(request) or _check_admin(request)
     if resp:
         return resp
@@ -11881,6 +12128,86 @@ async def handle_refresh(request):
     return web.json_response({"status": "ok", "message": "cache refreshed",
                               "servers": len(servers), "models": len(all_models()),
                               "loaded": _hosts_loaded_str()})
+
+
+def _read_log_tail(n=60):
+    """Last n lines of the most recent dyva-<date>.log under CACHE_DIR/logs (bounded);
+    [] if there are none. For the do_action 'read_logs' operator tool."""
+    d = os.path.join(CACHE_DIR, "logs")
+    try:
+        files = sorted(f for f in os.listdir(d)
+                       if f.startswith("dyva-") and f.endswith(".log"))
+    except OSError:
+        return []
+    if not files:
+        return []
+    try:
+        with open(os.path.join(d, files[-1]), encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+    return [ln.rstrip("\n") for ln in lines[-max(1, n):]]
+
+
+def _analyze_workers():
+    """Compact snapshot of the live race/worker pool for the do_action 'analyze_workers'
+    tool: how many are running, a capped list, and the open-connection count."""
+    snap = _worker_snapshot() or []
+    return {"count": len(snap), "workers": snap[:30], "connections": _conn_count()}
+
+
+async def handle_dyva_action(request):
+    """Operator actions for the do_action chat tool, ALL admin-gated (X-Admin-Key):
+      - update_sources: re-pull sources + reload pool (the work behind /refresh)
+      - read_logs: a bounded tail of today's log
+      - analyze_workers: a compact snapshot of the running race pool
+      - query: a READ-ONLY SELECT against a whitelisted DB (see _safe_select)
+    Returns small, bounded payloads so a call can't flood the chat context."""
+    denied = _check_admin(request)
+    if denied:
+        return denied
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    action = (body.get("action") or "").strip()
+    if action == "update_sources":
+        global _servers_cache, _dead_cache
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, refresh_cache)
+        _servers_cache = None
+        _dead_cache = None
+        servers = load_servers()
+        await loop.run_in_executor(None, gossiper_sync)
+        return web.json_response({"ok": True, "servers": len(servers),
+                                  "models": len(all_models())})
+    if action == "read_logs":
+        try:
+            n = max(1, min(200, int(body.get("lines", 60))))
+        except (TypeError, ValueError):
+            n = 60
+        return web.json_response({"ok": True, "lines": _read_log_tail(n)})
+    if action == "analyze_workers":
+        return web.json_response(dict({"ok": True}, **_analyze_workers()))
+    if action == "query":
+        db = (body.get("db") or "").strip()
+        sql = body.get("sql") or ""
+        try:
+            limit = int(body.get("limit", 50))
+        except (TypeError, ValueError):
+            limit = 50
+        try:
+            res = _safe_select(db, sql, limit)
+        except ValueError as e:
+            return web.json_response({"ok": False, "error": str(e)}, status=400)
+        except sqlite3.Error as e:
+            return web.json_response({"ok": False, "error": "SQL error: " + str(e)}, status=400)
+        return web.json_response(dict({"ok": True}, **res))
+    return web.json_response(
+        {"ok": False, "error": "unknown action %r; use update_sources, read_logs, "
+         "analyze_workers, or query" % action}, status=400)
 
 
 async def handle_api_ps(request):
@@ -13132,11 +13459,367 @@ def _chat_delete(cid):
     db.commit()
 
 
+def _chats_search(query, limit=8):
+    """Search saved chats (title + message text) for ALL query words, newest-first.
+    Returns up to `limit` {id, title, snippet} — a short context window around the first
+    match (via _doc_snippet). Bodies are read here but never returned whole. Same store
+    the sidebar lists, so this exposes nothing the chat list doesn't already."""
+    words = [w for w in re.split(r"\W+", str(query or "").lower()) if w]
+    if not words:
+        return []
+    out = []
+    for cid, title, data in _get_chats_db().execute(
+            "SELECT id, title, data FROM chats ORDER BY created DESC").fetchall():
+        try:
+            obj = json.loads(data or "")
+        except (ValueError, TypeError):
+            continue
+        parts = [title or ""]
+        for m in (obj.get("messages") or []) if isinstance(obj, dict) else []:
+            c = m.get("content") if isinstance(m, dict) else None
+            if isinstance(c, str):
+                parts.append(c)
+            elif isinstance(c, list):   # OpenAI-style content parts
+                parts.extend(p.get("text", "") for p in c
+                             if isinstance(p, dict) and isinstance(p.get("text"), str))
+        hay = "\n".join(parts)
+        low = hay.lower()
+        if all(w in low for w in words):
+            out.append({"id": cid, "title": title or "", "snippet": _doc_snippet(hay, words)})
+            if len(out) >= limit:
+                break
+    return out
+
+
+# --- Semantic search index (sqlite-vec) over docs + chats --------------------
+# The substring search_chats is a poor tool: "I talked about routing hiccups" won't find a
+# chat that said "the proxy kept stalling". This index embeds every doc section and chat
+# with ONE pinned model (EMBED_MODEL) so their vectors are comparable, stores them in a
+# vec0 KNN table, and ranks by cosine. It's built LAZILY — a search embeds only the new or
+# changed items ("build up the database on search"), so it costs nothing until used and
+# stays incremental after. No embedding host for the pinned model -> the query can't be
+# embedded -> the search functions return None and the callers fall back to keyword search.
+_sem_db = None
+SEM_TEXT_CHARS = 2000      # cap per-item text fed to the embedder (and stored for snippets)
+SEM_MAX_BUILD = 200        # cap items (re)embedded per search, so one search can't stall
+
+
+def _sem_hash(text):
+    return hashlib.sha1((text or "").encode("utf-8", "ignore")).hexdigest()
+
+
+def _sem_normalize(vec):
+    """Unit-length copy of `vec` (so L2 KNN ranks identically to cosine); None if the
+    vector is empty or all-zero."""
+    try:
+        fv = [float(a) for a in vec]
+    except (TypeError, ValueError):
+        return None
+    n = math.sqrt(sum(a * a for a in fv))
+    if n <= 0 or not fv:
+        return None
+    return [a / n for a in fv]
+
+
+def _get_sem_db():
+    """Open (once) the sqlite-vec index DB with the vec0 extension loaded. Returns None if
+    sqlite-vec isn't importable or the extension won't load — callers then fall back to
+    keyword search instead of crashing."""
+    global _sem_db
+    if _sem_db is None:
+        if sqlite_vec is None:
+            return None
+        try:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            db = sqlite3.connect(SEMINDEX_DB, check_same_thread=False)
+            db.enable_load_extension(True)
+            sqlite_vec.load(db)
+            db.enable_load_extension(False)
+        except (sqlite3.Error, AttributeError, OSError):
+            log.exception("semantic index: sqlite-vec unavailable; keyword search only")
+            return None
+        db.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
+        db.execute("CREATE TABLE IF NOT EXISTS items("
+                   "rowid INTEGER PRIMARY KEY, kind TEXT, ref TEXT, title TEXT, "
+                   "text TEXT, hash TEXT, UNIQUE(kind, ref))")
+        db.commit()
+        _sem_db = db
+    return _sem_db
+
+
+def _sem_meta_get(db, key):
+    r = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return r[0] if r else None
+
+
+def _sem_meta_set(db, key, value):
+    db.execute("INSERT INTO meta(key,value) VALUES(?,?) "
+               "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+
+
+def _sem_ensure_vec(db, dim):
+    """Create the vec0 table at `dim` on first use and remember the dim. Idempotent."""
+    cur = _sem_meta_get(db, "dim")
+    if cur is None:
+        db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS vec_items USING vec0(embedding float[%d])"
+                   % int(dim))
+        _sem_meta_set(db, "dim", int(dim))
+        db.commit()
+        return int(dim)
+    return int(cur)
+
+
+def _sem_check_model(db, model):
+    """If the pinned embedding model changed, every stored vector is from a different model
+    (likely a different dimension) and is no longer comparable — wipe the index so it
+    rebuilds under the new model on the next search."""
+    if _sem_meta_get(db, "model") != model:
+        db.execute("DROP TABLE IF EXISTS vec_items")
+        db.execute("DELETE FROM items")
+        db.execute("DELETE FROM meta WHERE key='dim'")
+        _sem_meta_set(db, "model", model)
+        db.commit()
+
+
+def _chat_text(obj, title):
+    """Title + all message text of one chat, flattened (str content and OpenAI list parts),
+    for embedding/snippets. Same extraction the keyword _chats_search uses."""
+    parts = [title or ""]
+    for m in (obj.get("messages") or []) if isinstance(obj, dict) else []:
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, str):
+            parts.append(c)
+        elif isinstance(c, list):
+            parts.extend(p.get("text", "") for p in c
+                         if isinstance(p, dict) and isinstance(p.get("text"), str))
+    return "\n".join(p for p in parts if p)
+
+
+def _corpus_items():
+    """The unified corpus the index covers: one dict per doc section and per saved chat,
+    {kind, ref, title, text, hash}. `ref` identifies the source (doc 'path#heading', chat
+    id); `text` is capped to SEM_TEXT_CHARS; `hash` is over that capped text so change
+    detection matches exactly what was embedded."""
+    out = []
+    for s in _docs_index():
+        if not s["heading"] and not s["body"]:
+            continue
+        text = ((s["heading"] + "\n" + s["body"]).strip())[:SEM_TEXT_CHARS]
+        out.append({"kind": "doc", "ref": s["path"] + "#" + s["heading"],
+                    "title": s["heading"] or s["path"], "text": text, "hash": _sem_hash(text)})
+    for cid, title, data in _get_chats_db().execute(
+            "SELECT id, title, data FROM chats ORDER BY created DESC").fetchall():
+        try:
+            obj = json.loads(data or "")
+        except (ValueError, TypeError):
+            continue
+        text = _chat_text(obj, title)[:SEM_TEXT_CHARS]
+        if not text:
+            continue
+        out.append({"kind": "chat", "ref": str(cid), "title": title or "",
+                    "text": text, "hash": _sem_hash(text)})
+    return out
+
+
+def _sem_plan(db, items):
+    """Diff the live corpus against what's indexed. Returns (to_delete_rowids, to_embed):
+    items whose (kind,ref) is new or whose hash changed need embedding; rows whose (kind,ref)
+    is gone from the corpus get deleted."""
+    have = {(k, r): (rid, h)
+            for rid, k, r, h in db.execute("SELECT rowid, kind, ref, hash FROM items")}
+    live, to_embed = set(), []
+    for it in items:
+        key = (it["kind"], it["ref"])
+        live.add(key)
+        cur = have.get(key)
+        if cur is None or cur[1] != it["hash"]:
+            to_embed.append(it)
+    to_delete = [rid for (k, r), (rid, _h) in have.items() if (k, r) not in live]
+    return to_delete, to_embed
+
+
+def _sem_remove(db, rowids):
+    for rid in rowids:
+        db.execute("DELETE FROM items WHERE rowid=?", (rid,))
+        db.execute("DELETE FROM vec_items WHERE rowid=?", (rid,))
+
+
+def _sem_store(db, item, vec):
+    """Upsert one item and (re)place its vector. `vec` is already unit-normalized and its
+    length must equal the table's dim (the caller guards that)."""
+    db.execute("INSERT INTO items(kind,ref,title,text,hash) VALUES(?,?,?,?,?) "
+               "ON CONFLICT(kind,ref) DO UPDATE SET "
+               "title=excluded.title, text=excluded.text, hash=excluded.hash",
+               (item["kind"], item["ref"], item["title"], item["text"], item["hash"]))
+    rid = db.execute("SELECT rowid FROM items WHERE kind=? AND ref=?",
+                     (item["kind"], item["ref"])).fetchone()[0]
+    db.execute("DELETE FROM vec_items WHERE rowid=?", (rid,))
+    db.execute("INSERT INTO vec_items(rowid, embedding) VALUES(?,?)",
+               (rid, sqlite_vec.serialize_float32(vec)))
+
+
+def _sem_knn(db, qvec, kinds=None, limit=8):
+    """Nearest items to `qvec` (unit vector), optionally restricted to `kinds`. Returns
+    [{kind, ref, title, snippet, score}] best-first; score is cosine in [0,1]."""
+    if _sem_meta_get(db, "dim") is None:
+        return []
+    want = max(1, min(50, int(limit)))
+    over = want * 5 if kinds else want      # over-fetch so the kind filter can still fill `want`
+    pairs = db.execute(
+        "SELECT rowid, distance FROM vec_items WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+        (sqlite_vec.serialize_float32(qvec), over)).fetchall()
+    out = []
+    for rid, dist in pairs:
+        row = db.execute("SELECT kind, ref, title, text FROM items WHERE rowid=?", (rid,)).fetchone()
+        if not row:
+            continue
+        kind, ref, title, text = row
+        if kinds and kind not in kinds:
+            continue
+        out.append({"kind": kind, "ref": ref, "title": title or "",
+                    "snippet": (text or "")[:300].strip(),
+                    "score": round(max(0.0, 1.0 - float(dist) * float(dist) / 2.0), 4)})
+        if len(out) >= want:
+            break
+    return out
+
+
+async def _embed_text(session, model, text):
+    """One embedding for `text` from any host serving the pinned `model`, tried in priority
+    order; None if no host produced a vector (caller falls back to keyword search)."""
+    for item in find_servers(model):
+        host, full = item[1], item[2][0]
+        try:
+            vec = await _embed_one(session, host, full, text)
+        except (asyncio.TimeoutError, aiohttp.ClientError, OSError):
+            continue
+        if vec:
+            return vec
+    return None
+
+
+async def _sem_build(session, model, max_embed=SEM_MAX_BUILD):
+    """Bring the index in line with the live corpus under the pinned `model`: prune dropped
+    items, then embed up to `max_embed` new/changed ones. Best-effort — if the embedding
+    host goes away mid-build the rest is left for the next search. Returns items embedded."""
+    db = _get_sem_db()
+    if db is None:
+        return 0
+    _sem_check_model(db, model)
+    to_delete, to_embed = _sem_plan(db, _corpus_items())
+    _sem_remove(db, to_delete)
+    db.commit()
+    embedded = 0
+    for it in to_embed[:max_embed] if max_embed else to_embed:
+        vec = await _embed_text(session, model, it["text"])
+        if vec is None:
+            break                                   # host gone; stop, resume next time
+        nv = _sem_normalize(vec)
+        if nv is None:
+            continue
+        dim = _sem_ensure_vec(db, len(nv))
+        if len(nv) != dim:                          # model changed dimension mid-flight; skip
+            continue
+        _sem_store(db, it, nv)
+        embedded += 1
+    db.commit()
+    return embedded
+
+
+async def _semantic_search(session, model, query, kinds=None, limit=8):
+    """Embedding search over the index. Returns ranked hits
+    [{kind, ref, title, snippet, score}], or None when semantic search is unavailable (no
+    embedding host for `model`, or sqlite-vec missing) so the caller falls back to keyword.
+    An empty query returns []."""
+    query = (query or "").strip()
+    if not query:
+        return []
+    qvec = await _embed_text(session, model, query)
+    if qvec is None:
+        return None                                 # can't embed the query -> no semantic search
+    db = _get_sem_db()
+    if db is None:
+        return None                                 # sqlite-vec missing -> fall back to keyword
+    # Past here, any unexpected failure degrades to the keyword fallback (return None)
+    # rather than 500-ing a search — this tool is a convenience, not a critical path.
+    try:
+        try:
+            await _sem_build(session, model)        # opportunistic, bounded top-up
+        except Exception:
+            log.exception("semantic index build failed")
+        nq = _sem_normalize(qvec)
+        dim = _sem_meta_get(db, "dim")
+        if nq is None or dim is None or len(nq) != int(dim):
+            return None
+        return _sem_knn(db, nq, kinds=kinds, limit=limit)
+    except Exception:
+        log.exception("semantic search failed; falling back to keyword")
+        return None
+
+
+# Read-only SQL for the do_action "query" tool (admin-gated at the endpoint). Only these
+# dyva DBs are reachable. "No update" is enforced STRUCTURALLY, not by string-matching:
+# the DB is opened mode=ro (any write raises at the engine) AND an authorizer denies
+# ATTACH (a query can't reach another file on disk) and PRAGMA; execute() runs exactly one
+# statement (a second raises). So no write, no cross-file reach, whatever the SQL says.
+_SELECT_DBS = ("stats", "host_status", "chats")
+
+
+def _select_db_path(db):
+    return {"stats": STATS_DB, "host_status": STATUS_DB, "chats": CHATS_DB}.get(db)
+
+
+def _safe_select(db, sql, limit=50):
+    """Run ONE read-only SELECT against a whitelisted DB; return {columns, rows} (rows
+    capped at `limit`, max 500). Raises ValueError for an unknown db or empty sql, and the
+    underlying sqlite error for anything that isn't a single read-only statement."""
+    path = _select_db_path(db)
+    if path is None:
+        raise ValueError("unknown database %r; choose one of %s" % (db, ", ".join(_SELECT_DBS)))
+    sql = str(sql or "").strip().rstrip(";").strip()
+    if not sql:
+        raise ValueError("empty query")
+    try:
+        limit = max(1, min(500, int(limit)))
+    except (TypeError, ValueError):
+        limit = 50
+    conn = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
+    try:
+        def _auth(action, *a):
+            if action in (sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_PRAGMA):
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+        conn.set_authorizer(_auth)
+        cur = conn.execute(sql)
+        cols = [d[0] for d in (cur.description or [])]
+        rows = [list(r) for r in cur.fetchmany(limit)]
+        return {"columns": cols, "rows": rows}
+    finally:
+        conn.close()
+
+
 async def handle_chats_get(request):
-    """List saved chats (id, title, createdAt) — no message bodies, for the sidebar."""
+    """List saved chats (id, title, createdAt) — no message bodies, for the sidebar.
+    With ?q=, instead returns {hits:[{id,title,snippet}]} — a bounded content search for
+    the search_chats chat tool, behind the SAME localhost gate as the list."""
     resp = await _check_local(request)
     if resp:
         return resp
+    q = (request.query.get("q") or "").strip()
+    if q:
+        try:
+            limit = max(1, min(20, int(request.query.get("limit", "8"))))
+        except (ValueError, TypeError):
+            limit = 8
+        # Semantic first (embeds the query + lazily indexes chats); if no embedding host is
+        # up it returns None and we fall back to the old all-words substring search.
+        hits = await _semantic_search(request.app["session"], EMBED_MODEL, q,
+                                      kinds=("chat",), limit=limit)
+        if hits is None:
+            return web.json_response({"hits": _chats_search(q, limit)})
+        return web.json_response(
+            {"hits": [{"id": h["ref"], "title": h["title"], "snippet": h["snippet"]}
+                      for h in hits]})
     return web.json_response({"chats": _chats_list()})
 
 
@@ -20078,6 +20761,8 @@ def make_app():
     app.router.add_post("/api/chats/{cid}", handle_chat_post)
     app.router.add_post("/api/chats/{cid}/delete", handle_chat_delete)
     app.router.add_get("/docs/{cid}/{doc}", handle_doc_share)   # shareable document link
+    app.router.add_get("/dyva-docs", handle_dyva_docs)          # read_docs / get_doc_section corpus
+    app.router.add_post("/dyva-action", handle_dyva_action)     # do_action (admin-gated)
     # Chat jobs (the print queue). Plain router: path params + control bodies.
     app.router.add_post("/api/chat/jobs", handle_chat_job_submit)
     app.router.add_get("/api/chat/jobs", handle_chat_jobs_list)

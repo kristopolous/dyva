@@ -663,7 +663,7 @@ button:hover{background:var(--btn-bg-hover)}
 button:disabled{opacity:.5;cursor:default}
 button.stop{background:var(--btn-danger)}
 button.stop:hover{background:var(--btn-danger-hover)}
-.messages{border:1px solid var(--border);border-radius:var(--r-lg);background:var(--bg-sunken);height:46vh;overflow-y:auto;overflow-anchor:none;padding:.75em;margin-bottom:.75em}
+.messages{border-radius:0;height:46vh;overflow-y:auto;overflow-anchor:none}
 .msg{margin-bottom:.75em}
 .msg .role{font-size:var(--fs-2xs);color:var(--text-dim);text-transform:uppercase;letter-spacing:var(--eyebrow-tracking);margin-bottom:.25em;display:flex;align-items:center;gap:.4em;position:relative}
 .msg .role .role-meta{text-transform:none;letter-spacing:0;font-family:var(--font-mono);color:var(--text-faint);min-width:0;display:inline-flex;align-items:center;gap:.35em}
@@ -851,7 +851,12 @@ details.toolbox>summary{cursor:pointer;color:var(--text-dim);font-size:var(--fs-
 .toolbox .tc-fn{font-family:var(--font-mono);font-size:var(--fs-sm);color:var(--text-2)}
 .toolbox pre.tc-args{white-space:pre-wrap;overflow-wrap:anywhere;font-family:var(--font-mono);font-size:var(--fs-2xs);border:0;background:var(--bg-inset);border-radius:var(--r-sm);padding:.4em .5em;margin:.2em 0 0;max-height:280px;overflow:auto}
 .toolbox pre.tc-args code{white-space:inherit;overflow-wrap:inherit;background:none;padding:0}
-.think-body{white-space:pre-wrap;color:var(--text-3);font-size:var(--fs-sm);line-height:var(--line-body);font-style:italic;margin-top:.3em;max-height:320px;overflow:auto}
+/* Thinking renders the same markdown as the answer (bold/lists/code), just muted and
+   smaller so it still reads as reasoning. Block spacing is inherited from .msg.assistant
+   .body; we only trim the leading/trailing margin inside the thinkbox. */
+.think-body{color:var(--text-3);font-size:var(--fs-sm);line-height:var(--line-body);margin-top:.3em;max-height:320px;overflow:auto}
+.think-body>:first-child{margin-top:0}
+.think-body>:last-child{margin-bottom:0}
 
 .chat-status{display:flex;align-items:center;gap:.45em;color:var(--text-dim);font-size:var(--fs-xs);font-style:italic;margin:.15em 0 .3em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .chat-status::before{content:'';flex-shrink:0;width:.6em;height:.6em;border:1.5px solid var(--border-strong);border-top-color:var(--accent);border-radius:var(--r-full);animation:spin .8s linear infinite}
@@ -1516,10 +1521,10 @@ body.dragging-image .hist-item{cursor:grabbing}
 <label class="tool-opt"><input type="checkbox" id="toolVideo"><span class="tool-txt"><b>Video</b><small>Make a short video</small></span></label>
 <label class="tool-opt"><input type="checkbox" id="toolSpeech"><span class="tool-txt"><b>Speech</b><small>Speak dialog out loud</small></span></label>
 <label class="tool-opt"><input type="checkbox" id="toolWeb"><span class="tool-txt"><b>Web</b><small>Read a page at a URL</small></span></label>
-<label class="tool-opt"><input type="checkbox" id="toolHost"><span class="tool-txt"><b>Host access</b><small>Let the model request your location (your browser asks first)</small></span></label>
+<label class="tool-opt"><input type="checkbox" id="toolHost"><span class="tool-txt"><b>Host access</b><small>Let the model request your location</small></span></label>
 <label class="tool-opt"><input type="checkbox" id="toolAgents"><span class="tool-txt"><b>Sub-agents</b><small>Split a task across parallel agents</small></span></label>
 <label class="tool-opt"><input type="checkbox" id="toolDocs"><span class="tool-txt"><b>Documents</b><small>Write &amp; edit documents</small></span></label>
-<label class="tool-opt"><input type="checkbox" id="toolLinks"><span class="tool-txt"><b>Show links</b><small>Preview cards for links in replies (display only)</small></span></label>
+<label class="tool-opt"><input type="checkbox" id="toolDyva"><span class="tool-txt"><b>Dyva</b><small>Ask about dyva from its docs and search your past chats</small></span></label>
 </div>
 </div>
 <button id="docToggle" class="mp-tool" title="Documents" style="display:none"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg></button>
@@ -4236,7 +4241,7 @@ function splitThink(raw){
 }
 function thinkHtml(t,open){
   if(!t)return '';
-  return '<details class="thinkbox"'+(open?' open':'')+'><summary>thinking</summary><div class="think-body">'+escHtml(t)+'</div></details>';
+  return '<details class="thinkbox"'+(open?' open':'')+'><summary>thinking</summary><div class="think-body">'+mdRender(t)+'</div></details>';
 }
 // The tool calls a turn made, shown collapsed like the thinking block so you
 // can expand and inspect exactly what function ran with what parameters —
@@ -5006,7 +5011,7 @@ var TOOL_LABELS=[
 ];
 function _toolFlags(){
   return {imageOn:imageOn,videoOn:videoOn,speechOn:speechOn,
-          webOn:webOn,hostOn:hostOn,agentsOn:agentsOn,docsOn:docsOn,toolsOff:toolsOff};
+          webOn:webOn,hostOn:hostOn,agentsOn:agentsOn,docsOn:docsOn,dyvaOn:dyvaOn,toolsOff:toolsOff};
 }
 function enabledToolNames(){
   var live=_toolFlags();
@@ -6128,6 +6133,111 @@ async function runStream(chatId,chatCreated,chatTitle,model,msgs,bubble,depth,ex
         results.push(loc.ok
           ?{text:'User location: latitude '+loc.lat+', longitude '+loc.lon+' (accuracy ±'+loc.acc+' m). Coordinates only — no street address; reverse-geocode if you need a place name.',md:'`get_location`'}
           :{text:'Could not get the location: '+loc.err+'. Do not retry unless the user asks again.',md:'`get_location` — '+loc.err});
+      }else if(fn.name==='read_docs'){
+        setStatus('reading docs…');
+        var _dq=String(args.query||'').trim();
+        if(!_dq){results.push({text:'Call read_docs again with "query" set to what you want to look up.'});}
+        else{
+          try{
+            var _rd=await fetch('dyva-docs?q='+encodeURIComponent(_dq),{cache:'no-store',signal:ac.signal});
+            var _jd=await _rd.json();var _dhits=(_jd&&_jd.hits)||[];
+            if(!_dhits.length)results.push({text:'No documentation matched "'+_dq+'". Try different words, or call get_doc_section with no arguments to see the section list.',md:'`read_docs` "'+_dq.slice(0,60)+'" → 0'});
+            else{
+              var _dtxt=_dhits.map(function(h){return '## '+h.path+' › '+h.heading+'\n'+h.snippet}).join('\n\n');
+              results.push({text:'Documentation matches for "'+_dq+'":\n\n'+_dtxt,md:'`read_docs` "'+_dq.slice(0,60)+'" → '+_dhits.length,keep:'[read_docs "'+_dq.slice(0,40)+'" → '+_dhits.length+' sections]'});
+            }
+          }catch(ex){if(ac.signal.aborted)return;results.push({text:'Could not search the docs ('+ex.message+'). Try again shortly.'});}
+        }
+      }else if(fn.name==='get_doc_section'){
+        setStatus('reading docs…');
+        var _ds=String(args.section||'').trim();
+        try{
+          var _gd=await fetch('dyva-docs'+(_ds?'?section='+encodeURIComponent(_ds):''),{cache:'no-store',signal:ac.signal});
+          var _gj=await _gd.json();
+          if(!_ds){
+            var _heads=((_gj&&_gj.sections)||[]).map(function(s){return s.path+' › '+s.heading});
+            results.push({text:'Documentation sections ('+_heads.length+'). Call get_doc_section with one of these names to read it in full:\n'+_heads.join('\n'),md:'`get_doc_section` → '+_heads.length+' sections'});
+          }else if(_gd.status===404){
+            results.push({text:'No section named "'+_ds+'". Available sections:\n'+(((_gj&&_gj.sections)||[]).join('\n'))});
+          }else{
+            results.push({text:_gj.path+' › '+_gj.heading+'\n\n'+_gj.body+(_gj.truncated?'\n…(truncated)':''),md:'`get_doc_section` '+escHtml(_gj.heading||_ds)});
+          }
+        }catch(ex){if(ac.signal.aborted)return;results.push({text:'Could not read that section ('+ex.message+'). Try again shortly.'});}
+      }else if(fn.name==='search_chats'){
+        setStatus('searching chats…');
+        var _cq=String(args.query||'').trim();
+        if(!_cq){results.push({text:'Call search_chats again with "query" set to what to look for.'});}
+        else{
+          try{
+            var _cr=await fetch('api/chats?q='+encodeURIComponent(_cq),{cache:'no-store',signal:ac.signal});
+            var _cj=await _cr.json();var _chits=(_cj&&_cj.hits)||[];
+            if(!_chits.length)results.push({text:'No past chats mention "'+_cq+'".',md:'`search_chats` "'+_cq.slice(0,60)+'" → 0'});
+            else{
+              var _ctxt=_chits.map(function(h){return '- **'+(h.title||'untitled')+'** — '+h.snippet+'  [open](#chat/'+h.id+')'}).join('\n');
+              results.push({text:'Past chats matching "'+_cq+'" (newest first). Each line has a markdown [open](#chat/ID) link — show the user the ones that fit, each with its link:\n'+_ctxt,md:'`search_chats` "'+_cq.slice(0,60)+'" → '+_chits.length,keep:'[search_chats "'+_cq.slice(0,40)+'" → '+_chits.length+']'});
+            }
+          }catch(ex){if(ac.signal.aborted)return;results.push({text:'Could not search chats ('+ex.message+'). Try again shortly.'});}
+        }
+      }else if(fn.name==='get_param'){
+        setStatus('reading settings…');
+        try{
+          var _gps=await fetch('settings',{headers:adminHeaders(),cache:'no-store',signal:ac.signal});
+          if(_gps.status===403){results.push({text:'Not signed in to Settings — ask the user to open Settings and enter the admin password, then try again.',md:'`get_param` — not authenticated'});}
+          else if(!_gps.ok){results.push({text:'Could not read settings (HTTP '+_gps.status+').'});}
+          else{
+            var _gpv=await _gps.json();
+            var _gpn=String(args.name||'').trim();
+            if(!_gpn){
+              var _gpl=DYVA_PARAMS.map(function(p){return '- '+p.label+' ('+p.key+') = '+JSON.stringify(_gpv[p.key])}).join('\n');
+              results.push({text:'Settable parameters (call set_param to change one):\n'+_gpl,md:'`get_param` → '+DYVA_PARAMS.length});
+            }else{
+              var _gpp=_dyvaParam(_gpn);
+              if(!_gpp)results.push({text:'No settable parameter "'+_gpn+'". Call get_param with no name to list them.'});
+              else results.push({text:_gpp.label+' ('+_gpp.key+') = '+JSON.stringify(_gpv[_gpp.key])+'\n'+_gpp.desc,md:'`get_param` '+_gpp.key});
+            }
+          }
+        }catch(ex){if(ac.signal.aborted)return;results.push({text:'Could not read settings ('+ex.message+').'});}
+      }else if(fn.name==='set_param'){
+        var _spp=_dyvaParam(args.name);
+        if(!_spp){results.push({text:'No settable parameter "'+String(args.name||'')+'". Call get_param with no name to list them.'});}
+        else{
+          var _spv=_coerceParam(_spp.type,args.value);
+          if(_spv===undefined){results.push({text:'"'+String(args.value)+'" is not a valid '+_spp.type+' value for '+_spp.label+'.'});}
+          else if(typeof confirm==='function'&&!confirm('Change '+_spp.label+' to '+_spv+'?')){results.push({text:'The user declined to change '+_spp.label+'.',md:'`set_param` '+_spp.key+' — cancelled'});}
+          else{
+            setStatus('saving setting…');
+            try{
+              var _spb={};_spb[_spp.key]=_spv;
+              var _spr=await fetch('settings',{method:'POST',headers:adminHeaders({'Content-Type':'application/json'}),body:JSON.stringify(_spb),signal:ac.signal});
+              if(_spr.status===403)results.push({text:'Not signed in to Settings — ask the user to open Settings and enter the admin password, then try again.',md:'`set_param` — not authenticated'});
+              else if(!_spr.ok)results.push({text:'Could not set '+_spp.label+' (HTTP '+_spr.status+').'});
+              else results.push({text:_spp.label+' is now '+_spv+'.',md:'`set_param` '+_spp.key+' = '+_spv,keep:'['+_spp.key+' set to '+_spv+']'});
+            }catch(ex){if(ac.signal.aborted)return;results.push({text:'Could not set '+_spp.label+' ('+ex.message+').'});}
+          }
+        }
+      }else if(fn.name==='do_action'){
+        var _act=String(args.action||'').trim();
+        setStatus(_act?('do_action: '+_act+'…'):'do_action…');
+        var _ab={action:_act};
+        if(_act==='query'){_ab.db=String(args.db||'').trim();_ab.sql=String(args.sql||'');if(args.limit)_ab.limit=args.limit;}
+        if(_act==='read_logs'&&args.lines)_ab.lines=args.lines;
+        try{
+          var _ar=await fetch('dyva-action',{method:'POST',headers:adminHeaders({'Content-Type':'application/json'}),body:JSON.stringify(_ab),signal:ac.signal});
+          if(_ar.status===403){results.push({text:'Not signed in to Settings — operator actions need the admin password. Ask the user to open Settings and sign in, then try again.',md:'`do_action` — not authenticated'});}
+          else{
+            var _aj=await _ar.json();
+            if(!_ar.ok||_aj.ok===false){results.push({text:'do_action '+_act+' failed: '+(_aj.error||('HTTP '+_ar.status)),md:'`do_action` '+_act+' — error'});}
+            else{
+              var _txt;
+              if(_act==='update_sources')_txt='Sources refreshed: '+_aj.servers+' hosts, '+_aj.models+' models.';
+              else if(_act==='read_logs')_txt='Last '+((_aj.lines||[]).length)+' log lines:\n'+((_aj.lines||[]).join('\n'));
+              else if(_act==='analyze_workers')_txt=_aj.count+' running race(s), '+_aj.connections+' open connections:\n'+JSON.stringify(_aj.workers);
+              else if(_act==='query')_txt='Columns: '+JSON.stringify(_aj.columns)+'\nRows ('+((_aj.rows||[]).length)+'):\n'+((_aj.rows||[]).map(function(r){return JSON.stringify(r)}).join('\n'));
+              else _txt=JSON.stringify(_aj);
+              results.push({text:_txt,md:'`do_action` '+_act,keep:'[do_action '+_act+']'});
+            }
+          }
+        }catch(ex){if(ac.signal.aborted)return;results.push({text:'do_action '+_act+' failed ('+ex.message+').'});}
       }else results.push({text:'There is no tool named "'+fn.name+'". Use one of the tools available in this chat.'});
     }
     // Runaway guard: if the model spammed more tool calls than the cap, tell it ONCE
@@ -7001,12 +7111,13 @@ var toolVideoChk=document.getElementById('toolVideo');
 var toolWebChk=document.getElementById('toolWeb');
 var toolHostChk=document.getElementById('toolHost');
 var toolAgentsChk=document.getElementById('toolAgents');
+var toolDyvaChk=document.getElementById('toolDyva');
 var toolsOffChk=document.getElementById('toolsOff');
-var imageOn=false,docsOn=false,speechOn=false,videoOn=false,webOn=false,hostOn=false,agentsOn=false;
+var imageOn=false,docsOn=false,speechOn=false,videoOn=false,webOn=false,hostOn=false,agentsOn=false,dyvaOn=false;
 // DISPLAY-only toggle (not a model tool): render preview cards for links in replies.
-var linksOn=false;
-try{linksOn=localStorage.getItem('dyva_links')==='1'}catch(e){}
-var toolLinksChk=document.getElementById('toolLinks');
+// Link preview cards always render — no toggle. (Was optional on a thin security
+// argument about outbound preview fetches; not worth a line in an already-long menu.)
+var linksOn=true;
 // Master override: some pool models don't support tool calls at all, so this
 // sends NO tools (buildTools returns []), regardless of the individual toggles.
 var toolsOff=false;
@@ -7021,9 +7132,13 @@ try{videoOn=localStorage.getItem('dyva_tools_video')==='1'}catch(e){}
 try{webOn=localStorage.getItem('dyva_tools_web')==='1'}catch(e){}
 try{hostOn=localStorage.getItem('dyva_tools_host')==='1'}catch(e){}
 try{agentsOn=localStorage.getItem('dyva_tools_agents')==='1'}catch(e){}
+// Dyva's self-service tools (read_docs / get_doc_section, more to come) — one toggle
+// gates the whole group so none of their schemas ship until it's on, keeping the chat
+// context clean for models that don't need them.
+try{dyvaOn=localStorage.getItem('dyva_tools_dyva')==='1'}catch(e){}
 // ask_question has no toggle — it is always available (see buildTools), so it is
 // deliberately excluded from anyToolsOn (it must not keep the wrench lit).
-function anyToolsOn(){return !toolsOff&&(imageOn||docsOn||speechOn||videoOn||webOn||hostOn||agentsOn)}
+function anyToolsOn(){return !toolsOff&&(imageOn||docsOn||speechOn||videoOn||webOn||hostOn||agentsOn||dyvaOn)}
 // Full docs live on the tool defs; read_docs serves them on demand so the tool
 // list sent every turn can carry only a terse one-liner per tool. TOOL_DEFS maps
 // name -> the full function object (kept intact); buildTools terses a COPY.
@@ -7087,6 +7202,38 @@ function _argsValidFor(name,args){
   return true;
 }
 var READ_DOCS_TOOL={type:'function',function:{name:'help',description:'Get the docs (description + every parameter) for another tool.',parameters:{type:'object',properties:{tool:{type:'string',description:'Which tool to get help for'}},required:['tool']}}};
+// Dyva self-service tools (gated by the "Dyva docs" toggle). read_docs / get_doc_section
+// answer questions about dyva from its OWN documentation (READMEs + docs/ + brainstorm/,
+// a fixed server-side whitelist). Context-lean: they return a heading list, one section,
+// or short ranked snippets — never a whole file.
+var READ_PROJECT_DOCS_TOOL={type:'function',function:{name:'read_docs',description:'Search dyva’s own documentation (the READMEs plus docs/ and brainstorm/) and get back the best-matching sections as short snippets. Use it to answer questions about how dyva works — routing, settings, APIs, reputation, design.',parameters:{type:'object',properties:{query:{type:'string',description:'What to look up, e.g. "how does host reputation work" or "thinking token key".'}},required:['query']}}};
+var GET_DOC_SECTION_TOOL={type:'function',function:{name:'get_doc_section',description:'Browse dyva’s documentation by section. Call with no arguments to get the list of section headings; call with a section name to read that one section in full.',parameters:{type:'object',properties:{section:{type:'string',description:'A section heading to fetch in full. Omit to list every section heading.'}},required:[]}}};
+// Search the user's OWN past conversations (the same chats the sidebar lists). Each hit
+// carries a short snippet and a markdown link to open that chat.
+var SEARCH_CHATS_TOOL={type:'function',function:{name:'search_chats',description:'Search the user’s past conversations for a word or phrase. Each hit comes back with a short context snippet and a markdown link to open that chat — use it when the user is trying to find or remember an earlier conversation.',parameters:{type:'object',properties:{query:{type:'string',description:'Words to look for across the user’s saved chats.'}},required:['query']}}};
+// ADMIN tools (server enforces X-Admin-Key; a 403 means "not signed in to Settings").
+// get_param/set_param drive the existing /settings endpoint; set_param confirms first.
+// The settable whitelist + descriptions live here, so set_param can only touch these.
+var DYVA_PARAMS=[
+  {key:'workers',label:'Worker count',type:'int',desc:'Max concurrent upstream requests (1–200). Higher = more parallelism and more load.'},
+  {key:'timeout',label:'Request timeout (s)',type:'int',desc:'Per-request upstream timeout in seconds (1–600).'},
+  {key:'hedge_delay',label:'Hedge delay (s)',type:'num',desc:'Seconds before a slow request is also sent to a second host (0 = never hedge).'},
+  {key:'fanout',label:'Fan-out',type:'int',desc:'How many hosts to race per model-resolution wave.'},
+  {key:'min_count',label:'Min model count',type:'int',desc:'Fewest hosts a model needs before it is offered.'},
+  {key:'explore',label:'Explore mode',type:'bool',desc:'Occasionally try lower-ranked hosts to keep reputation fresh.'},
+  {key:'gossiper_enabled',label:'Gossiper',type:'bool',desc:'Sync smoke-test verdicts with peer dyvas on refresh.'},
+  {key:'hide_dyva',label:'Hide dyva',type:'bool',desc:'Leave dyva’s own identifying model/header out of responses.'}
+];
+function _dyvaParam(name){var n=String(name||'').trim().toLowerCase();return DYVA_PARAMS.filter(function(p){return p.key===n||p.label.toLowerCase().indexOf(n)>=0})[0];}
+function _coerceParam(type,v){
+  if(type==='bool'){if(typeof v==='boolean')return v;var s=String(v).trim().toLowerCase();if(['true','on','yes','1'].indexOf(s)>=0)return true;if(['false','off','no','0'].indexOf(s)>=0)return false;return undefined;}
+  if(type==='int'){var n=parseInt(v,10);return isNaN(n)?undefined:n;}
+  if(type==='num'){var f=parseFloat(v);return isNaN(f)?undefined:f;}
+  return String(v);
+}
+var GET_PARAM_TOOL={type:'function',function:{name:'get_param',description:'Read a dyva runtime setting and its description (admin only). Call with no name to list the settable parameters and their current values.',parameters:{type:'object',properties:{name:{type:'string',description:'The parameter name or label. Omit to list them all.'}},required:[]}}};
+var SET_PARAM_TOOL={type:'function',function:{name:'set_param',description:'Change a dyva runtime setting (admin only). The user is shown a confirmation before it takes effect.',parameters:{type:'object',properties:{name:{type:'string',description:'The parameter to change (name or label).'},value:{type:'string',description:'The new value.'}},required:['name','value']}}};
+var DO_ACTION_TOOL={type:'function',function:{name:'do_action',description:'Run an operator action on this dyva server (admin only): "update_sources" re-pulls host sources and reloads the pool; "read_logs" returns a tail of today’s log; "analyze_workers" summarises the running races; "query" runs a READ-ONLY SQL SELECT against a dyva database (stats, host_status, chats).',parameters:{type:'object',properties:{action:{type:'string',enum:['update_sources','read_logs','analyze_workers','query'],description:'Which action to run.'},db:{type:'string',enum:['stats','host_status','chats'],description:'For query: which database to read.'},sql:{type:'string',description:'For query: a single read-only SELECT statement.'},lines:{type:'integer',description:'For read_logs: how many trailing lines (default 60).'}},required:['action']}}};
 // Render a tool's parameters as doc lines, expanding nested object / array-item
 // schemas (e.g. spawn_agents' per-agent name/task/model) — the blanked terse
 // schema omits params, so help / the gate are the only place the model can learn
@@ -7140,6 +7287,8 @@ function buildTools(){
   if(hostOn)t.push(GET_LOCATION_TOOL);   // client-executed; browser prompts for permission
   if(agentsOn)t.push(SPAWN_TOOL);
   if(docsOn){t=t.concat(DOC_TOOLS);t.push(GET_SCREENSHOT_TOOL);}   // see the rendered document
+  if(dyvaOn){t.push(READ_PROJECT_DOCS_TOOL);t.push(GET_DOC_SECTION_TOOL);t.push(SEARCH_CHATS_TOOL);   // ask dyva about itself; find past chats
+             t.push(GET_PARAM_TOOL);t.push(SET_PARAM_TOOL);t.push(DO_ACTION_TOOL);}                    // admin: settings + operator actions (server-gated)
   // No toggle of its own: it is the index for whatever media tools are on,
   // and useless without them.
   if(imageOn||videoOn||speechOn||webOn){t.push(LIST_ASSETS_TOOL);t.push(GET_ASSET_TOOL);}   // list, then look
@@ -7168,8 +7317,8 @@ function paintTools(){
   if(toolVideoChk)toolVideoChk.checked=videoOn;
   if(toolWebChk)toolWebChk.checked=webOn;
   if(toolHostChk)toolHostChk.checked=hostOn;
-  if(toolLinksChk)toolLinksChk.checked=linksOn;
   if(toolAgentsChk)toolAgentsChk.checked=agentsOn;
+  if(toolDyvaChk)toolDyvaChk.checked=dyvaOn;
   if(toolsOffChk)toolsOffChk.checked=toolsOff;
   // when everything's disabled, grey out the per-tool list so it reads as moot
   if(toolsPop)toolsPop.classList.toggle('all-off',toolsOff);
@@ -7202,7 +7351,7 @@ function _applyChatTools(){
   var t=currentChat&&currentChat.tools;
   if(!t||typeof t!=='object')return;   // no per-chat setting -> keep the default
   imageOn=!!t.imageOn;docsOn=!!t.docsOn;speechOn=!!t.speechOn;
-  videoOn=!!t.videoOn;webOn=!!t.webOn;hostOn=!!t.hostOn;agentsOn=!!t.agentsOn;toolsOff=!!t.toolsOff;
+  videoOn=!!t.videoOn;webOn=!!t.webOn;hostOn=!!t.hostOn;agentsOn=!!t.agentsOn;dyvaOn=!!t.dyvaOn;toolsOff=!!t.toolsOff;
   paintTools();
 }
 toolImageChk.addEventListener('change',function(){
@@ -7225,13 +7374,6 @@ if(toolHostChk)toolHostChk.addEventListener('change',function(){
   try{localStorage.setItem('dyva_tools_host',hostOn?'1':'0')}catch(e){}
   paintTools();_persistChatTools();
 });
-// Display-only: not a model tool, so no _persistChatTools / buildTools — just re-render the
-// current chat so cards appear/disappear for the messages already on screen.
-if(toolLinksChk)toolLinksChk.addEventListener('change',function(){
-  linksOn=this.checked;
-  try{localStorage.setItem('dyva_links',linksOn?'1':'0')}catch(e){}
-  if(typeof renderMessages==='function')renderMessages();
-});
 if(toolAgentsChk)toolAgentsChk.addEventListener('change',function(){
   agentsOn=this.checked;
   try{localStorage.setItem('dyva_tools_agents',agentsOn?'1':'0')}catch(e){}
@@ -7250,6 +7392,11 @@ if(toolSpeechChk)toolSpeechChk.addEventListener('change',function(){
 if(toolDocsChk)toolDocsChk.addEventListener('change',function(){
   docsOn=this.checked;
   try{localStorage.setItem('dyva_tools_docs',docsOn?'1':'0')}catch(e){}
+  paintTools();_persistChatTools();
+});
+if(toolDyvaChk)toolDyvaChk.addEventListener('change',function(){
+  dyvaOn=this.checked;
+  try{localStorage.setItem('dyva_tools_dyva',dyvaOn?'1':'0')}catch(e){}
   paintTools();_persistChatTools();
 });
 document.addEventListener('click',function(){toolsPop.classList.remove('open')});
