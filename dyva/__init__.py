@@ -152,7 +152,7 @@ logging.basicConfig(
 _LOG_COLOR = bool(getattr(sys.stderr, "isatty", lambda: False)()) and not os.environ.get("NO_COLOR")
 for _handler in logging.getLogger().handlers:
     _handler.setFormatter((ColorFormatter if _LOG_COLOR else ApacheStyleFormatter)(LOG_FORMAT))
-log = logging.getLogger("dumpster-dyva")
+log = logging.getLogger("dyva")
 
 
 def _permissive_ssl():
@@ -12353,6 +12353,92 @@ async def _embed_one(session, host, full, text):
     return embs[0] if embs else None
 
 
+# ---- embedding-quality smoke gate ------------------------------------------------------
+# A host can answer /api/embeddings with a correctly-shaped, fast, deterministic vector that
+# carries NO semantic meaning — a honeypot, or a broken model. Those vectors poison the
+# semantic index: every search then ranks by noise. The #000000 colour smoke screens CHAT
+# hosts, but it can't test an embedder (an embedding model has no chat to answer with), so a
+# fast fake won every embed race and every stored vector came from it. This is the embedder's
+# equivalent smoke: embed a known-SIMILAR pair and one DISSIMILAR item, and check that a real
+# model puts the pair measurably closer than the odd one out. A fake (random vectors) scores
+# ~0 for every pair; a constant embedder (same vector for everything) scores ~1 for every
+# pair — both have ~0 margin and fail. The probe strings are fixed so a host's verdict is
+# reproducible and cacheable.
+EMBED_SMOKE_A = "a photograph of a dog"
+EMBED_SMOKE_B = "a picture of a puppy"                    # ~ A (near-synonym)
+EMBED_SMOKE_C = "quarterly tax accounting spreadsheet"   # far from A/B
+EMBED_SMOKE_MIN_SIM = 0.30      # the similar pair must be at least this close (real nomic ~0.79)
+EMBED_SMOKE_MIN_MARGIN = 0.10   # and at least this much closer than the odd one out (fake ~0)
+
+# (host, full-model) pairs that PASSED / conclusively FAILED the embed smoke in THIS process.
+# The pass set skips re-probing a verified host on every embed; the fail set means a confirmed
+# fake is smoked at most once per run even before add_bad() propagates to find_servers (a
+# 498-item rebuild would otherwise re-smoke the same fake hundreds of times). A FAIL is also
+# persisted via add_bad(), so find_servers drops the fake pair across restarts too. An
+# INCONCLUSIVE result (unreachable) is cached in neither — it stays re-testable.
+_embed_verified = set()
+_embed_failed = set()
+
+
+def _embed_cos(a, b):
+    """Cosine of two equal-length non-zero vectors; None on any degenerate input."""
+    if not a or not b or len(a) != len(b):
+        return None
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    if na <= 0 or nb <= 0:
+        return None
+    return sum(x * y for x, y in zip(a, b)) / (na * nb)
+
+
+def _embed_quality_ok(va, vb, vc,
+                      min_sim=EMBED_SMOKE_MIN_SIM, min_margin=EMBED_SMOKE_MIN_MARGIN):
+    """True iff these three embeddings show real semantic structure: the SIMILAR pair
+    (va,vb) is close AND measurably closer than the DISSIMILAR third vector (vc). Random
+    vectors (all cosines ~0) and constant vectors (all cosines ~1) both have ~0 margin, so
+    both fail. Any degenerate input (zero vector, dimension mismatch) -> False."""
+    sim = _embed_cos(va, vb)
+    da = _embed_cos(va, vc)
+    db = _embed_cos(vb, vc)
+    if sim is None or da is None or db is None:
+        return False
+    margin = sim - max(da, db)
+    return sim >= min_sim and margin >= min_margin
+
+
+async def _embed_verify(session, host, full, model_in=None, wid=None):
+    """Run the embedding smoke against one host. Returns True (real embedder), False (a
+    fake/broken embedder — marked bad per (host,model) so find_servers drops it), or None
+    (couldn't reach/complete the probe — no verdict, re-testable). Mirrors _quick_probe's
+    gate role: it records the verdict, nothing more."""
+    model_in = model_in or full
+    try:
+        va = await _embed_one(session, host, full, EMBED_SMOKE_A)
+        vb = await _embed_one(session, host, full, EMBED_SMOKE_B)
+        vc = await _embed_one(session, host, full, EMBED_SMOKE_C)
+    except (asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
+        await broadcast_activity(host, model_in, "failed",
+            f"embed smoke: {host}@{model_in} - {type(e).__name__}", wid=wid)
+        return None
+    if not (va and vb and vc):
+        await broadcast_activity(host, model_in, "failed",
+            f"embed smoke: {host}@{model_in} - no embedding", wid=wid)
+        return None
+    if _embed_quality_ok(va, vb, vc):
+        await broadcast_activity(host, model_in, "connected",
+            f"embed smoke PASSED: {host}@{model_in}", wid=wid)
+        return True
+    # Well-formed vectors with no semantic structure: a fabricated/broken embedder. Condemn
+    # just this (host, model) embed pair (per-model, reversible) so every embedding consumer
+    # routes around it; the honeypot's other models are left to their own smoke tests.
+    sim = _embed_cos(va, vb)
+    add_bad(host, full, reason=f"embed smoke: no semantic structure (sim={sim:+.3f})")
+    await broadcast_activity(host, model_in, "failed",
+        f"embed smoke: {host}@{model_in} - FAKE, random vectors (sim={sim:+.3f})", wid=wid)
+    log.warning(f"embed smoke FAKE {host} ({full}): similar-pair cos={sim:+.3f} (no structure)")
+    return False
+
+
 async def handle_api_embeddings(request):
     """
     Text embeddings (Ollama /api/embeddings format)
@@ -13687,9 +13773,22 @@ def _sem_knn(db, qvec, kinds=None, limit=8):
 
 async def _embed_text(session, model, text):
     """One embedding for `text` from any host serving the pinned `model`, tried in priority
-    order; None if no host produced a vector (caller falls back to keyword search)."""
+    order; None if no host produced a vector (caller falls back to keyword search). Each host
+    is screened ONCE by the embedding smoke (_embed_verify) before its vectors are trusted, so
+    a fake/broken embedder that returns well-formed noise can't poison the index or a query —
+    it's skipped and marked bad, and find_servers then routes every consumer around it."""
     for item in find_servers(model):
         host, full = item[1], item[2][0]
+        if (host, full) in _embed_failed:         # confirmed fake earlier this run -> skip
+            continue
+        if (host, full) not in _embed_verified:
+            ok = await _embed_verify(session, host, full, model)
+            if ok is False:
+                _embed_failed.add((host, full))   # don't re-smoke a known fake this run
+                continue
+            if ok is None:                        # unreachable -> no verdict, re-testable
+                continue
+            _embed_verified.add((host, full))
         try:
             vec = await _embed_one(session, host, full, text)
         except (asyncio.TimeoutError, aiohttp.ClientError, OSError):
@@ -20868,7 +20967,7 @@ def banner():
 def main():
     global TIMEOUT, PORT, WORKER_COUNT, _LOCAL, _CURLIFY, BASE_PATH, ACTIVITY_LOG, SOCKS_PROXY
 
-    parser = argparse.ArgumentParser(description="dumpster-dyva - Like the Ollama :cloud models, but you don't pay.")
+    parser = argparse.ArgumentParser(description="dyva - Like the Ollama :cloud models, but you don't pay.")
     parser.add_argument("-p", "--port",     type=int, default=PORT, help=f"port to listen on (default: {PORT})")
     parser.add_argument("-u", "--host",     action="append", default=None, metavar="ADDR", help="host address to bind to; repeat to bind several, e.g. -u 127.0.0.1 -u 10.0.0.1 (default: all interfaces)")
     parser.add_argument("--base",           type=str, default=None, help="secret URL path to serve dyva under, e.g. /some-path -> /some-path/v1/models (overrides the base_path setting; default: served at root)")
@@ -20995,7 +21094,7 @@ def main():
         log.warning(f"port {PORT} is in use — binding {_cand} instead")
         PORT = _cand
 
-    log.info(f"Starting dumpster-dyva on port {PORT}, WORKER_COUNT={WORKER_COUNT}, TIMEOUT={TIMEOUT}, MIN_COUNT={MIN_COUNT}, LOCAL={_LOCAL}")
+    log.info(f"Starting dyva on port {PORT}, WORKER_COUNT={WORKER_COUNT}, TIMEOUT={TIMEOUT}, MIN_COUNT={MIN_COUNT}, LOCAL={_LOCAL}")
 
     # Big, obvious, clickable (OSC8) links so there's zero hunting for where to go.
     # One line per bound interface (-u may be repeated); a wildcard bind shows as
