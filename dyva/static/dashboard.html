@@ -6098,14 +6098,20 @@ async function runStream(chatId,chatCreated,chatTitle,model,msgs,bubble,depth,ex
                   +'(its output stays in your own context, not the caller’s). You also share a '
                   +'scratchpad with the other agents: write_scratch(text) leaves a note for them '
                   +'(and the user sees it), read_scratch() shows what they have posted so far. '
-                  +'When done, return ONLY your result — concise and self-contained.';
+                  +'You have your OWN private file sandbox (isolated, ~1MB): write_file / read_file / '
+                  +'edit_file / list_files. Put any ARTIFACT the user should keep — an SVG chart, an '
+                  +'HTML page, a report — in a file (it is shown to the user as a rendered document '
+                  +'when the batch finishes); do NOT paste a big artifact into your text answer or the '
+                  +'scratchpad. When done, return ONLY a concise, self-contained summary of your result.';
             var uc=(shared?shared+'\n\n':'')+String(ag.task||'');
             // dyva_agent → the job runner executes the tools server-side and loops
             // (the one shared orchestration); scratch/agent_name give the batch
             // blackboard its identity; spread → each starts at a different host.
             return runAgentJob({model:amodel,dyva_agent:true,spread:ix,
                                 scratch:batchId,agent_name:nm,
-                                tools:[WEB_TOOL,WRITE_SCRATCH_TOOL,READ_SCRATCH_TOOL],
+                                tools:[WEB_TOOL,WRITE_SCRATCH_TOOL,READ_SCRATCH_TOOL,
+                                       AGENT_WRITE_FILE_TOOL,AGENT_READ_FILE_TOOL,
+                                       AGENT_EDIT_FILE_TOOL,AGENT_LIST_FILES_TOOL],
                                 messages:[{role:'system',content:sys},
                                           {role:'user',content:uc}]},ac.signal,
                               function(t){var a=agentLog[ix];a.status=t.phase||t.status||'running';
@@ -6119,6 +6125,26 @@ async function runStream(chatId,chatCreated,chatTitle,model,msgs,bubble,depth,ex
           try{var _jf=await (await fetch('api/chat/scratch/'+encodeURIComponent(batchId),{cache:'no-store'})).json();scratchEntries=(_jf&&_jf.entries)||[];}catch(e){}
           _renderAgents();   // final state of every agent + the finished board
           if(ac.signal.aborted)return;
+          // Surface each sub-agent's sandbox files as rendered documents — this is how an
+          // agent's artifacts (SVG charts, HTML, reports) reach the user. One doc per file,
+          // titled "<agent> · <name>" so same-named files from different agents don't merge;
+          // the extension (.svg/.html/.md) still drives live rendering. The GET also cleans
+          // up the batch's server-side sandbox once read.
+          try{
+            var _af=await (await fetch('api/chat/agent-files/'+encodeURIComponent(batchId),{cache:'no-store'})).json();
+            var _agents=(_af&&_af.agents)||{};var _fctx=docCtx(chatId);var _nfiles=0;
+            if(_fctx)Object.keys(_agents).forEach(function(an){
+              (_agents[an]||[]).forEach(function(f){
+                var nm2=String(f.name||'file');var title=an+' · '+nm2;
+                var isMd=/\.(md|markdown|txt)$/i.test(nm2);
+                var doc=findDoc(_fctx.docs,title);
+                if(!doc){doc={id:_docId(),title:title.slice(0,120),type:isMd?'markdown':'code',language:'',content:'',updated:Date.now(),versions:[]};_fctx.docs.push(doc);}
+                doc.content=String(f.content||'');doc.type=isMd?'markdown':'code';doc.updated=Date.now();_docCommitVersion(doc);
+                _nfiles++;
+              });
+            });
+            if(_nfiles)setStatus(_nfiles+' file'+(_nfiles>1?'s':'')+' from sub-agents → documents');
+          }catch(e){}
           var joined=outs.map(function(o){
             return '### '+o.name+(o.model?' ('+String(o.model).replace(/\\/g,'/').split('/').pop()+')':'')
                  +'\n'+o.text;
@@ -7059,6 +7085,14 @@ var SPEECH_TOOL={type:'function',function:{name:'generate_speech',description:'S
 var SPAWN_TOOL={type:'function',function:{name:'spawn_agents',description:'Run several sub-agents in parallel to divide a large task, then read back what each returned. Each agent is an independent generation that sees ONLY the task and context you give it — not this conversation — so make every task self-contained. Each agent can use the web itself with the web tool (search for pages, or read a URL), and crucially what it reads stays in ITS context, not yours — so this is the right tool when the inputs are big (give each agent a URL to fetch and digest, or a topic to research, e.g. one web page or question per agent). Use it for work that splits into independent pieces (e.g. "fetch and summarize each of these 20 pages", "research X from 5 angles"). You are the coordinator: give each agent a focused task, then synthesize their short answers into your own reply — do not just paste them. Agents run server-side and keep going even if the app is backgrounded.',parameters:{type:'object',properties:{agents:{type:'array',description:'The sub-agents to run in parallel (each self-contained). Use as many as the task genuinely splits into (one per page/angle); 80 is the ceiling.',items:{type:'object',properties:{name:{type:'string',description:'Short label for this agent, e.g. "story-42" or "skeptic".'},task:{type:'string',description:'The complete instruction for this agent. Include everything it needs — it cannot see the conversation or the other agents.'},model:{type:'string',description:'Optional model for this agent (glob ok, e.g. "qwen*"). Leave blank to use this chat’s model.'}},required:['task']}},context:{type:'string',description:'Optional shared background prepended to every agent’s task.'}},required:['agents']}}};
 var WRITE_SCRATCH_TOOL={type:'function',function:{name:'write_scratch',description:'Leave a note on the shared scratchpad the other sub-agents (and the user) can see. Use it to post a finding, flag a dead end, or ask the others for something. Notes are attributed to you.',parameters:{type:'object',properties:{text:{type:'string',description:'The note to post (markdown allowed).'}},required:['text']}}};
 var READ_SCRATCH_TOOL={type:'function',function:{name:'read_scratch',description:'Read the shared scratchpad — the notes the other sub-agents have posted so far, each attributed to its author. Check it before duplicating work or when you need something another agent may have found.',parameters:{type:'object',properties:{}}}};
+// A sub-agent's OWN private file sandbox (server-side, isolated per agent, ~1MB total).
+// Files written here are returned to the user as rendered documents when the batch
+// finishes — this is how an agent produces an artifact (an SVG chart, an HTML page, a
+// report) rather than cramming it into its text answer or the shared scratchpad.
+var AGENT_WRITE_FILE_TOOL={type:'function',function:{name:'write_file',description:'Write a file to your OWN private sandbox (isolated from the other agents; ~1MB total for you). This is how you hand a finished artifact back to the user — when the batch ends, your files are shown as rendered documents. A .svg/.html/.md name renders live. Use it for anything the user keeps: a chart, a page, a report. Call again with append:true to add to a file.',parameters:{type:'object',properties:{name:{type:'string',description:'Plain file name WITH an extension, e.g. "chart.svg" — no paths, no "..".'},content:{type:'string',description:'File content.'},append:{type:'boolean',description:'Append instead of overwrite.'}},required:['name','content']}}};
+var AGENT_READ_FILE_TOOL={type:'function',function:{name:'read_file',description:'Read back one of your own sandbox files (to review or before editing it).',parameters:{type:'object',properties:{name:{type:'string',description:'The file name.'}},required:['name']}}};
+var AGENT_EDIT_FILE_TOOL={type:'function',function:{name:'edit_file',description:'Replace text in one of your own sandbox files. old_text must appear EXACTLY once — copy it verbatim — unless you pass all:true.',parameters:{type:'object',properties:{name:{type:'string',description:'The file name.'},old_text:{type:'string',description:'Exact text to replace.'},new_text:{type:'string',description:'Replacement (empty string deletes it).'},all:{type:'boolean',description:'Replace every occurrence.'}},required:['name','old_text','new_text']}}};
+var AGENT_LIST_FILES_TOOL={type:'function',function:{name:'list_files',description:'List the files you have written to your sandbox, with sizes.',parameters:{type:'object',properties:{}}}};
 // Mirror a spawn batch's shared scratchpad into the "Scratchpad" document so the
 // user can watch it fill live. Read-only view of server-side buffer state; we
 // replace the doc content each poll and only commit when it actually changed.

@@ -13166,6 +13166,26 @@ async def handle_scratch_get(request):
     return web.json_response({"entries": _scratch_read(bid)})
 
 
+async def handle_agent_files_get(request):
+    """
+    Read a spawn batch's sub-agent files
+    ---
+    tags: [Chat]
+    summary: GET /api/chat/agent-files/{bid} — files each sub-agent wrote to its sandbox
+    responses:
+      '200': {description: '{agent: [{name, content}]} for the batch'}
+    """
+    resp = await _check_local(request)
+    if resp:
+        return resp
+    bid = request.match_info.get("bid")
+    files = _agent_fs_batch_files(bid)
+    # The client reads this once the batch finishes and renders the files as docs; the
+    # sandbox is working storage, so drop it now that it's been surfaced.
+    _agent_fs_cleanup(bid)
+    return web.json_response({"agents": files})
+
+
 async def handle_openai_chat(request):
     """
     Chat completion (OpenAI format)
@@ -16513,6 +16533,194 @@ def _scratch_read(bid):
     return list(_SCRATCH.get(bid) or [])
 
 
+# --- Sub-agent file sandbox -------------------------------------------------
+# Each sub-agent gets an ISOLATED on-disk directory under CACHE_DIR/agent-fs/<batch>/
+# <agent>/, capped at AGENT_FS_MAX bytes. Sub-agents run UNTRUSTED model output on a
+# public demo, so every model-supplied name is reduced to a safe basename and the
+# resolved path is asserted to stay inside the agent's own dir — a name like
+# "../../etc/passwd", "/etc/passwd" or "a/b" can only ever touch the sandbox, never the
+# server's real files. Ephemeral working storage: swept by age/count and on batch end.
+AGENT_FS_MAX = 1_000_000    # 1 MB total per sub-agent (hard cap, write + append)
+AGENT_FS_BATCHES = 64       # live batch dirs kept; oldest-mtime swept beyond this
+AGENT_FS_TTL = 3600         # seconds; batch dirs older than this are swept on write
+
+
+def _agent_fs_root():
+    return os.path.join(CACHE_DIR, "agent-fs")
+
+
+def _fs_token(s):
+    """A filesystem-safe single path component for a batch/agent id: keep [A-Za-z0-9._-],
+    collapse everything else to '_', strip leading/trailing dots, cap length, never empty
+    and never '.'/'..'. So a hostile id can't add path separators or climb directories."""
+    t = re.sub(r"[^A-Za-z0-9._-]", "_", str(s or ""))[:64].strip(".")
+    return t or "x"
+
+
+def _agent_fs_dir(batch, agent, create=False):
+    d = os.path.join(_agent_fs_root(), _fs_token(batch), _fs_token(agent))
+    if create:
+        os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _agent_fs_safe_name(name):
+    """A safe FLAT filename, or None. We REJECT (not silently basename) anything with a
+    path separator, a parent ref, or a leading dot, so the model gets a clear error
+    instead of a quietly-rewritten name — and nothing with a directory part ever reaches
+    the filesystem join."""
+    raw = re.sub(r"[\x00-\x1f]", "", str(name or "").strip().replace("\\", "/"))[:128].strip()
+    if not raw or "/" in raw or raw.startswith(".") or raw in (".", ".."):
+        return None
+    return raw
+
+
+def _agent_fs_resolve(batch, agent, name):
+    """Absolute path for (batch, agent, name), GUARANTEED inside the agent's dir, or None.
+    The name is a basename (no separators), so the only path is <dir>/<name>; the realpath
+    containment check is belt-and-suspenders against a symlink planted in the dir."""
+    safe = _agent_fs_safe_name(name)
+    if not safe:
+        return None
+    d = _agent_fs_dir(batch, agent)
+    p = os.path.join(d, safe)
+    if os.path.realpath(os.path.dirname(p)) != os.path.realpath(d):
+        return None
+    return p
+
+
+def _agent_fs_usage(batch, agent):
+    d = _agent_fs_dir(batch, agent)
+    total = 0
+    try:
+        for n in os.listdir(d):
+            fp = os.path.join(d, n)
+            if os.path.isfile(fp):
+                total += os.path.getsize(fp)
+    except OSError:
+        pass
+    return total
+
+
+def _agent_fs_sweep():
+    """Keep the sandbox bounded: drop batch dirs older than AGENT_FS_TTL, then the
+    oldest beyond AGENT_FS_BATCHES. Best-effort; never raises."""
+    root = _agent_fs_root()
+    try:
+        batches = [os.path.join(root, b) for b in os.listdir(root)]
+        batches = [b for b in batches if os.path.isdir(b)]
+    except OSError:
+        return
+    now = time.time()
+    dated = []
+    for b in batches:
+        try:
+            mt = os.path.getmtime(b)
+        except OSError:
+            continue
+        if now - mt > AGENT_FS_TTL:
+            shutil.rmtree(b, ignore_errors=True)
+        else:
+            dated.append((mt, b))
+    dated.sort()
+    for _mt, b in dated[:-AGENT_FS_BATCHES] if len(dated) > AGENT_FS_BATCHES else []:
+        shutil.rmtree(b, ignore_errors=True)
+
+
+def _agent_fs_write(batch, agent, name, content, append=False):
+    """(ok, message). Writes/appends a file in the agent's sandbox, enforcing the per-agent
+    byte cap. Rejects an unsafe name and any write that would exceed AGENT_FS_MAX."""
+    p = _agent_fs_resolve(batch, agent, name)
+    if not p:
+        return (False, "invalid file name — use a plain name like chart.svg, no paths or '..'.")
+    data = content if isinstance(content, str) else str(content or "")
+    nbytes = len(data.encode("utf-8"))
+    cur = os.path.getsize(p) if os.path.exists(p) else 0
+    usage = _agent_fs_usage(batch, agent)
+    projected = usage + nbytes if append else usage - cur + nbytes
+    if projected > AGENT_FS_MAX:
+        return (False, f"over the {AGENT_FS_MAX // 1000}KB per-agent file limit "
+                       f"(you're using {usage} bytes; this would reach {projected}). "
+                       "Delete or shorten a file first.")
+    _agent_fs_dir(batch, agent, create=True)
+    _agent_fs_sweep()
+    try:
+        with open(p, "a" if append else "w", encoding="utf-8") as f:
+            f.write(data)
+    except OSError as e:
+        return (False, f"could not write {_agent_fs_safe_name(name)}: {e}")
+    size = os.path.getsize(p)
+    return (True, f"{'Appended to' if append else 'Wrote'} {os.path.basename(p)} ({size} bytes).")
+
+
+def _agent_fs_read(batch, agent, name):
+    """(ok, content-or-message)."""
+    p = _agent_fs_resolve(batch, agent, name)
+    if not p or not os.path.isfile(p):
+        return (False, f"no file named {_agent_fs_safe_name(name) or name!r}. "
+                       "Use list_files to see what you've written.")
+    try:
+        with open(p, encoding="utf-8", errors="replace") as f:
+            return (True, f.read())
+    except OSError as e:
+        return (False, f"could not read that file: {e}")
+
+
+def _agent_fs_edit(batch, agent, name, old_text, new_text, replace_all=False):
+    """(ok, message). Replaces old_text in the file; exactly once unless replace_all."""
+    ok, content = _agent_fs_read(batch, agent, name)
+    if not ok:
+        return (False, content)
+    old_text = str(old_text or "")
+    if not old_text or old_text not in content:
+        return (False, "old_text not found in the file — copy it verbatim from read_file.")
+    n = content.count(old_text)
+    if n > 1 and not replace_all:
+        return (False, f"old_text appears {n} times — add more surrounding text to make it "
+                       "unique, or pass all=true to replace every occurrence.")
+    updated = content.replace(old_text, str(new_text or ""), -1 if replace_all else 1)
+    return _agent_fs_write(batch, agent, name, updated)
+
+
+def _agent_fs_list(batch, agent):
+    """[(name, size_bytes)] for the agent's sandbox, sorted by name."""
+    d = _agent_fs_dir(batch, agent)
+    out = []
+    try:
+        for n in sorted(os.listdir(d)):
+            fp = os.path.join(d, n)
+            if os.path.isfile(fp):
+                out.append((n, os.path.getsize(fp)))
+    except OSError:
+        pass
+    return out
+
+
+def _agent_fs_batch_files(batch):
+    """{agent: [{"name", "content"}]} for a whole batch — the surfacing payload. Skips
+    anything unreadable; bounded by the per-agent cap already enforced on write."""
+    bdir = os.path.join(_agent_fs_root(), _fs_token(batch))
+    out = {}
+    try:
+        agents = sorted(os.listdir(bdir))
+    except OSError:
+        return out
+    for ag in agents:
+        files = []
+        for name, _sz in _agent_fs_list(batch, ag):
+            ok, content = _agent_fs_read(batch, ag, name)
+            if ok:
+                files.append({"name": name, "content": content})
+        if files:
+            out[ag] = files
+    return out
+
+
+def _agent_fs_cleanup(batch):
+    """Remove a finished batch's whole sandbox. Best-effort."""
+    shutil.rmtree(os.path.join(_agent_fs_root(), _fs_token(batch)), ignore_errors=True)
+
+
 def _job_ctl(jid):
     return _JOB_CTL.setdefault(str(jid), {"cancel": False, "skip": False})
 
@@ -16673,6 +16881,25 @@ async def _run_chat_job(session, jid):
                             "other agents yet. Keep working and check back later, or "
                             "leave a note with write_scratch (e.g. ask for what you "
                             "need from the others).")
+                ran = True
+            elif name in ("write_file", "read_file", "edit_file", "list_files"):
+                # Isolated, 1MB-capped per-agent file sandbox (see _agent_fs_*). batch =
+                # this spawn's id, agent = this sub-agent's name — the same keys the
+                # scratchpad uses, so each agent's files are private to it.
+                _bid, _ag = params.get("scratch"), params.get("agent_name")
+                if name == "write_file":
+                    _ok, text = _agent_fs_write(_bid, _ag, a.get("name"),
+                                                a.get("content"), append=bool(a.get("append")))
+                elif name == "read_file":
+                    _ok, text = _agent_fs_read(_bid, _ag, a.get("name"))
+                elif name == "edit_file":
+                    _ok, text = _agent_fs_edit(_bid, _ag, a.get("name"),
+                                               a.get("old_text"), a.get("new_text"),
+                                               replace_all=bool(a.get("all")))
+                else:  # list_files
+                    _files = _agent_fs_list(_bid, _ag)
+                    text = ("Your files: " + ", ".join(f"{n} ({sz}B)" for n, sz in _files)
+                            if _files else "You haven't written any files yet.")
                 ran = True
             else:
                 text = f"(tool '{name}' is not available to sub-agents)"
@@ -20965,6 +21192,7 @@ def make_app():
     app.router.add_post("/api/chat/jobs/{id}/delete", handle_chat_job_delete)
     app.router.add_get("/api/chat/jobs/{id}", handle_chat_job_get)
     app.router.add_get("/api/chat/scratch/{bid}", handle_scratch_get)
+    app.router.add_get("/api/chat/agent-files/{bid}", handle_agent_files_get)
 
     app.router.add_route("*", "/comfyui/{tail:.*}", handle_comfyui_proxy)
     app.router.add_post("/v1/videos", handle_videos_post)
