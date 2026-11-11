@@ -665,7 +665,7 @@ button.stop{background:var(--btn-danger)}
 button.stop:hover{background:var(--btn-danger-hover)}
 .messages{border-radius:0;height:46vh;overflow-y:auto;overflow-anchor:none}
 .msg{margin-bottom:.75em}
-.msg .role{font-size:var(--fs-2xs);color:var(--text-dim);text-transform:uppercase;letter-spacing:var(--eyebrow-tracking);margin-bottom:.25em;display:flex;align-items:center;gap:.4em;position:relative}
+.msg .role{font-size:var(--fs-2xs);color:var(--text-dim);text-transform:uppercase;letter-spacing:var(--eyebrow-tracking);margin-bottom:.25em;display:flex;align-items:center;gap:.4em;position:relative;padding-left:0.7rem}
 .msg .role .role-meta{text-transform:none;letter-spacing:0;font-family:var(--font-mono);color:var(--text-faint);min-width:0;display:inline-flex;align-items:center;gap:.35em}
 .msg .role .role-meta .rm-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .msg .role .role-meta .copy-curl{flex-shrink:0}
@@ -689,7 +689,7 @@ button.stop:hover{background:var(--btn-danger-hover)}
 @keyframes speakpulse{50%{opacity:.35}}
 .copy-btn.ok{color:var(--accent)}
 .msg .speak-out{margin-top:var(--sp-2);max-width:420px}
-.msg-time{margin-left:auto;color:var(--text-faint);font-size:var(--fs-2xs);letter-spacing:0;text-transform:none;font-weight:400;flex-shrink:0}
+.msg-time{margin-left:auto;color:var(--text-faint);font-size:var(--fs-2xs);letter-spacing:0;text-transform:none;font-weight:400;flex-shrink:0;margin-right:0.7rem}
 .msg .body{border-radius:var(--r-lg);padding:.7em;font-size:var(--fs-lg);overflow-wrap:anywhere;line-height:var(--line-body)}
 .msg .body .error{color:var(--err)}
 /* Wide math can't wrap (katex is white-space:nowrap); scroll it inside the
@@ -703,7 +703,7 @@ button.stop:hover{background:var(--btn-danger-hover)}
 #snackbar.show{opacity:1;transform:translateX(-50%) translateY(0)}
 #snackbar .snack-spin{width:14px;height:14px;border:2px solid var(--border-strong);border-top-color:var(--accent);border-radius:var(--r-full);animation:spin .8s linear infinite;flex-shrink:0}
 .msg.user .body{background:var(--a-900);white-space:pre-wrap;max-width:80%;margin-left:auto;width:fit-content}
-.msg.note{margin:.4em 0 .8em}
+.msg.note{padding-left:0.7rem;margin:.4em 0 .8em}
 .msg.note .body{background:transparent;border-left:2px solid var(--border-accent);border-radius:0;padding:.15em 0 .15em .7em;font-size:var(--fs-md);color:var(--text-dim)}
 .msg.note .note-cmd{display:block;font-family:var(--font-mono);font-size:var(--fs-2xs);color:var(--accent);letter-spacing:0;margin-bottom:.1em}
 .msg.note.err .body{border-left-color:var(--err)}
@@ -787,6 +787,7 @@ button.stop:hover{background:var(--btn-danger-hover)}
 .msg.assistant .body p{margin:.75em 0;line-height:1.43rem}
 .msg.assistant .body h1,.msg.assistant .body h2,.msg.assistant .body h3,.msg.assistant .body h4{margin:.7em 0 .3em}
 .msg.assistant .body hr{border:none;border-top:1px solid var(--border-strong);margin:.7em 0}
+.msg.assistant .body {padding-top:0}
 .input-row{display:flex;gap:var(--sp-3);align-items:stretch;position:relative}
 .mpick-wrap{position:relative}
 .mpick-pop{display:none;position:absolute;left:0;right:0;top:calc(100% + 4px);background:var(--surface);border:1px solid var(--border-strong);border-radius:var(--r-lg);box-shadow:var(--shadow-pop);padding:var(--sp-2);z-index:140;max-height:min(46vh,280px);overflow-y:auto;overscroll-behavior:contain}
