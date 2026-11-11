@@ -4298,7 +4298,11 @@ function mdRender(text){
   var out=String(text||'');
   var math=[];
   out=out.replace(/\$\$([\s\S]+?)\$\$/g,function(_,m){math.push({d:1,s:m});return 'katexmath'+(math.length-1)});
-  out=out.replace(/\$([^$\n]+?)\$/g,function(_,m){math.push({d:0,s:m});return 'katexmath'+(math.length-1)});
+  // Inline math, but don't eat currency: pandoc's guards — an opening $ not
+  // followed by a space, a closing $ not preceded by a space and not followed by
+  // a digit. So "$1,500", "$8,000-core", "$5 and $7" stay literal; "$x^2$" and
+  // even "$3.14$" still render.
+  out=out.replace(/\$(?!\s)([^$\n]*?[^$\n\s])\$(?!\d)/g,function(_,m){math.push({d:0,s:m});return 'katexmath'+(math.length-1)});
   if(window.marked){try{out=window.marked.parse(out)}catch(e){}}
   else{out=escHtml(out).replace(/\n/g,'<br>')}
   if(window.DOMPurify){try{out=window.DOMPurify.sanitize(out)}catch(e){}}
