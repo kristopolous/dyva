@@ -189,6 +189,63 @@ embedders are abundant; the fake just won on latency. Probe strings and threshol
 (min_sim 0.30, min_margin 0.10) live next to the code.
 
 --------------------------------------------------------------------------------
+SIGNAL D — SYNTHETIC DIGEST / FABRICATED CATALOG  (structural; BUILT 2026-11-11)
+--------------------------------------------------------------------------------
+A DIFFERENT fake class from Signal A. A catches CLONES (many hosts sharing one real
+disk image's timestamps). D catches FABRICATORS: a single host whose catalog was
+NEVER real — it parrots model names it cannot run and mints the supporting metadata
+out of thin air. These are the costumes that answer "I'm claude-opus-5.5, hosted
+with LocalAI" to a verbatim-echo probe.
+
+The fake (observed, 157.245.193.55:8080, 2026-11-11): /v1/models advertises closed
+weights a self-host can't run (gpt-4o, o1, o3-mini, claude-3-5-sonnet, claude-opus-
+4-8-...) mixed with open names, and /api/tags lists an impossible kitchen-sink
+(deepseek-r1:671b + llama3.3:70b + dolphin-mixtral + qwen2.5:72b on one box). The
+closed names already draw a bogus_score (graflex _CLOSED_FAMILY_RE -> deprioritize),
+but that's a soft low-rank, not a honeypot mark, and the OPEN lookalikes slip it.
+
+The tell (structural, information-destroying, negative). The /api/tags `digest`s are
+VALID 64-hex — they pass _SHA and the existing ouroboros guard (which only skips
+NON-hex ASCII-art digests, the dyva-proxy case) — but they are NOT RANDOM. The host
+mints them from a rolling counter, so:
+  - a single digest is an arithmetic byte-ramp: every byte = prev + 0x11
+    (d1a6f8e2b3c4...a7b8c9d0), or a short-period cycle; and
+  - the whole catalog is cut from ONE sequence, so digests are byte-shifted copies
+    of each other and share 40-62-char substrings.
+A real ollama host's digests are independent random sha256 — no ramp, no shared
+runs. So the test DISCARDS the digest values and asserts only non-randomness:
+  - per digest: consecutive byte-deltas collapse to <= half distinct (a real sha256
+    has ~28-31 of 31 distinct); or
+  - cross digest: two digests share a >= 32-hex (16-byte) run — two independent
+    sha256 colliding on a run that long is ~2**-128, so a shared run PROVES both were
+    cut from one generated stream.
+Either fires -> the catalog is fabricated. Asserts bogus, never asserts good: a
+random-LOOKING catalog is merely "not proven fake," never whitelisted. Zero queries,
+already-pulled /api/tags data — the cheapest tier there is, cheaper than Signal A.
+
+Verdict is PER-HOST here, not per-(host, model) like A/C. A fabricated catalog has
+no real model hiding behind it — the whole inventory is the costume — so there's no
+9ol.es-style real-model-to-rescue. Hard host-wide honeypot mark (recorded notworking,
+reason "honeypot"), no /wp-login.php confirmation needed: the digest math is proof
+enough. This matters operationally because these hosts don't just serve junk — they
+PARROT tool-capable frontier names and then never emit a real tool call, so they
+STALL an agentic run (the agent waits on a tool result that never comes). Catching
+them at discovery keeps dyva from ever routing an agent into one.
+
+Residual defeat (the usual tripwire caveat, cf. Signal B): a fabricator could run
+sha256 over random bytes and get random-looking digests for free — that escapes to
+"unknown" (the safe failure, never marked good). So D is NOT adaptation-proof; it's a
+zero-cost structural tripwire for the current lazy-fabricator crop, the same disposable
+class as the smoke/diffusive tests — but unlike those it needs no probe and no round
+trip. Pairs with dyva's min-hosts-per-model floor (default 2): once the fabricator is
+marked notworking, its parroted names lose their only host and drop off the listings.
+
+Built: graflex synthetic_digest_catalog() + _synthetic_digest() + _shares_run(),
+wired into the check honeypot gate alongside the phantom-catalog / wp-login path.
+Tests: tests/test_honeypot_digests.py (real captured digests as the positive class,
+hashlib sha256 as the negative class). Thresholds live next to the code.
+
+--------------------------------------------------------------------------------
 HOW THE SIGNALS COMBINE — the escalation ladder
 --------------------------------------------------------------------------------
   1. FINGERPRINT (built, primary): cheap, structural, zero queries, already-pulled
@@ -216,6 +273,14 @@ HOW THE SIGNALS COMBINE — the escalation ladder
      test (Signal C) is the gate — and unlike the behavioural chat tiers it has teeth,
      because the free fake (random vectors) is CAUGHT, not escaped: clearing it needs
      a real embedder. Per-(host, model), negative-only, same as the rest.
+  5. SYNTHETIC DIGEST (built, structural): the second signal with teeth, orthogonal to
+     1-4. Where the fingerprint catches CLONES (shared real timestamps), this catches
+     FABRICATORS (a catalog minted from a rolling counter — non-random valid-hex
+     digests). Zero queries, already-pulled /api/tags, PER-HOST (the whole inventory is
+     the costume, nothing real to rescue) -> hard host-wide mark. Still a tripwire:
+     random-looking digests are free, so a careful fabricator escapes to "unknown";
+     cheap enough to always run anyway, and it nails the current parrot-everything crop
+     that also stalls agentic runs.
 
 --------------------------------------------------------------------------------
 OPEN: PER-HOST vs PER-(HOST, MODEL)  (revisit — new evidence)

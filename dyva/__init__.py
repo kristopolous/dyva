@@ -10740,48 +10740,40 @@ def _trycloudflare_fold(model_hosts):
     return tunnel_only, host_union
 
 
-async def handle_dashboard_models(request):
-    """
-    Dashboard models (JSON)
-    ---
-    tags: [UI]
-    summary: Normalized server list (each host once) for client-side model/host rendering
-    responses:
-      '200':
-        description: Server list with per-host service, models, and checked time
-        content:
-          application/json:
-            schema:
-              type: object
-    """
+# Pool-derived dashboard rows (the SLOW half), memoized per re-source. Scanning every
+# host's catalog, hiding junk/stub/imposter names, folding tunnels + rename families, and
+# classifying every distinct name depends ONLY on the sourced pool (free-ollama.json) and
+# the survey — both change at refresh time, not per request — so build it once and reuse
+# it until the next re-source. This was ~1s of CPU on EVERY request (13k hosts, 72k model
+# instances), including every 304, since the body was fully rebuilt just to hash the ETag.
+# Pool HEALTH (good/bad) is live and is NOT cached here — the handler overlays it per
+# request from a cheap GROUP BY. Keyed on _servers_loaded_at, which load_servers() re-stamps
+# every time it re-reads the (invalidated) cache file.
+_dashmodels_cache = None   # (servers_loaded_at, rows_no_health, sizes, kind)
+
+
+def _dashboard_model_rows():
+    """(rows, sizes, kind) for the dashboard, memoized per re-source. `rows` carry NO
+    good/bad — the handler overlays live reputation. Rebuilt only when the pool cache is
+    reloaded (_servers_loaded_at changes); the survey is process-static, so it needs no key."""
+    global _dashmodels_cache
     servers = load_servers()
-    # Key by MODEL, not by host: the client sorts/facets/filters on aggregates
-    # (how many hosts, how many good/bad), never on the host IPs — those are fetched
-    # on demand (see /dashboard-model-hosts). This turns an (hosts x their models)
-    # payload — the whole private inventory — into one small row per distinct model.
-    # Per-model GGUF digest from the survey (same /api/tags digest graflex already
-    # records). Renamed junk — probe_zz_*, sysverify-*, zzc_* — is the same base
-    # re-uploaded under throwaway names, so its members share one digest; we use
-    # that to collapse the family into a single row below.
+    if _dashmodels_cache is not None and _dashmodels_cache[0] == _servers_loaded_at:
+        return _dashmodels_cache[1], _dashmodels_cache[2], _dashmodels_cache[3]
+    # Per-model GGUF digest from the survey. Renamed junk — probe_zz_*, sysverify-*, zzc_*
+    # — is the same base re-uploaded under throwaway names, so its members share one
+    # digest; we use that to collapse the family into a single row below.
     survey = load_survey()
 
     def _model_digest(name):
         r = survey.get(name)
         return (r.get("digest") if isinstance(r, dict) else None) or None
 
-    # A sha256 GGUF digest is a model's IDENTITY; a REAL model reports a plausible
-    # (>=1MB) disk size under some name sharing that digest (survey records `size`
-    # only from >=1MB sightings). Byte-sized stubs that carry a digest but NEVER a
-    # real size at any name are exploit/honeypot artifacts — cve-*-probe:latest,
-    # ...free.pinggy.net/.../leak_model, .../ns/read (parameter_size "0"/"66K",
-    # sizes of a few bytes). They stay in the survey (signal about the host) but
-    # are NOT usable models, so we drop them from the listing. Guard: a model is
-    # dropped only if it has a digest AND that digest is never real anywhere;
-    # no-digest models (openai/vllm/llama.cpp backends report none) and any model
-    # ever >=1MB are always kept, so no real model is hidden — a junk NAME that
-    # merely re-registers a real digest is kept and collapses into the real row.
-    # (Needs survey.json rebuilt with the size-independent digest vote; on an older
-    # survey digest<->size are coupled, so this drops nothing — a safe no-op.)
+    # A sha256 GGUF digest is a model's IDENTITY; a REAL model reports a plausible (>=1MB)
+    # disk size under some name sharing that digest. Byte-sized stubs that carry a digest
+    # but NEVER a real size at any name are exploit/honeypot artifacts — dropped from the
+    # listing (kept in the survey as host signal). No-digest models (openai/vllm/llama.cpp)
+    # and anything ever >=1MB are always kept, so no real model is hidden.
     real_digest = {str(r["digest"]).lower()
                    for r in survey.values()
                    if isinstance(r, dict) and r.get("size") and r.get("digest")}
@@ -10802,12 +10794,9 @@ async def handle_dashboard_models(request):
         for m in s.get("models") or []:
             if not m:
                 continue
-            # Hidden from the listing but kept in the pool/survey as host signal:
-            #   * byte-sized exploit/honeypot stubs (digest never >=1MB),
-            #   * scanner-injected junk namespaces (rce.local/, cve-, probe_zz_*,
-            #     sysverify-*, zzc_*, free.pinggy, lima-*-poc-*, IP/attack paths),
-            #   * commercial-name imposters (claude/gpt/gemini spoofs, no open base).
-            # None are usable models; listing them just buries the real pool.
+            # Hidden from the listing but kept in the pool/survey as host signal: byte-sized
+            # exploit/honeypot stubs, scanner-injected junk namespaces, commercial-name
+            # imposters. None are usable models; listing them just buries the real pool.
             if (_is_stub(m) or _is_junk_model(m) or _is_fake_name(m)
                     or _is_commercial_imposter(m)):
                 continue
@@ -10822,14 +10811,6 @@ async def handle_dashboard_models(request):
             if dg:
                 dig_members.setdefault(dg, set()).add(m)
                 dig_hosts.setdefault(dg, set()).add(host)
-    # Complete good/bad host counts per model straight from the reputation DB — one
-    # GROUP BY, and unlike the dashboard-data panes these aren't a truncated slice,
-    # so the coverage bars are exact again.
-    gb = {}
-    for model, state, n in _get_db().execute(
-            f"SELECT model, state, COUNT(*) FROM host_status "
-            f"WHERE state IN ('good','bad') AND {_LIVE_REAL} GROUP BY model, state").fetchall():
-        gb.setdefault(model, {})[state] = n
     # Fold the ephemeral tunnels FIRST: every model that lives only on *.trycloudflare.com
     # drops out of the per-model view and the GGUF families (so a tunnel's churn can't
     # inflate a real family's host count) and is replaced by one synthetic row below.
@@ -10842,14 +10823,11 @@ async def handle_dashboard_models(request):
             if not dig_members[dg]:
                 dig_members.pop(dg, None)
                 dig_hosts.pop(dg, None)
-    # Collapse rename families: when FAMILY_MIN+ distinct model NAMES share one GGUF
-    # digest, they're one base under junk names — emit a SINGLE row instead of
-    # hundreds. The surviving row is keyed on a real member name (so the host
-    # drill-down still resolves) and carries `aka` = how many names folded in; its
-    # host count is the UNION across the family. The representative is the
-    # most-served member (ties broken by name) so the row is as "real" as the data
-    # allows. Image checkpoints never carry a GGUF digest, so they're never touched.
-    # (Labeling the row with the true base name is a separate, later layer.)
+    # Collapse rename families: when FAMILY_MIN+ distinct model NAMES share one GGUF digest,
+    # they're one base under junk names — emit a SINGLE row keyed on a real member name (so
+    # the host drill-down still resolves), carrying `aka` = how many names folded in and a
+    # host count that is the UNION across the family. The representative is the most-served
+    # member (ties broken by name). Image checkpoints never carry a GGUF digest, so untouched.
     FAMILY_MIN = 3
     labels = load_gguf_labels()   # digest -> real base name, when known (curated)
     collapsed = {}      # member name -> representative name (the row that survives)
@@ -10862,14 +10840,12 @@ async def handle_dashboard_models(request):
                          "label": labels.get(dg.lower())}
         for n in members:
             collapsed[n] = rep
-    out = []
+    rows = []           # NO good/bad — overlaid live in the handler
     for m, a in agg.items():
         rep = collapsed.get(m)
         if rep is not None and rep != m:
             continue   # folded into its family's representative row
-        c = gb.get(canon_pattern(m), {})
-        _row = {"id": m, "count": a["count"], "image": a["image"],
-                "good": c.get("good", 0), "bad": c.get("bad", 0)}
+        _row = {"id": m, "count": a["count"], "image": a["image"]}
         fm = fam_meta.get(m)
         if fm:
             _row["count"] = fm["count"]
@@ -10878,24 +10854,17 @@ async def handle_dashboard_models(request):
                 _row["label"] = fm["label"]
         if a["image"] and is_nsfw_model(m):   # label image checkpoints only
             _row["nsfw"] = True
-        out.append(_row)
-    # One synthetic row standing in for every tunnel-only model: `aka` is how many names
-    # folded in, `count` how many distinct tunnels they came from, `tunnel` lets the
-    # client label it for what it is. Emitted only when there's something to fold.
+        rows.append(_row)
+    # One synthetic row standing in for every tunnel-only model: `aka` = how many names
+    # folded in, `count` = how many distinct tunnels, `tunnel` lets the client label it.
     if tunnel_only:
-        out.append({"id": "trycloudflare.com", "count": len(tcf_hosts), "image": False,
-                    "good": 0, "bad": 0, "aka": len(tunnel_only), "tunnel": True})
-    # ship the survey's per-model sizes so the client filter understands ">10gb",
-    # and the release-date lookup so it understands ">2026-02" (fuzzy-matched
-    # client-side, same as the server does for routing).
-    sizes = {name: rec["size"] for name, rec in load_survey().items()
+        rows.append({"id": "trycloudflare.com", "count": len(tcf_hosts), "image": False,
+                     "aka": len(tunnel_only), "tunnel": True})
+    # Survey per-model sizes (client ">10gb" filter) and the raw classifier KIND per
+    # distinct name (image/image_edit/edit/lora/vision/video/music/audio/other). The RAW
+    # first-match category, NOT model_classes() — the fidelity the image pane's facet needs.
+    sizes = {name: rec["size"] for name, rec in survey.items()
              if isinstance(rec, dict) and rec.get("size")}
-    # Per-model KIND straight from the hand-curated classifier (CLASSIFIER_FILE ==
-    # graflex/model-classifier.json). This is the RAW first-match category
-    # (image / image_edit / edit / lora / vision / video / music / audio / other),
-    # NOT model_classes() — which consolidates image_edit and drops support assets
-    # (lora/vae/encoder), the very fidelity the image pane's kind facet needs. Text
-    # models don't match any pattern, so this stays scoped to the media/comfy set.
     kind, _seen = {}, set()
     for s in servers:
         for m in s.get("models") or []:
@@ -10905,16 +10874,55 @@ async def handle_dashboard_models(request):
             c = classify_model(m)
             if c:
                 kind[m] = c
-    # Universal MIN_COUNT floor: show only models served by AT LEAST MIN_COUNT hosts,
-    # on the dashboard too (it was listings-only before). Applied to the final rows so it
-    # respects folded family/tunnel counts (host UNION), which is the honest host coverage.
-    # 1 = show all; 2+ hides one-offs. Same rule as listed_models(); keeps the two in sync.
+    _dashmodels_cache = (_servers_loaded_at, rows, sizes, kind)
+    return rows, sizes, kind
+
+
+async def handle_dashboard_models(request):
+    """
+    Dashboard models (JSON)
+    ---
+    tags: [UI]
+    summary: Normalized server list (each host once) for client-side model/host rendering
+    responses:
+      '200':
+        description: Server list with per-host service, models, and checked time
+        content:
+          application/json:
+            schema:
+              type: object
+    """
+    # Slow, pool-derived half: memoized, rebuilt only when the pool is re-sourced.
+    rows, sizes, kind = _dashboard_model_rows()
+    # Live half: good/bad coverage straight from the reputation DB — one GROUP BY, exact
+    # (not a truncated slice). Overlaid per request so the bars stay current even though the
+    # rows above are cached. canon_pattern(id) matches the per-(host,model) status rows.
+    gb = {}
+    for model, state, n in _get_db().execute(
+            f"SELECT model, state, COUNT(*) FROM host_status "
+            f"WHERE state IN ('good','bad') AND {_LIVE_REAL} GROUP BY model, state").fetchall():
+        gb.setdefault(model, {})[state] = n
+    out = []
+    for r in rows:
+        c = gb.get(canon_pattern(r["id"]), {})
+        out.append({**r, "good": c.get("good", 0), "bad": c.get("bad", 0)})
+    # Universal MIN_COUNT floor: show only models served by AT LEAST MIN_COUNT hosts, on the
+    # dashboard too. Applied to the final rows so it respects folded family/tunnel counts
+    # (host UNION). 1 = show all; 2+ hides one-offs. Same rule as listed_models().
     if MIN_COUNT > 1:
         out = [r for r in out if r.get("count", 0) >= MIN_COUNT]
+    # Trim the companion maps to the models we actually ship: `sizes`/`kind` are built over
+    # the whole surveyed name universe (~2x the shown rows — folded members, hidden junk),
+    # but the client only looks them up by a displayed row id. Pruning roughly halves the
+    # payload with no visible change. (`dates`/`params` are small, keyed differently — kept.)
+    shown = {r["id"] for r in out}
+    sizes = {k: v for k, v in sizes.items() if k in shown}
+    kind = {k: v for k, v in kind.items() if k in shown}
     body = json.dumps({"models": out, "sizes": sizes, "dates": _load_release_dates(),
                        "params": _load_ollama_params(), "kind": kind})
-    # This payload is large but changes slowly; serve it with an ETag so the
-    # browser revalidates and gets a tiny 304 instead of re-downloading it.
+    # Changes slowly; the ETag lets the browser revalidate to a tiny 304. The expensive
+    # body build is now memoized (above), so producing this ETag no longer costs ~1s of
+    # CPU per request — a 304 is cheap on both ends now, not just the wire.
     etag = '"' + hashlib.md5(body.encode("utf-8")).hexdigest() + '"'
     if request.headers.get("If-None-Match") == etag:
         return web.Response(status=304, headers={"ETag": etag, "Cache-Control": "no-cache"})
