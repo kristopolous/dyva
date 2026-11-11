@@ -5412,20 +5412,24 @@ function flushQueuedAsSend(chatId){
 }
 async function sendChat(){
   hideSlashPop(false);
-  if(genOf(currentChat.id)){
-    // Already generating — queue the message instead of dropping it. It reaches the
-    // model at the next tool-result boundary, or as the next turn when this one ends.
-    var _qt=document.getElementById('chatInput').value.trim();
-    if(_qt){ queuePush(currentChat.id,_qt); document.getElementById('chatInput').value=''; refreshSendButton(); }
-    return;
-  }
-  var model=document.getElementById('chatModel').value.trim();
   var input=document.getElementById('chatInput');
   var text=input.value.trim();
   if(!text)return;
+  // Slash commands are local UI actions (/list, /next, /download…), not messages to the
+  // model — run them immediately, even mid-generation, so a command like /list shows at
+  // once instead of landing in the steering queue. A command that returns false has
+  // rewritten the input into a turn to actually send (/info → __dyva_info__), so it
+  // falls through to the send/queue path below.
   if(handleSlashCommand(text)){input.value='';return;}
   text=input.value.trim();   // a command may rewrite the input (e.g. /info → __dyva_info__)
   if(!text)return;
+  if(genOf(currentChat.id)){
+    // Already generating — queue the message instead of dropping it. It reaches the
+    // model at the next tool-result boundary, or as the next turn when this one ends.
+    queuePush(currentChat.id,text); input.value=''; refreshSendButton();
+    return;
+  }
+  var model=document.getElementById('chatModel').value.trim();
   pushHist(text);
   if(!model){
     model='*';
@@ -5563,6 +5567,9 @@ async function runStream(chatId,chatCreated,chatTitle,model,msgs,bubble,depth,ex
           // fill optional fields with plausible-looking nonsense
           var gm=String(args.model||'').trim();
           if(gm&&gm.length<80)ib.model=gm;
+          // Output shape, same buckets as edit_image; the server maps it to width/height.
+          var gasp=String(args.aspect||'').trim().toLowerCase();
+          if(gasp==='long'||gasp==='square'||gasp==='tall')ib.aspect=gasp;
           var r2=await fetch('sdapi/v1/txt2img',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(ib),signal:ac.signal});
           if(r2.ok){
             var j=await r2.json();
@@ -6205,40 +6212,40 @@ async function runStream(chatId,chatCreated,chatTitle,model,msgs,bubble,depth,ex
             }
           }catch(ex){if(ac.signal.aborted)return;results.push({text:'Could not search chats ('+ex.message+'). Try again shortly.'});}
         }
-      }else if(fn.name==='get_param'){
+      }else if(fn.name==='get_server_param'){
         setStatus('reading settings…');
         try{
           var _gps=await fetch('settings',{headers:adminHeaders(),cache:'no-store',signal:ac.signal});
-          if(_gps.status===403){results.push({text:'Not signed in to Settings — ask the user to open Settings and enter the admin password, then try again.',md:'`get_param` — not authenticated'});}
+          if(_gps.status===403){results.push({text:'Not signed in to Settings — ask the user to open Settings and enter the admin password, then try again.',md:'`get_server_param` — not authenticated'});}
           else if(!_gps.ok){results.push({text:'Could not read settings (HTTP '+_gps.status+').'});}
           else{
             var _gpv=await _gps.json();
             var _gpn=String(args.name||'').trim();
             if(!_gpn){
               var _gpl=DYVA_PARAMS.map(function(p){return '- '+p.label+' ('+p.key+') = '+JSON.stringify(_gpv[p.key])}).join('\n');
-              results.push({text:'Settable parameters (call set_param to change one):\n'+_gpl,md:'`get_param` → '+DYVA_PARAMS.length});
+              results.push({text:'Settable parameters (call set_server_param to change one):\n'+_gpl,md:'`get_server_param` → '+DYVA_PARAMS.length});
             }else{
               var _gpp=_dyvaParam(_gpn);
-              if(!_gpp)results.push({text:'No settable parameter "'+_gpn+'". Call get_param with no name to list them.'});
-              else results.push({text:_gpp.label+' ('+_gpp.key+') = '+JSON.stringify(_gpv[_gpp.key])+'\n'+_gpp.desc,md:'`get_param` '+_gpp.key});
+              if(!_gpp)results.push({text:'No settable parameter "'+_gpn+'". Call get_server_param with no name to list them.'});
+              else results.push({text:_gpp.label+' ('+_gpp.key+') = '+JSON.stringify(_gpv[_gpp.key])+'\n'+_gpp.desc,md:'`get_server_param` '+_gpp.key});
             }
           }
         }catch(ex){if(ac.signal.aborted)return;results.push({text:'Could not read settings ('+ex.message+').'});}
-      }else if(fn.name==='set_param'){
+      }else if(fn.name==='set_server_param'){
         var _spp=_dyvaParam(args.name);
-        if(!_spp){results.push({text:'No settable parameter "'+String(args.name||'')+'". Call get_param with no name to list them.'});}
+        if(!_spp){results.push({text:'No settable parameter "'+String(args.name||'')+'". Call get_server_param with no name to list them.'});}
         else{
           var _spv=_coerceParam(_spp.type,args.value);
           if(_spv===undefined){results.push({text:'"'+String(args.value)+'" is not a valid '+_spp.type+' value for '+_spp.label+'.'});}
-          else if(typeof confirm==='function'&&!confirm('Change '+_spp.label+' to '+_spv+'?')){results.push({text:'The user declined to change '+_spp.label+'.',md:'`set_param` '+_spp.key+' — cancelled'});}
+          else if(typeof confirm==='function'&&!confirm('Change '+_spp.label+' to '+_spv+'?')){results.push({text:'The user declined to change '+_spp.label+'.',md:'`set_server_param` '+_spp.key+' — cancelled'});}
           else{
             setStatus('saving setting…');
             try{
               var _spb={};_spb[_spp.key]=_spv;
               var _spr=await fetch('settings',{method:'POST',headers:adminHeaders({'Content-Type':'application/json'}),body:JSON.stringify(_spb),signal:ac.signal});
-              if(_spr.status===403)results.push({text:'Not signed in to Settings — ask the user to open Settings and enter the admin password, then try again.',md:'`set_param` — not authenticated'});
+              if(_spr.status===403)results.push({text:'Not signed in to Settings — ask the user to open Settings and enter the admin password, then try again.',md:'`set_server_param` — not authenticated'});
               else if(!_spr.ok)results.push({text:'Could not set '+_spp.label+' (HTTP '+_spr.status+').'});
-              else results.push({text:_spp.label+' is now '+_spv+'.',md:'`set_param` '+_spp.key+' = '+_spv,keep:'['+_spp.key+' set to '+_spv+']'});
+              else results.push({text:_spp.label+' is now '+_spv+'.',md:'`set_server_param` '+_spp.key+' = '+_spv,keep:'['+_spp.key+' set to '+_spv+']'});
             }catch(ex){if(ac.signal.aborted)return;results.push({text:'Could not set '+_spp.label+' ('+ex.message+').'});}
           }
         }
@@ -6959,7 +6966,7 @@ function _calcEval(expr){
   var r=_calcMath.evaluate(String(expr||''));
   return (r&&r.toString)?r.toString():String(r);
 }
-var IMG_TOOL={type:'function',function:{name:'generate_image',description:'Generate an image from a text description. Use when the user asks to create, draw, or render a picture.',parameters:{type:'object',properties:{prompt:{type:'string',description:'Detailed description of the image to generate'},negative_prompt:{type:'string',description:'Things to avoid in the image'},model:{type:'string',description:'The checkpoint to render with. If the user names a model, family, or style \u2014 e.g. "dreamshaper", "flux", "juggernaut" \u2014 put it HERE, as a substring or glob ("dreamshaper*" matches dreamshaper_8.safetensors), and do NOT mention the model in the prompt. Leave blank only when the user did not name one, to auto-pick the best available. Never invent a model name; use search_models if unsure what exists.'},name:{type:'string',description:'A short filename to save the result under, so it can be referred to later, e.g. "beautiful_garden.jpg". Lowercase, no spaces. Choose something descriptive of the content.'}},required:['prompt','name']}}};
+var IMG_TOOL={type:'function',function:{name:'generate_image',description:'Generate an image from a text description. Use when the user asks to create, draw, or render a picture.',parameters:{type:'object',properties:{prompt:{type:'string',description:'Detailed description of the image to generate'},negative_prompt:{type:'string',description:'Things to avoid in the image'},model:{type:'string',description:'The checkpoint to render with. If the user names a model, family, or style \u2014 e.g. "dreamshaper", "flux", "juggernaut" \u2014 put it HERE, as a substring or glob ("dreamshaper*" matches dreamshaper_8.safetensors), and do NOT mention the model in the prompt. Leave blank only when the user did not name one, to auto-pick the best available. Never invent a model name; use search_models if unsure what exists.'},name:{type:'string',description:'A short filename to save the result under, so it can be referred to later, e.g. "beautiful_garden.jpg". Lowercase, no spaces. Choose something descriptive of the content.'},aspect:{type:'string',enum:['long','square','tall'],description:'Optional output shape: "long" is landscape (16:9), "square" is 1:1, "tall" is portrait (9:16). Omit for the default square image — only set it when the user asks for a particular shape.'}},required:['prompt','name']}}};
 var EDIT_TOOL={type:'function',function:{name:'edit_image',description:'Edit one image, combine several, or generate a fresh image on an edit-class model (Flux.2 and similar do text-to-image too \u2014 no reference needed). Use for "make it night", "put a hat on the dog", "remove the background", and for "add this lady to the garden" \u2014 in that last case pass BOTH pictures in `images`. Leave `images` out to work on the most recent image (an incremental tweak), or when there is no image at all to generate from the prompt. Call list_assets first if you need to know what the pictures are called.',parameters:{type:'object',properties:{prompt:{type:'string',description:'What to change, e.g. "put a feathered cap on the dog"'},images:{type:'array',items:{type:'string'},description:'Asset names to work from, e.g. ["lady.jpg","garden.jpg"], in the order they should be used \u2014 the first is the picture being changed, the rest are references drawn from. Omit entirely to use the most recent image. Names come from list_assets; do not invent them.'},name:{type:'string',description:'A short filename to save the result under, so it can be referred to later, e.g. "garden_with_lady.jpg". Lowercase, no spaces. Choose something descriptive of the content.'},model:{type:'string',description:'The edit model to use. If the user names one, put it HERE as a substring or glob (globs work, e.g. "flux*2") \u2014 not in the prompt. Leave blank to auto-pick the best available. Never invent a model name; use search_models (type "edit") if unsure.'},aspect:{type:'string',enum:['long','square','tall'],description:'Optional output shape: "long" is landscape (16:9), "square" is 1:1, "tall" is portrait (9:16). Omit to keep the source image\u2019s own proportions \u2014 only set it when the user asks for a different shape.'},size:{type:'string',enum:['small','medium','large'],description:'Optional output resolution bucket; "small" renders faster. Omit for the default (medium).'}},required:['prompt','name']}}};
 // The image to edit is known deterministically, so the model never picks it:
 // walk back through the conversation and take whichever came last, a generated
@@ -7031,7 +7038,12 @@ function askUser(question,options,signal){
     function sendOther(){var v=inp.value.trim();if(v)answer(v)}
     go.addEventListener('click',sendOther);
     inp.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();sendOther()}});
-    other.appendChild(inp);other.appendChild(go);
+    // Skip: decline the question so the model proceeds on its own judgment, instead of
+    // forcing an answer (or cancelling the whole turn). Same row, after Send.
+    var skip=document.createElement('button');skip.type='button';skip.className='ask-opt';skip.textContent='Skip';
+    skip.style.flex='0 0 auto';
+    skip.addEventListener('click',function(){answer('(skipped — no answer; use your best judgment)')});
+    other.appendChild(inp);other.appendChild(go);other.appendChild(skip);
     card.appendChild(other);
     chatLog.appendChild(card);scrollChat(true);
     setTimeout(function(){inp.focus()},0);
@@ -7239,8 +7251,8 @@ var GET_DOC_SECTION_TOOL={type:'function',function:{name:'get_doc_section',descr
 // carries a short snippet and a markdown link to open that chat.
 var SEARCH_CHATS_TOOL={type:'function',function:{name:'search_chats',description:'Search the user’s past conversations for a word or phrase. Each hit comes back with a short context snippet and a markdown link to open that chat — use it when the user is trying to find or remember an earlier conversation.',parameters:{type:'object',properties:{query:{type:'string',description:'Words to look for across the user’s saved chats.'}},required:['query']}}};
 // ADMIN tools (server enforces X-Admin-Key; a 403 means "not signed in to Settings").
-// get_param/set_param drive the existing /settings endpoint; set_param confirms first.
-// The settable whitelist + descriptions live here, so set_param can only touch these.
+// get_server_param/set_server_param drive the existing /settings endpoint; set_server_param confirms first.
+// The settable whitelist + descriptions live here, so set_server_param can only touch these.
 var DYVA_PARAMS=[
   {key:'workers',label:'Worker count',type:'int',desc:'Max concurrent upstream requests (1–200). Higher = more parallelism and more load.'},
   {key:'timeout',label:'Request timeout (s)',type:'int',desc:'Per-request upstream timeout in seconds (1–600).'},
@@ -7258,8 +7270,8 @@ function _coerceParam(type,v){
   if(type==='num'){var f=parseFloat(v);return isNaN(f)?undefined:f;}
   return String(v);
 }
-var GET_PARAM_TOOL={type:'function',function:{name:'get_param',description:'Read a dyva runtime setting and its description (admin only). Call with no name to list the settable parameters and their current values.',parameters:{type:'object',properties:{name:{type:'string',description:'The parameter name or label. Omit to list them all.'}},required:[]}}};
-var SET_PARAM_TOOL={type:'function',function:{name:'set_param',description:'Change a dyva runtime setting (admin only). The user is shown a confirmation before it takes effect.',parameters:{type:'object',properties:{name:{type:'string',description:'The parameter to change (name or label).'},value:{type:'string',description:'The new value.'}},required:['name','value']}}};
+var GET_PARAM_TOOL={type:'function',function:{name:'get_server_param',description:'Read a dyva runtime setting and its description (admin only). Call with no name to list the settable parameters and their current values.',parameters:{type:'object',properties:{name:{type:'string',description:'The parameter name or label. Omit to list them all.'}},required:[]}}};
+var SET_PARAM_TOOL={type:'function',function:{name:'set_server_param',description:'Change a dyva runtime setting (admin only). The user is shown a confirmation before it takes effect.',parameters:{type:'object',properties:{name:{type:'string',description:'The parameter to change (name or label).'},value:{type:'string',description:'The new value.'}},required:['name','value']}}};
 var DO_ACTION_TOOL={type:'function',function:{name:'do_action',description:'Run an operator action on this dyva server (admin only): "update_sources" re-pulls host sources and reloads the pool; "read_logs" returns a tail of today’s log; "analyze_workers" summarises the running races; "query" runs a READ-ONLY SQL SELECT against a dyva database (stats, host_status, chats).',parameters:{type:'object',properties:{action:{type:'string',enum:['update_sources','read_logs','analyze_workers','query'],description:'Which action to run.'},db:{type:'string',enum:['stats','host_status','chats'],description:'For query: which database to read.'},sql:{type:'string',description:'For query: a single read-only SELECT statement.'},lines:{type:'integer',description:'For read_logs: how many trailing lines (default 60).'}},required:['action']}}};
 // Render a tool's parameters as doc lines, expanding nested object / array-item
 // schemas (e.g. spawn_agents' per-agent name/task/model) — the blanked terse

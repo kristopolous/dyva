@@ -376,7 +376,9 @@ SHODAN_PAGES = 2
 # ZoomEye's JSON search API. The session cookie is a SECRET, read only from the
 # environment (ZOOMEYE_COOKIE in .env) — never hard-code it or commit it.
 ZOOMEYE_API = "https://www.zoomeye.ai/api/search"
-# ZoomEye serves only the first ~250 results (pageSize 50 -> 5 pages); page 6+ errors.
+# ZoomEye only serves pages 1-5 (page 6+ errors). Without a pageSize param the API
+# returns its default 10 results/page, so a query now tops out at ~50 results (was
+# ~250 when pageSize=50 was accepted — see _fetch_zoomeye).
 ZOOMEYE_MAX_PAGES = 5
 # Always constrain to hosts SEEN in the last N days (after=today-N, before=future),
 # so the limited points budget is spent on fresh, likelier-alive hosts.
@@ -489,6 +491,7 @@ SERVICE_CONFIG = {
         "port": 8188,
         "fofa_query": 'title="ComfyUI"',
         "shodan_query": 'http.title:"ComfyUI"',
+        "zoomeye_query": 'app="comfyui"',
         "check_path": "/models/checkpoints",
         "stats_path": "/api/system_stats",
     },

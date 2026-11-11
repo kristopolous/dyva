@@ -6757,6 +6757,18 @@ async def _race_hosts(entries, attempt, key, job_wid=None, workers=None, host_of
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
     finally:
+        # Guaranteed teardown on EVERY exit path — including a cancellation that lands
+        # while the finalization loop above is awaiting (sleep/queue poll). Before this,
+        # a cancel there skipped the in-try teardown (6754-6758) and jumped straight here,
+        # orphaning the watchdog: `done` stayed clear, so it logged "still searching"
+        # for hours, and the worker tasks ran on un-cancelled until the pool drained.
+        # (checked=-1 in those logs = the worker record was already unregistered below
+        # while the watchdog still ran.) done.set()/cancel are idempotent, so the happy
+        # path repeating them is harmless.
+        done.set()
+        _wd.cancel()
+        for _t in tasks:
+            _t.cancel()
         # Stash this race's per-host log onto the worker rather than writing a
         # record here. A record is written ONCE, when the worker COMPLETES (in
         # _unregister_worker) — so it's a record of the whole JOB (all continuation
@@ -14614,6 +14626,18 @@ async def handle_txt2img(request):
     model_filter = body.pop("model", None)
     requested_model = model_filter or ""
     activity_label = (model_filter or body.get("prompt", "txt2img"))[:60]
+
+    # Optional output shape (long/square/tall), the text-to-image mirror of
+    # edit_image's `aspect`. Map it to width/height here so BOTH the A1111
+    # passthrough and the ComfyUI path honor it; an explicit width/height from the
+    # caller always wins. Anchored on the same 512 budget as the default square, so
+    # "square" stays 512x512 and only the shape changes (snapped to a 64px grid).
+    _asp = str(body.pop("aspect", "") or "").strip().lower()
+    if _asp in VIDEO_ASPECTS and not body.get("width") and not body.get("height"):
+        _ratio = VIDEO_ASPECTS[_asp]
+        _budget = 512 * 512
+        body["width"] = max(64, int(round(math.sqrt(_budget * _ratio) / 64)) * 64)
+        body["height"] = max(64, int(round(math.sqrt(_budget / _ratio) / 64)) * 64)
 
     # One worker for the whole request. Without this the sticky-host fast path
     # below served images with no card in the Workers pane at all — only the
