@@ -303,6 +303,7 @@ body.chat{height:100vh;height:100dvh}
 .status-connected{color:var(--ok)}
 .status-failed{color:var(--err)}
 .status-warming{color:var(--warn)}
+.status-affinity{color:#8b5cf6}
 .status-abandoned{color:var(--text-faint)}
 .content-line{padding:2px 0;color:var(--text-2)}
 .done-line{color:var(--text-faint);font-style:italic}
@@ -662,9 +663,9 @@ button:hover{background:var(--btn-bg-hover)}
 button:disabled{opacity:.5;cursor:default}
 button.stop{background:var(--btn-danger)}
 button.stop:hover{background:var(--btn-danger-hover)}
-.messages{border:1px solid var(--border);border-radius:var(--r-lg);background:var(--bg-sunken);height:46vh;overflow-y:auto;overflow-anchor:none;padding:.75em;margin-bottom:.75em}
+.messages{border-radius:0;height:46vh;overflow-y:auto;overflow-anchor:none}
 .msg{margin-bottom:.75em}
-.msg .role{font-size:var(--fs-2xs);color:var(--text-dim);text-transform:uppercase;letter-spacing:var(--eyebrow-tracking);margin-bottom:.25em;display:flex;align-items:center;gap:.4em;position:relative}
+.msg .role{font-size:var(--fs-2xs);color:var(--text-dim);text-transform:uppercase;letter-spacing:var(--eyebrow-tracking);margin-bottom:.25em;display:flex;align-items:center;gap:.4em;position:relative;padding-left:0.7rem}
 .msg .role .role-meta{text-transform:none;letter-spacing:0;font-family:var(--font-mono);color:var(--text-faint);min-width:0;display:inline-flex;align-items:center;gap:.35em}
 .msg .role .role-meta .rm-text{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .msg .role .role-meta .copy-curl{flex-shrink:0}
@@ -674,7 +675,11 @@ button.stop:hover{background:var(--btn-danger-hover)}
 .msg .actions .act{cursor:pointer;color:var(--accent);font-size:1rem;line-height:1;height:1.5rem;min-width:1.5rem;margin:-.375rem 0;padding:0 4px;border-radius:var(--r-sm);user-select:none;display:inline-flex;align-items:center;justify-content:center}
 .msg .actions .act:hover{background:var(--accent-bg-active)}
 .msg .editbox{width:100%;min-height:3em;background:var(--bg-inset);border:1px solid var(--border-strong);border-radius:var(--r-md);color:var(--text);padding:.5em;font-size:var(--fs-md);font-family:var(--font-mono);outline:none;resize:vertical}
-.msg.user .role{color:var(--accent)}
+/* No "You" label on user rows, so pack the edit/retry buttons + timestamp to the right.
+   Zero the global .msg-time margin-left:auto here — two auto margins in one flex row split
+   the free space and strand .actions in the middle; justify-content:flex-end packs instead. */
+.msg.user .role{color:var(--accent);justify-content:flex-end}
+.msg.user .msg-time{margin-left:0}
 /* speak button: sits left of the ASSISTANT label, quiet until hovered */
 .speak-btn{flex-shrink:0;order:-1;background:none;border:none;padding:0;margin:0 .1em 0 0;color:var(--text-faint);cursor:pointer;display:flex;align-items:center;line-height:0}
 .speak-btn:hover{color:var(--accent)}
@@ -684,8 +689,8 @@ button.stop:hover{background:var(--btn-danger-hover)}
 @keyframes speakpulse{50%{opacity:.35}}
 .copy-btn.ok{color:var(--accent)}
 .msg .speak-out{margin-top:var(--sp-2);max-width:420px}
-.msg-time{margin-left:auto;color:var(--text-faint);font-size:var(--fs-2xs);letter-spacing:0;text-transform:none;font-weight:400;flex-shrink:0}
-.msg .body{background:var(--surface);border-radius:var(--r-lg);padding:.7em;font-size:var(--fs-lg);overflow-wrap:anywhere;line-height:var(--line-body)}
+.msg-time{margin-left:auto;color:var(--text-faint);font-size:var(--fs-2xs);letter-spacing:0;text-transform:none;font-weight:400;flex-shrink:0;margin-right:0.7rem}
+.msg .body{border-radius:var(--r-lg);padding:.7em;font-size:var(--fs-lg);overflow-wrap:anywhere;line-height:var(--line-body)}
 .msg .body .error{color:var(--err)}
 /* Wide math can't wrap (katex is white-space:nowrap); scroll it inside the
    bubble instead of letting it stretch the chat column, same as .body pre. */
@@ -697,8 +702,8 @@ button.stop:hover{background:var(--btn-danger-hover)}
 #snackbar{position:fixed;left:50%;bottom:var(--sp-6);transform:translateX(-50%) translateY(8px);display:flex;align-items:center;gap:10px;background:var(--surface);border:1px solid var(--border-strong);color:var(--text-2);border-radius:var(--r-lg);padding:10px var(--sp-5);font-size:var(--fs-md);box-shadow:var(--shadow-pop);z-index:250;opacity:0;pointer-events:none;transition:opacity .2s,transform .2s}
 #snackbar.show{opacity:1;transform:translateX(-50%) translateY(0)}
 #snackbar .snack-spin{width:14px;height:14px;border:2px solid var(--border-strong);border-top-color:var(--accent);border-radius:var(--r-full);animation:spin .8s linear infinite;flex-shrink:0}
-.msg.user .body{background:var(--a-900);white-space:pre-wrap}
-.msg.note{margin:.4em 0 .8em}
+.msg.user .body{background:var(--a-900);white-space:pre-wrap;max-width:80%;margin-left:auto;width:fit-content}
+.msg.note{padding-left:0.7rem;margin:.4em 0 .8em}
 .msg.note .body{background:transparent;border-left:2px solid var(--border-accent);border-radius:0;padding:.15em 0 .15em .7em;font-size:var(--fs-md);color:var(--text-dim)}
 .msg.note .note-cmd{display:block;font-family:var(--font-mono);font-size:var(--fs-2xs);color:var(--accent);letter-spacing:0;margin-bottom:.1em}
 .msg.note.err .body{border-left-color:var(--err)}
@@ -782,6 +787,7 @@ button.stop:hover{background:var(--btn-danger-hover)}
 .msg.assistant .body p{margin:.75em 0;line-height:1.43rem}
 .msg.assistant .body h1,.msg.assistant .body h2,.msg.assistant .body h3,.msg.assistant .body h4{margin:.7em 0 .3em}
 .msg.assistant .body hr{border:none;border-top:1px solid var(--border-strong);margin:.7em 0}
+.msg.assistant .body {padding-top:0}
 .input-row{display:flex;gap:var(--sp-3);align-items:stretch;position:relative}
 .mpick-wrap{position:relative}
 .mpick-pop{display:none;position:absolute;left:0;right:0;top:calc(100% + 4px);background:var(--surface);border:1px solid var(--border-strong);border-radius:var(--r-lg);box-shadow:var(--shadow-pop);padding:var(--sp-2);z-index:140;max-height:min(46vh,280px);overflow-y:auto;overscroll-behavior:contain}
@@ -850,9 +856,14 @@ details.toolbox>summary{cursor:pointer;color:var(--text-dim);font-size:var(--fs-
 .toolbox .tc-fn{font-family:var(--font-mono);font-size:var(--fs-sm);color:var(--text-2)}
 .toolbox pre.tc-args{white-space:pre-wrap;overflow-wrap:anywhere;font-family:var(--font-mono);font-size:var(--fs-2xs);border:0;background:var(--bg-inset);border-radius:var(--r-sm);padding:.4em .5em;margin:.2em 0 0;max-height:280px;overflow:auto}
 .toolbox pre.tc-args code{white-space:inherit;overflow-wrap:inherit;background:none;padding:0}
-.think-body{white-space:pre-wrap;color:var(--text-3);font-size:var(--fs-sm);line-height:var(--line-body);font-style:italic;margin-top:.3em;max-height:320px;overflow:auto}
+/* Thinking renders the same markdown as the answer (bold/lists/code), just muted and
+   smaller so it still reads as reasoning. Block spacing is inherited from .msg.assistant
+   .body; we only trim the leading/trailing margin inside the thinkbox. */
+.think-body{color:var(--text-3);font-size:var(--fs-sm);line-height:var(--line-body);margin-top:.3em;max-height:320px;overflow:auto}
+.think-body>:first-child{margin-top:0}
+.think-body>:last-child{margin-bottom:0}
 
-.chat-status{display:flex;align-items:center;gap:.45em;color:var(--text-dim);font-size:var(--fs-xs);font-style:italic;margin:.15em 0 .3em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.chat-status{padding-left:0.7rem;display:flex;align-items:center;gap:.45em;color:var(--text-dim);font-size:var(--fs-xs);font-style:italic;margin:.15em 0 .3em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .chat-status::before{content:'';flex-shrink:0;width:.6em;height:.6em;border:1.5px solid var(--border-strong);border-top-color:var(--accent);border-radius:var(--r-full);animation:spin .8s linear infinite}
 .chat-layout{display:flex;gap:0;flex:1;min-height:0}
 /* invisible drag gutters between sidebar|main and main|doc — they occupy what was
@@ -927,9 +938,8 @@ body.col-resizing,body.col-resizing *{cursor:col-resize!important;user-select:no
 .chat-item:hover .re{opacity:1}
 .chat-item .re:hover{color:var(--ok);filter:brightness(1.3)}
 .chat-main{position:relative;flex:1;display:flex;flex-direction:column;min-width:0;min-height:0}
-.tok-est{position:absolute;top:0;right:14px;z-index:6;font:11px/1 var(--font-mono);
-         color:var(--text-2);background:rgba(20,20,20,.5);padding:3px 8px;border-radius:1px;
-         pointer-events:none;white-space:nowrap}
+/* context-size estimate, shown in the tools menu's title row (not a floating overlay) */
+.tools-pop-title .tp-tok{font-family:var(--font-mono);color:var(--text-faint);text-transform:none;letter-spacing:0;font-weight:400;white-space:nowrap}
 .doc-panel{flex:1;min-width:0;display:flex;flex-direction:column;border:1px solid var(--border);border-radius:var(--r-lg);background:var(--bg-sunken);overflow:hidden}
 .doc-panel.doc-max{position:fixed;inset:0;z-index:200;border-radius:0}
 .doc-head{display:flex;align-items:center;gap:var(--sp-3);padding:var(--sp-3) 10px;border-bottom:1px solid var(--border);flex-shrink:0}
@@ -1372,7 +1382,6 @@ body.dragging-image .hist-item{cursor:grabbing}
 /* hardcoded #fff heading that would be invisible on a light surface */
 :root[data-theme="light"] .msg.note .note-text h4{color:var(--text)}
 /* token-count badge: hardcoded dark translucent chip -> a light one for light mode */
-:root[data-theme="light"] .tok-est{background:rgba(245,247,250,.72)}
 </style>
 </head>
 <body>
@@ -1496,7 +1505,6 @@ body.dragging-image .hist-item{cursor:grabbing}
 </div>
 <div class="col-resizer" id="sidebarResizer" title="Drag to resize"></div>
 <div class="chat-main">
-<div id="tokEst" class="tok-est" title="estimated context size (~words × 1.33; varies by model)"></div>
 <div id="chatMessages" class="messages"></div>
 <div class="composer">
 <div class="field">
@@ -1510,15 +1518,15 @@ body.dragging-image .hist-item{cursor:grabbing}
 <div class="tool-menu">
 <button id="chatTools" class="mp-tool" title="Tools" aria-haspopup="true"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"></path></svg></button>
 <div id="toolsPop" class="tools-pop">
-<div class="tools-pop-title">Tools <label class="tools-off" title="Send no tools at all — for models that don't support tool calls"><input type="checkbox" id="toolsOff"> disable all</label></div>
+<div class="tools-pop-title"><span>Tools <span id="tokEst" class="tp-tok" title="estimated context size (~words × 1.33; varies by model)">—</span></span> <label class="tools-off" title="Send no tools at all — for models that don't support tool calls"><input type="checkbox" id="toolsOff"> disable all</label></div>
 <label class="tool-opt"><input type="checkbox" id="toolImage"><span class="tool-txt"><b>Image</b><small>Generate and edit images</small></span></label>
 <label class="tool-opt"><input type="checkbox" id="toolVideo"><span class="tool-txt"><b>Video</b><small>Make a short video</small></span></label>
 <label class="tool-opt"><input type="checkbox" id="toolSpeech"><span class="tool-txt"><b>Speech</b><small>Speak dialog out loud</small></span></label>
 <label class="tool-opt"><input type="checkbox" id="toolWeb"><span class="tool-txt"><b>Web</b><small>Read a page at a URL</small></span></label>
-<label class="tool-opt"><input type="checkbox" id="toolHost"><span class="tool-txt"><b>Host access</b><small>Let the model request your location (your browser asks first)</small></span></label>
+<label class="tool-opt"><input type="checkbox" id="toolHost"><span class="tool-txt"><b>Host access</b><small>Let the model request your location</small></span></label>
 <label class="tool-opt"><input type="checkbox" id="toolAgents"><span class="tool-txt"><b>Sub-agents</b><small>Split a task across parallel agents</small></span></label>
 <label class="tool-opt"><input type="checkbox" id="toolDocs"><span class="tool-txt"><b>Documents</b><small>Write &amp; edit documents</small></span></label>
-<label class="tool-opt"><input type="checkbox" id="toolLinks"><span class="tool-txt"><b>Show links</b><small>Preview cards for links in replies (display only)</small></span></label>
+<label class="tool-opt"><input type="checkbox" id="toolDyva"><span class="tool-txt"><b>Dyva</b><small>Ask about dyva from its docs and search your past chats</small></span></label>
 </div>
 </div>
 <button id="docToggle" class="mp-tool" title="Documents" style="display:none"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg></button>
@@ -1908,12 +1916,12 @@ body.dragging-image .hist-item{cursor:grabbing}
 </div>
 <div class="settings-card">
 <div class="settings-card-title">Presentation<span class="dirty-flag">needs save</span></div>
-<label class="setting"><span class="setting-text"><span class="setting-name">Minimum model count</span><small class="setting-help">Hide models served by fewer than this many hosts from the <code>/api/tags</code> and <code>/v1/models</code> listings that third-party apps read. 0 = show all. (The dashboard always shows everything.)</small></span><input type="number" id="setMinCount" min="0" step="1"></label>
+<label class="setting"><span class="setting-text"><span class="setting-name">Minimum hosts per model</span><small class="setting-help">Show only models served by <b>at least</b> this many hosts &mdash; everywhere: the dashboard <b>and</b> the <code>/api/tags</code> / <code>/v1/models</code> listings third-party apps read. <b>1</b> = show all; <b>2</b> hides one-offs (models on a single host). Doesn't apply to an explicit model-list override.</small></span><input type="number" id="setMinCount" min="1" step="1"></label>
 <label class="setting"><span class="setting-text"><span class="setting-name">Base path</span><small class="setting-help">Serve dyva under a secret URL path instead of the root. A path like <code>/some-path</code> moves the dashboard to <code>/some-path/</code> and the API to <code>/some-path/v1/models</code> — deterrence by obscurity: a scanner hitting the default paths (<code>/v1/models</code>, <code>/api/tags</code>) finds nothing. Blank = served at the root. <b>Takes effect on restart</b> (like the listen port); the <code>--base</code> flag overrides this.</small></span><input type="text" id="setBasePath" placeholder="/some-path" spellcheck="false" autocomplete="off"></label>
 <label class="setting"><span class="setting-text"><span class="setting-name">Hide dyva</span><small class="setting-help">Serve the web dashboard only to real browsers. When on, a remote non-browser request for a page &mdash; <code>curl server:11434/</code>, a scanner, a bot &mdash; gets an empty <code>404</code> instead of the UI, so a drive-by probe sees nothing. Browsers (any <code>Mozilla/</code> user-agent) and localhost always get through, and the <code>/v1</code> and <code>/api</code> endpoints stay reachable to non-browser API clients. Off by default.</small></span><input type="checkbox" id="setHideDyva"></label>
 <label class="setting"><span class="setting-text"><span class="setting-name">Gossiper</span><small class="setting-help">Share high-confidence signals &mdash; starting with smoke-test results (real endpoint vs honeypot) &mdash; with peer dyva instances, scoped by source, so you skip re-probing a host a peer just characterized. The signal set expands conservatively over time. A peer's honeypot flag is trusted: the host is skipped without contact (re-verifying it would mean sending the trap a request &mdash; the exact thing the flag spares you). Privacy-bounded: a sync only reaches peers who already hold the same source URL. <b>On by default</b>; untick to opt out entirely.</small></span><input type="checkbox" id="setGossiperEnabled"></label>
 <label class="setting"><span class="setting-text"><span class="setting-name">Gossiper endpoint</span><small class="setting-help">The gossiper server to sync with. Defaults to the public reference instance; point it at your own, or clear it to run without one. Keep the trailing slash (a POST to the slashless form gets redirected and dropped).</small></span><input type="text" id="setGossiperUrl" placeholder="https://9ol.es/dyva/gossiper/" spellcheck="false" autocomplete="off"></label>
-<label class="setting"><span class="setting-text"><span class="setting-name">Model list override</span><small class="setting-help">Advertise a fixed list of model names from <code>/api/tags</code> and <code>/v1/models</code> instead of the discovered catalog, for tools that make you pick one specific model id. Every dyva model name is a routing pattern, so one entry like <code>qwen3</code> covers every <code>qwen3:*</code> variant on every host. Tick <b>Enabled</b> and put one name per line in the box below (blank lines and <code>#comments</code> are ignored). Untick to go back to the real catalog — the list stays in the box so you can flip it back on. Names no host currently serves stay listed (count 0) so the menu can't shift under a tool that pinned one. <b>Minimum model count</b> doesn't apply to an explicit list.</small></span><input type="checkbox" id="setModelListOn"></label>
+<label class="setting"><span class="setting-text"><span class="setting-name">Model list override</span><small class="setting-help">Advertise a fixed list of model names from <code>/api/tags</code> and <code>/v1/models</code> instead of the discovered catalog, for tools that make you pick one specific model id. Every dyva model name is a routing pattern, so one entry like <code>qwen3</code> covers every <code>qwen3:*</code> variant on every host. Tick <b>Enabled</b> and put one name per line in the box below (blank lines and <code>#comments</code> are ignored). Untick to go back to the real catalog — the list stays in the box so you can flip it back on. Names no host currently serves stay listed (count 0) so the menu can't shift under a tool that pinned one. <b>Minimum hosts per model</b> doesn't apply to an explicit list.</small></span><input type="checkbox" id="setModelListOn"></label>
 <textarea id="setModelList" class="src-textarea" spellcheck="false" placeholder="one model name per line (blank lines and #comments ignored)"></textarea>
 <div class="settings-actions"><span class="settings-status"></span><button type="button" class="settings-save">Save</button></div>
 </div>
@@ -4100,8 +4108,12 @@ function addMsg(role,text,index){
   }
   var d=document.createElement('div');d.className='msg '+role;
   var r=document.createElement('div');r.className='role';
-  var lbl=document.createElement('span');lbl.className='role-label';lbl.textContent=role==='user'?'You':'Assistant';
-  r.appendChild(lbl);
+  // User messages are right-justified and bubbled, so a "You" label is redundant; only
+  // the assistant keeps a role label (ASSISTANT + host/model meta via setAssistantLabel).
+  if(role!=='user'){
+    var lbl=document.createElement('span');lbl.className='role-label';lbl.textContent='Assistant';
+    r.appendChild(lbl);
+  }
   if(role==='assistant'&&index!==undefined){
     // read from the record, not the captured string, so it reflects edits
     r.appendChild(makeSpeakBtn(function(){
@@ -4235,7 +4247,7 @@ function splitThink(raw){
 }
 function thinkHtml(t,open){
   if(!t)return '';
-  return '<details class="thinkbox"'+(open?' open':'')+'><summary>thinking</summary><div class="think-body">'+escHtml(t)+'</div></details>';
+  return '<details class="thinkbox"'+(open?' open':'')+'><summary>thinking</summary><div class="think-body">'+mdRender(t)+'</div></details>';
 }
 // The tool calls a turn made, shown collapsed like the thinking block so you
 // can expand and inspect exactly what function ran with what parameters —
@@ -4287,7 +4299,11 @@ function mdRender(text){
   var out=String(text||'');
   var math=[];
   out=out.replace(/\$\$([\s\S]+?)\$\$/g,function(_,m){math.push({d:1,s:m});return 'katexmath'+(math.length-1)});
-  out=out.replace(/\$([^$\n]+?)\$/g,function(_,m){math.push({d:0,s:m});return 'katexmath'+(math.length-1)});
+  // Inline math, but don't eat currency: pandoc's guards — an opening $ not
+  // followed by a space, a closing $ not preceded by a space and not followed by
+  // a digit. So "$1,500", "$8,000-core", "$5 and $7" stay literal; "$x^2$" and
+  // even "$3.14$" still render.
+  out=out.replace(/\$(?!\s)([^$\n]*?[^$\n\s])\$(?!\d)/g,function(_,m){math.push({d:0,s:m});return 'katexmath'+(math.length-1)});
   if(window.marked){try{out=window.marked.parse(out)}catch(e){}}
   else{out=escHtml(out).replace(/\n/g,'<br>')}
   if(window.DOMPurify){try{out=window.DOMPurify.sanitize(out)}catch(e){}}
@@ -5005,7 +5021,7 @@ var TOOL_LABELS=[
 ];
 function _toolFlags(){
   return {imageOn:imageOn,videoOn:videoOn,speechOn:speechOn,
-          webOn:webOn,hostOn:hostOn,agentsOn:agentsOn,docsOn:docsOn,toolsOff:toolsOff};
+          webOn:webOn,hostOn:hostOn,agentsOn:agentsOn,docsOn:docsOn,dyvaOn:dyvaOn,toolsOff:toolsOff};
 }
 function enabledToolNames(){
   var live=_toolFlags();
@@ -5037,6 +5053,16 @@ function lastAnswerMeta(){
   }
   return null;
 }
+// A one-line stub for a function the model can call: name(req, req, optional?). Required
+// params are plain, optional ones carry a trailing ? — built from the tool's own schema, so
+// it mirrors exactly what buildTools() hands the model this turn (tersed media tools included).
+function _toolStub(t){
+  var f=t&&t.function; if(!f||!f.name)return '';
+  var props=(f.parameters&&f.parameters.properties)||{};
+  var req=(f.parameters&&f.parameters.required)||[];
+  var ps=Object.keys(props).map(function(k){return req.indexOf(k)<0?k+'?':k;});
+  return f.name+'('+ps.join(', ')+')';
+}
 function chatSummaryMd(){
   var out=[],i;
   function block(title,lines){
@@ -5054,6 +5080,13 @@ function chatSummaryMd(){
   out.push(_grp('enabled',enabledToolNames()));
   out.push(_grp('disabled',disabledToolNames()));
   out.push(_grp('always on',alwaysOnToolNames()));
+  out.push('');
+  // The actual callable function stubs sent to the model THIS turn — what it can literally
+  // invoke right now (names + params, required plain / optional with a trailing ?).
+  out.push('#### functions');
+  var _fns=((typeof buildTools==='function')?buildTools():[]).map(_toolStub).filter(Boolean).sort();
+  if(!_fns.length)out.push('> *(none)*');
+  else out.push('```\n'+_fns.join('\n')+'\n```');
   out.push('');
   var meta=lastAnswerMeta();
   var wanted=document.getElementById('chatModel').value.trim();
@@ -5379,20 +5412,24 @@ function flushQueuedAsSend(chatId){
 }
 async function sendChat(){
   hideSlashPop(false);
-  if(genOf(currentChat.id)){
-    // Already generating — queue the message instead of dropping it. It reaches the
-    // model at the next tool-result boundary, or as the next turn when this one ends.
-    var _qt=document.getElementById('chatInput').value.trim();
-    if(_qt){ queuePush(currentChat.id,_qt); document.getElementById('chatInput').value=''; refreshSendButton(); }
-    return;
-  }
-  var model=document.getElementById('chatModel').value.trim();
   var input=document.getElementById('chatInput');
   var text=input.value.trim();
   if(!text)return;
+  // Slash commands are local UI actions (/list, /next, /download…), not messages to the
+  // model — run them immediately, even mid-generation, so a command like /list shows at
+  // once instead of landing in the steering queue. A command that returns false has
+  // rewritten the input into a turn to actually send (/info → __dyva_info__), so it
+  // falls through to the send/queue path below.
   if(handleSlashCommand(text)){input.value='';return;}
   text=input.value.trim();   // a command may rewrite the input (e.g. /info → __dyva_info__)
   if(!text)return;
+  if(genOf(currentChat.id)){
+    // Already generating — queue the message instead of dropping it. It reaches the
+    // model at the next tool-result boundary, or as the next turn when this one ends.
+    queuePush(currentChat.id,text); input.value=''; refreshSendButton();
+    return;
+  }
+  var model=document.getElementById('chatModel').value.trim();
   pushHist(text);
   if(!model){
     model='*';
@@ -5530,6 +5567,9 @@ async function runStream(chatId,chatCreated,chatTitle,model,msgs,bubble,depth,ex
           // fill optional fields with plausible-looking nonsense
           var gm=String(args.model||'').trim();
           if(gm&&gm.length<80)ib.model=gm;
+          // Output shape, same buckets as edit_image; the server maps it to width/height.
+          var gasp=String(args.aspect||'').trim().toLowerCase();
+          if(gasp==='long'||gasp==='square'||gasp==='tall')ib.aspect=gasp;
           var r2=await fetch('sdapi/v1/txt2img',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(ib),signal:ac.signal});
           if(r2.ok){
             var j=await r2.json();
@@ -6127,6 +6167,111 @@ async function runStream(chatId,chatCreated,chatTitle,model,msgs,bubble,depth,ex
         results.push(loc.ok
           ?{text:'User location: latitude '+loc.lat+', longitude '+loc.lon+' (accuracy ±'+loc.acc+' m). Coordinates only — no street address; reverse-geocode if you need a place name.',md:'`get_location`'}
           :{text:'Could not get the location: '+loc.err+'. Do not retry unless the user asks again.',md:'`get_location` — '+loc.err});
+      }else if(fn.name==='read_docs'){
+        setStatus('reading docs…');
+        var _dq=String(args.query||'').trim();
+        if(!_dq){results.push({text:'Call read_docs again with "query" set to what you want to look up.'});}
+        else{
+          try{
+            var _rd=await fetch('dyva-docs?q='+encodeURIComponent(_dq),{cache:'no-store',signal:ac.signal});
+            var _jd=await _rd.json();var _dhits=(_jd&&_jd.hits)||[];
+            if(!_dhits.length)results.push({text:'No documentation matched "'+_dq+'". Try different words, or call get_doc_section with no arguments to see the section list.',md:'`read_docs` "'+_dq.slice(0,60)+'" → 0'});
+            else{
+              var _dtxt=_dhits.map(function(h){return '## '+h.path+' › '+h.heading+'\n'+h.snippet}).join('\n\n');
+              results.push({text:'Documentation matches for "'+_dq+'":\n\n'+_dtxt,md:'`read_docs` "'+_dq.slice(0,60)+'" → '+_dhits.length,keep:'[read_docs "'+_dq.slice(0,40)+'" → '+_dhits.length+' sections]'});
+            }
+          }catch(ex){if(ac.signal.aborted)return;results.push({text:'Could not search the docs ('+ex.message+'). Try again shortly.'});}
+        }
+      }else if(fn.name==='get_doc_section'){
+        setStatus('reading docs…');
+        var _ds=String(args.section||'').trim();
+        try{
+          var _gd=await fetch('dyva-docs'+(_ds?'?section='+encodeURIComponent(_ds):''),{cache:'no-store',signal:ac.signal});
+          var _gj=await _gd.json();
+          if(!_ds){
+            var _heads=((_gj&&_gj.sections)||[]).map(function(s){return s.path+' › '+s.heading});
+            results.push({text:'Documentation sections ('+_heads.length+'). Call get_doc_section with one of these names to read it in full:\n'+_heads.join('\n'),md:'`get_doc_section` → '+_heads.length+' sections'});
+          }else if(_gd.status===404){
+            results.push({text:'No section named "'+_ds+'". Available sections:\n'+(((_gj&&_gj.sections)||[]).join('\n'))});
+          }else{
+            results.push({text:_gj.path+' › '+_gj.heading+'\n\n'+_gj.body+(_gj.truncated?'\n…(truncated)':''),md:'`get_doc_section` '+escHtml(_gj.heading||_ds)});
+          }
+        }catch(ex){if(ac.signal.aborted)return;results.push({text:'Could not read that section ('+ex.message+'). Try again shortly.'});}
+      }else if(fn.name==='search_chats'){
+        setStatus('searching chats…');
+        var _cq=String(args.query||'').trim();
+        if(!_cq){results.push({text:'Call search_chats again with "query" set to what to look for.'});}
+        else{
+          try{
+            var _cr=await fetch('api/chats?q='+encodeURIComponent(_cq),{cache:'no-store',signal:ac.signal});
+            var _cj=await _cr.json();var _chits=(_cj&&_cj.hits)||[];
+            if(!_chits.length)results.push({text:'No past chats mention "'+_cq+'".',md:'`search_chats` "'+_cq.slice(0,60)+'" → 0'});
+            else{
+              var _ctxt=_chits.map(function(h){return '- **'+(h.title||'untitled')+'** — '+h.snippet+'  [open](#chat/'+h.id+')'}).join('\n');
+              results.push({text:'Past chats matching "'+_cq+'" (newest first). Each line has a markdown [open](#chat/ID) link — show the user the ones that fit, each with its link:\n'+_ctxt,md:'`search_chats` "'+_cq.slice(0,60)+'" → '+_chits.length,keep:'[search_chats "'+_cq.slice(0,40)+'" → '+_chits.length+']'});
+            }
+          }catch(ex){if(ac.signal.aborted)return;results.push({text:'Could not search chats ('+ex.message+'). Try again shortly.'});}
+        }
+      }else if(fn.name==='get_server_param'){
+        setStatus('reading settings…');
+        try{
+          var _gps=await fetch('settings',{headers:adminHeaders(),cache:'no-store',signal:ac.signal});
+          if(_gps.status===403){results.push({text:'Not signed in to Settings — ask the user to open Settings and enter the admin password, then try again.',md:'`get_server_param` — not authenticated'});}
+          else if(!_gps.ok){results.push({text:'Could not read settings (HTTP '+_gps.status+').'});}
+          else{
+            var _gpv=await _gps.json();
+            var _gpn=String(args.name||'').trim();
+            if(!_gpn){
+              var _gpl=DYVA_PARAMS.map(function(p){return '- '+p.label+' ('+p.key+') = '+JSON.stringify(_gpv[p.key])}).join('\n');
+              results.push({text:'Settable parameters (call set_server_param to change one):\n'+_gpl,md:'`get_server_param` → '+DYVA_PARAMS.length});
+            }else{
+              var _gpp=_dyvaParam(_gpn);
+              if(!_gpp)results.push({text:'No settable parameter "'+_gpn+'". Call get_server_param with no name to list them.'});
+              else results.push({text:_gpp.label+' ('+_gpp.key+') = '+JSON.stringify(_gpv[_gpp.key])+'\n'+_gpp.desc,md:'`get_server_param` '+_gpp.key});
+            }
+          }
+        }catch(ex){if(ac.signal.aborted)return;results.push({text:'Could not read settings ('+ex.message+').'});}
+      }else if(fn.name==='set_server_param'){
+        var _spp=_dyvaParam(args.name);
+        if(!_spp){results.push({text:'No settable parameter "'+String(args.name||'')+'". Call get_server_param with no name to list them.'});}
+        else{
+          var _spv=_coerceParam(_spp.type,args.value);
+          if(_spv===undefined){results.push({text:'"'+String(args.value)+'" is not a valid '+_spp.type+' value for '+_spp.label+'.'});}
+          else if(typeof confirm==='function'&&!confirm('Change '+_spp.label+' to '+_spv+'?')){results.push({text:'The user declined to change '+_spp.label+'.',md:'`set_server_param` '+_spp.key+' — cancelled'});}
+          else{
+            setStatus('saving setting…');
+            try{
+              var _spb={};_spb[_spp.key]=_spv;
+              var _spr=await fetch('settings',{method:'POST',headers:adminHeaders({'Content-Type':'application/json'}),body:JSON.stringify(_spb),signal:ac.signal});
+              if(_spr.status===403)results.push({text:'Not signed in to Settings — ask the user to open Settings and enter the admin password, then try again.',md:'`set_server_param` — not authenticated'});
+              else if(!_spr.ok)results.push({text:'Could not set '+_spp.label+' (HTTP '+_spr.status+').'});
+              else results.push({text:_spp.label+' is now '+_spv+'.',md:'`set_server_param` '+_spp.key+' = '+_spv,keep:'['+_spp.key+' set to '+_spv+']'});
+            }catch(ex){if(ac.signal.aborted)return;results.push({text:'Could not set '+_spp.label+' ('+ex.message+').'});}
+          }
+        }
+      }else if(fn.name==='do_action'){
+        var _act=String(args.action||'').trim();
+        setStatus(_act?('do_action: '+_act+'…'):'do_action…');
+        var _ab={action:_act};
+        if(_act==='query'){_ab.db=String(args.db||'').trim();_ab.sql=String(args.sql||'');if(args.limit)_ab.limit=args.limit;}
+        if(_act==='read_logs'&&args.lines)_ab.lines=args.lines;
+        try{
+          var _ar=await fetch('dyva-action',{method:'POST',headers:adminHeaders({'Content-Type':'application/json'}),body:JSON.stringify(_ab),signal:ac.signal});
+          if(_ar.status===403){results.push({text:'Not signed in to Settings — operator actions need the admin password. Ask the user to open Settings and sign in, then try again.',md:'`do_action` — not authenticated'});}
+          else{
+            var _aj=await _ar.json();
+            if(!_ar.ok||_aj.ok===false){results.push({text:'do_action '+_act+' failed: '+(_aj.error||('HTTP '+_ar.status)),md:'`do_action` '+_act+' — error'});}
+            else{
+              var _txt;
+              if(_act==='update_sources')_txt='Sources refreshed: '+_aj.servers+' hosts, '+_aj.models+' models.';
+              else if(_act==='read_logs')_txt='Last '+((_aj.lines||[]).length)+' log lines:\n'+((_aj.lines||[]).join('\n'));
+              else if(_act==='analyze_workers')_txt=_aj.count+' running race(s), '+_aj.connections+' open connections:\n'+JSON.stringify(_aj.workers);
+              else if(_act==='query')_txt='Columns: '+JSON.stringify(_aj.columns)+'\nRows ('+((_aj.rows||[]).length)+'):\n'+((_aj.rows||[]).map(function(r){return JSON.stringify(r)}).join('\n'));
+              else _txt=JSON.stringify(_aj);
+              results.push({text:_txt,md:'`do_action` '+_act,keep:'[do_action '+_act+']'});
+            }
+          }
+        }catch(ex){if(ac.signal.aborted)return;results.push({text:'do_action '+_act+' failed ('+ex.message+').'});}
       }else results.push({text:'There is no tool named "'+fn.name+'". Use one of the tools available in this chat.'});
     }
     // Runaway guard: if the model spammed more tool calls than the cap, tell it ONCE
@@ -6821,7 +6966,7 @@ function _calcEval(expr){
   var r=_calcMath.evaluate(String(expr||''));
   return (r&&r.toString)?r.toString():String(r);
 }
-var IMG_TOOL={type:'function',function:{name:'generate_image',description:'Generate an image from a text description. Use when the user asks to create, draw, or render a picture.',parameters:{type:'object',properties:{prompt:{type:'string',description:'Detailed description of the image to generate'},negative_prompt:{type:'string',description:'Things to avoid in the image'},model:{type:'string',description:'The checkpoint to render with. If the user names a model, family, or style \u2014 e.g. "dreamshaper", "flux", "juggernaut" \u2014 put it HERE, as a substring or glob ("dreamshaper*" matches dreamshaper_8.safetensors), and do NOT mention the model in the prompt. Leave blank only when the user did not name one, to auto-pick the best available. Never invent a model name; use search_models if unsure what exists.'},name:{type:'string',description:'A short filename to save the result under, so it can be referred to later, e.g. "beautiful_garden.jpg". Lowercase, no spaces. Choose something descriptive of the content.'}},required:['prompt','name']}}};
+var IMG_TOOL={type:'function',function:{name:'generate_image',description:'Generate an image from a text description. Use when the user asks to create, draw, or render a picture.',parameters:{type:'object',properties:{prompt:{type:'string',description:'Detailed description of the image to generate'},negative_prompt:{type:'string',description:'Things to avoid in the image'},model:{type:'string',description:'The checkpoint to render with. If the user names a model, family, or style \u2014 e.g. "dreamshaper", "flux", "juggernaut" \u2014 put it HERE, as a substring or glob ("dreamshaper*" matches dreamshaper_8.safetensors), and do NOT mention the model in the prompt. Leave blank only when the user did not name one, to auto-pick the best available. Never invent a model name; use search_models if unsure what exists.'},name:{type:'string',description:'A short filename to save the result under, so it can be referred to later, e.g. "beautiful_garden.jpg". Lowercase, no spaces. Choose something descriptive of the content.'},aspect:{type:'string',enum:['long','square','tall'],description:'Optional output shape: "long" is landscape (16:9), "square" is 1:1, "tall" is portrait (9:16). Omit for the default square image — only set it when the user asks for a particular shape.'}},required:['prompt','name']}}};
 var EDIT_TOOL={type:'function',function:{name:'edit_image',description:'Edit one image, combine several, or generate a fresh image on an edit-class model (Flux.2 and similar do text-to-image too \u2014 no reference needed). Use for "make it night", "put a hat on the dog", "remove the background", and for "add this lady to the garden" \u2014 in that last case pass BOTH pictures in `images`. Leave `images` out to work on the most recent image (an incremental tweak), or when there is no image at all to generate from the prompt. Call list_assets first if you need to know what the pictures are called.',parameters:{type:'object',properties:{prompt:{type:'string',description:'What to change, e.g. "put a feathered cap on the dog"'},images:{type:'array',items:{type:'string'},description:'Asset names to work from, e.g. ["lady.jpg","garden.jpg"], in the order they should be used \u2014 the first is the picture being changed, the rest are references drawn from. Omit entirely to use the most recent image. Names come from list_assets; do not invent them.'},name:{type:'string',description:'A short filename to save the result under, so it can be referred to later, e.g. "garden_with_lady.jpg". Lowercase, no spaces. Choose something descriptive of the content.'},model:{type:'string',description:'The edit model to use. If the user names one, put it HERE as a substring or glob (globs work, e.g. "flux*2") \u2014 not in the prompt. Leave blank to auto-pick the best available. Never invent a model name; use search_models (type "edit") if unsure.'},aspect:{type:'string',enum:['long','square','tall'],description:'Optional output shape: "long" is landscape (16:9), "square" is 1:1, "tall" is portrait (9:16). Omit to keep the source image\u2019s own proportions \u2014 only set it when the user asks for a different shape.'},size:{type:'string',enum:['small','medium','large'],description:'Optional output resolution bucket; "small" renders faster. Omit for the default (medium).'}},required:['prompt','name']}}};
 // The image to edit is known deterministically, so the model never picks it:
 // walk back through the conversation and take whichever came last, a generated
@@ -6893,7 +7038,12 @@ function askUser(question,options,signal){
     function sendOther(){var v=inp.value.trim();if(v)answer(v)}
     go.addEventListener('click',sendOther);
     inp.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();sendOther()}});
-    other.appendChild(inp);other.appendChild(go);
+    // Skip: decline the question so the model proceeds on its own judgment, instead of
+    // forcing an answer (or cancelling the whole turn). Same row, after Send.
+    var skip=document.createElement('button');skip.type='button';skip.className='ask-opt';skip.textContent='Skip';
+    skip.style.flex='0 0 auto';
+    skip.addEventListener('click',function(){answer('(skipped — no answer; use your best judgment)')});
+    other.appendChild(inp);other.appendChild(go);other.appendChild(skip);
     card.appendChild(other);
     chatLog.appendChild(card);scrollChat(true);
     setTimeout(function(){inp.focus()},0);
@@ -7000,12 +7150,13 @@ var toolVideoChk=document.getElementById('toolVideo');
 var toolWebChk=document.getElementById('toolWeb');
 var toolHostChk=document.getElementById('toolHost');
 var toolAgentsChk=document.getElementById('toolAgents');
+var toolDyvaChk=document.getElementById('toolDyva');
 var toolsOffChk=document.getElementById('toolsOff');
-var imageOn=false,docsOn=false,speechOn=false,videoOn=false,webOn=false,hostOn=false,agentsOn=false;
+var imageOn=false,docsOn=false,speechOn=false,videoOn=false,webOn=false,hostOn=false,agentsOn=false,dyvaOn=false;
 // DISPLAY-only toggle (not a model tool): render preview cards for links in replies.
-var linksOn=false;
-try{linksOn=localStorage.getItem('dyva_links')==='1'}catch(e){}
-var toolLinksChk=document.getElementById('toolLinks');
+// Link preview cards always render — no toggle. (Was optional on a thin security
+// argument about outbound preview fetches; not worth a line in an already-long menu.)
+var linksOn=true;
 // Master override: some pool models don't support tool calls at all, so this
 // sends NO tools (buildTools returns []), regardless of the individual toggles.
 var toolsOff=false;
@@ -7020,9 +7171,13 @@ try{videoOn=localStorage.getItem('dyva_tools_video')==='1'}catch(e){}
 try{webOn=localStorage.getItem('dyva_tools_web')==='1'}catch(e){}
 try{hostOn=localStorage.getItem('dyva_tools_host')==='1'}catch(e){}
 try{agentsOn=localStorage.getItem('dyva_tools_agents')==='1'}catch(e){}
+// Dyva's self-service tools (read_docs / get_doc_section, more to come) — one toggle
+// gates the whole group so none of their schemas ship until it's on, keeping the chat
+// context clean for models that don't need them.
+try{dyvaOn=localStorage.getItem('dyva_tools_dyva')==='1'}catch(e){}
 // ask_question has no toggle — it is always available (see buildTools), so it is
 // deliberately excluded from anyToolsOn (it must not keep the wrench lit).
-function anyToolsOn(){return !toolsOff&&(imageOn||docsOn||speechOn||videoOn||webOn||hostOn||agentsOn)}
+function anyToolsOn(){return !toolsOff&&(imageOn||docsOn||speechOn||videoOn||webOn||hostOn||agentsOn||dyvaOn)}
 // Full docs live on the tool defs; read_docs serves them on demand so the tool
 // list sent every turn can carry only a terse one-liner per tool. TOOL_DEFS maps
 // name -> the full function object (kept intact); buildTools terses a COPY.
@@ -7086,6 +7241,38 @@ function _argsValidFor(name,args){
   return true;
 }
 var READ_DOCS_TOOL={type:'function',function:{name:'help',description:'Get the docs (description + every parameter) for another tool.',parameters:{type:'object',properties:{tool:{type:'string',description:'Which tool to get help for'}},required:['tool']}}};
+// Dyva self-service tools (gated by the "Dyva docs" toggle). read_docs / get_doc_section
+// answer questions about dyva from its OWN documentation (READMEs + docs/ + brainstorm/,
+// a fixed server-side whitelist). Context-lean: they return a heading list, one section,
+// or short ranked snippets — never a whole file.
+var READ_PROJECT_DOCS_TOOL={type:'function',function:{name:'read_docs',description:'Search dyva’s own documentation (the READMEs plus docs/ and brainstorm/) and get back the best-matching sections as short snippets. Use it to answer questions about how dyva works — routing, settings, APIs, reputation, design.',parameters:{type:'object',properties:{query:{type:'string',description:'What to look up, e.g. "how does host reputation work" or "thinking token key".'}},required:['query']}}};
+var GET_DOC_SECTION_TOOL={type:'function',function:{name:'get_doc_section',description:'Browse dyva’s documentation by section. Call with no arguments to get the list of section headings; call with a section name to read that one section in full.',parameters:{type:'object',properties:{section:{type:'string',description:'A section heading to fetch in full. Omit to list every section heading.'}},required:[]}}};
+// Search the user's OWN past conversations (the same chats the sidebar lists). Each hit
+// carries a short snippet and a markdown link to open that chat.
+var SEARCH_CHATS_TOOL={type:'function',function:{name:'search_chats',description:'Search the user’s past conversations for a word or phrase. Each hit comes back with a short context snippet and a markdown link to open that chat — use it when the user is trying to find or remember an earlier conversation.',parameters:{type:'object',properties:{query:{type:'string',description:'Words to look for across the user’s saved chats.'}},required:['query']}}};
+// ADMIN tools (server enforces X-Admin-Key; a 403 means "not signed in to Settings").
+// get_server_param/set_server_param drive the existing /settings endpoint; set_server_param confirms first.
+// The settable whitelist + descriptions live here, so set_server_param can only touch these.
+var DYVA_PARAMS=[
+  {key:'workers',label:'Worker count',type:'int',desc:'Max concurrent upstream requests (1–200). Higher = more parallelism and more load.'},
+  {key:'timeout',label:'Request timeout (s)',type:'int',desc:'Per-request upstream timeout in seconds (1–600).'},
+  {key:'hedge_delay',label:'Hedge delay (s)',type:'num',desc:'Seconds before a slow request is also sent to a second host (0 = never hedge).'},
+  {key:'fanout',label:'Fan-out',type:'int',desc:'How many hosts to race per model-resolution wave.'},
+  {key:'min_count',label:'Min hosts/model',type:'int',desc:'A model must be served by at least this many hosts to appear (1 = show all; 2 hides one-offs).'},
+  {key:'explore',label:'Explore mode',type:'bool',desc:'Occasionally try lower-ranked hosts to keep reputation fresh.'},
+  {key:'gossiper_enabled',label:'Gossiper',type:'bool',desc:'Sync smoke-test verdicts with peer dyvas on refresh.'},
+  {key:'hide_dyva',label:'Hide dyva',type:'bool',desc:'Leave dyva’s own identifying model/header out of responses.'}
+];
+function _dyvaParam(name){var n=String(name||'').trim().toLowerCase();return DYVA_PARAMS.filter(function(p){return p.key===n||p.label.toLowerCase().indexOf(n)>=0})[0];}
+function _coerceParam(type,v){
+  if(type==='bool'){if(typeof v==='boolean')return v;var s=String(v).trim().toLowerCase();if(['true','on','yes','1'].indexOf(s)>=0)return true;if(['false','off','no','0'].indexOf(s)>=0)return false;return undefined;}
+  if(type==='int'){var n=parseInt(v,10);return isNaN(n)?undefined:n;}
+  if(type==='num'){var f=parseFloat(v);return isNaN(f)?undefined:f;}
+  return String(v);
+}
+var GET_PARAM_TOOL={type:'function',function:{name:'get_server_param',description:'Read a dyva runtime setting and its description (admin only). Call with no name to list the settable parameters and their current values.',parameters:{type:'object',properties:{name:{type:'string',description:'The parameter name or label. Omit to list them all.'}},required:[]}}};
+var SET_PARAM_TOOL={type:'function',function:{name:'set_server_param',description:'Change a dyva runtime setting (admin only). The user is shown a confirmation before it takes effect.',parameters:{type:'object',properties:{name:{type:'string',description:'The parameter to change (name or label).'},value:{type:'string',description:'The new value.'}},required:['name','value']}}};
+var DO_ACTION_TOOL={type:'function',function:{name:'do_action',description:'Run an operator action on this dyva server (admin only): "update_sources" re-pulls host sources and reloads the pool; "read_logs" returns a tail of today’s log; "analyze_workers" summarises the running races; "query" runs a READ-ONLY SQL SELECT against a dyva database (stats, host_status, chats).',parameters:{type:'object',properties:{action:{type:'string',enum:['update_sources','read_logs','analyze_workers','query'],description:'Which action to run.'},db:{type:'string',enum:['stats','host_status','chats'],description:'For query: which database to read.'},sql:{type:'string',description:'For query: a single read-only SELECT statement.'},lines:{type:'integer',description:'For read_logs: how many trailing lines (default 60).'}},required:['action']}}};
 // Render a tool's parameters as doc lines, expanding nested object / array-item
 // schemas (e.g. spawn_agents' per-agent name/task/model) — the blanked terse
 // schema omits params, so help / the gate are the only place the model can learn
@@ -7139,6 +7326,8 @@ function buildTools(){
   if(hostOn)t.push(GET_LOCATION_TOOL);   // client-executed; browser prompts for permission
   if(agentsOn)t.push(SPAWN_TOOL);
   if(docsOn){t=t.concat(DOC_TOOLS);t.push(GET_SCREENSHOT_TOOL);}   // see the rendered document
+  if(dyvaOn){t.push(READ_PROJECT_DOCS_TOOL);t.push(GET_DOC_SECTION_TOOL);t.push(SEARCH_CHATS_TOOL);   // ask dyva about itself; find past chats
+             t.push(GET_PARAM_TOOL);t.push(SET_PARAM_TOOL);t.push(DO_ACTION_TOOL);}                    // admin: settings + operator actions (server-gated)
   // No toggle of its own: it is the index for whatever media tools are on,
   // and useless without them.
   if(imageOn||videoOn||speechOn||webOn){t.push(LIST_ASSETS_TOOL);t.push(GET_ASSET_TOOL);}   // list, then look
@@ -7167,8 +7356,8 @@ function paintTools(){
   if(toolVideoChk)toolVideoChk.checked=videoOn;
   if(toolWebChk)toolWebChk.checked=webOn;
   if(toolHostChk)toolHostChk.checked=hostOn;
-  if(toolLinksChk)toolLinksChk.checked=linksOn;
   if(toolAgentsChk)toolAgentsChk.checked=agentsOn;
+  if(toolDyvaChk)toolDyvaChk.checked=dyvaOn;
   if(toolsOffChk)toolsOffChk.checked=toolsOff;
   // when everything's disabled, grey out the per-tool list so it reads as moot
   if(toolsPop)toolsPop.classList.toggle('all-off',toolsOff);
@@ -7183,7 +7372,7 @@ chatToolsBtn.addEventListener('click',function(e){
   e.stopPropagation();
   var opening=!toolsPop.classList.contains('open');
   toolsPop.classList.toggle('open');
-  if(opening)placeToolsPop();
+  if(opening){placeToolsPop();if(typeof updateTokEst==='function')updateTokEst();}
 });
 window.addEventListener('resize',function(){
   if(toolsPop.classList.contains('open'))placeToolsPop();
@@ -7201,7 +7390,7 @@ function _applyChatTools(){
   var t=currentChat&&currentChat.tools;
   if(!t||typeof t!=='object')return;   // no per-chat setting -> keep the default
   imageOn=!!t.imageOn;docsOn=!!t.docsOn;speechOn=!!t.speechOn;
-  videoOn=!!t.videoOn;webOn=!!t.webOn;hostOn=!!t.hostOn;agentsOn=!!t.agentsOn;toolsOff=!!t.toolsOff;
+  videoOn=!!t.videoOn;webOn=!!t.webOn;hostOn=!!t.hostOn;agentsOn=!!t.agentsOn;dyvaOn=!!t.dyvaOn;toolsOff=!!t.toolsOff;
   paintTools();
 }
 toolImageChk.addEventListener('change',function(){
@@ -7224,13 +7413,6 @@ if(toolHostChk)toolHostChk.addEventListener('change',function(){
   try{localStorage.setItem('dyva_tools_host',hostOn?'1':'0')}catch(e){}
   paintTools();_persistChatTools();
 });
-// Display-only: not a model tool, so no _persistChatTools / buildTools — just re-render the
-// current chat so cards appear/disappear for the messages already on screen.
-if(toolLinksChk)toolLinksChk.addEventListener('change',function(){
-  linksOn=this.checked;
-  try{localStorage.setItem('dyva_links',linksOn?'1':'0')}catch(e){}
-  if(typeof renderMessages==='function')renderMessages();
-});
 if(toolAgentsChk)toolAgentsChk.addEventListener('change',function(){
   agentsOn=this.checked;
   try{localStorage.setItem('dyva_tools_agents',agentsOn?'1':'0')}catch(e){}
@@ -7249,6 +7431,11 @@ if(toolSpeechChk)toolSpeechChk.addEventListener('change',function(){
 if(toolDocsChk)toolDocsChk.addEventListener('change',function(){
   docsOn=this.checked;
   try{localStorage.setItem('dyva_tools_docs',docsOn?'1':'0')}catch(e){}
+  paintTools();_persistChatTools();
+});
+if(toolDyvaChk)toolDyvaChk.addEventListener('change',function(){
+  dyvaOn=this.checked;
+  try{localStorage.setItem('dyva_tools_dyva',dyvaOn?'1':'0')}catch(e){}
   paintTools();_persistChatTools();
 });
 document.addEventListener('click',function(){toolsPop.classList.remove('open')});
@@ -8206,34 +8393,52 @@ chatFilesInput.addEventListener('change',function(){
   addChatFiles(chatFilesInput.files);
   chatFilesInput.value='';
 });
-// Drag-and-drop onto the composer box. dragover MUST preventDefault or the browser
-// just opens the dropped file instead. A depth counter keeps the highlight steady
-// as the pointer crosses child elements (each child fires its own enter/leave), and
-// we only react to an actual file drag (types includes 'Files'), not dragged text.
+// Fetch an image URL (an in-app asset, or a link dragged from another tab) and attach it,
+// the same shape the edit panel's drop zone uses. Non-images are ignored. Best-effort.
+async function _attachChatFromUrl(url,name){
+  try{
+    var r=await fetch(url);if(!r.ok)return;
+    var b=await r.blob();
+    if(b.type.indexOf('image/')!==0&&!/\.(png|jpe?g|webp|gif|avif)$/i.test(name||''))return;
+    addChatFiles([new File([b],name||'image.png',{type:b.type||'image/png'})]);
+  }catch(e){/* a drag that can't be fetched just doesn't attach */}
+}
+// Drag-and-drop onto the composer box. dragover MUST preventDefault or the browser just opens
+// the dropped item instead. Accepts the three ways an IMAGE arrives (mirrors #editDrop): an OS
+// file, an in-app image drag (application/x-dyva-image = a generated/gallery image), or a URL
+// (text/uri-list, e.g. dragged from another tab). Plain-text drags are left alone so text can
+// still be dropped into the textarea. A depth counter keeps the highlight steady as the pointer
+// crosses child elements (each fires its own enter/leave).
 (function(){
   var composer=document.querySelector('.composer');
   if(!composer)return;
   var depth=0;
-  function hasFiles(e){
-    var t=e.dataTransfer&&e.dataTransfer.types;
-    return !!t&&Array.prototype.indexOf.call(t,'Files')>=0;
+  function dragHasImage(e){
+    var t=e.dataTransfer&&e.dataTransfer.types;if(!t)return false;
+    function has(x){return Array.prototype.indexOf.call(t,x)>=0;}
+    return has('Files')||has('application/x-dyva-image')||has('text/uri-list');
   }
   composer.addEventListener('dragenter',function(e){
-    if(!hasFiles(e))return;
+    if(!dragHasImage(e))return;
     e.preventDefault();depth++;composer.classList.add('drop-active');
   });
   composer.addEventListener('dragover',function(e){
-    if(!hasFiles(e))return;
+    if(!dragHasImage(e))return;
     e.preventDefault();try{e.dataTransfer.dropEffect='copy';}catch(_){}
   });
   composer.addEventListener('dragleave',function(e){
-    if(!hasFiles(e))return;
+    if(!dragHasImage(e))return;
     depth--;if(depth<=0){depth=0;composer.classList.remove('drop-active');}
   });
   composer.addEventListener('drop',function(e){
-    if(!hasFiles(e))return;
+    if(!dragHasImage(e))return;
     e.preventDefault();depth=0;composer.classList.remove('drop-active');
-    if(e.dataTransfer.files&&e.dataTransfer.files.length)addChatFiles(e.dataTransfer.files);
+    var dt=e.dataTransfer;
+    if(dt.files&&dt.files.length){addChatFiles(dt.files);return;}
+    var internal=dt.getData('application/x-dyva-image');
+    if(internal){_attachChatFromUrl('sdapi/v1/images/'+encodeURIComponent(internal),internal);return;}
+    var uri=(dt.getData('text/uri-list')||dt.getData('text/plain')||'').split(/[\r\n]/)[0].trim();
+    if(uri)_attachChatFromUrl(uri,decodeURIComponent(uri.split('/').pop().split('?')[0])||'image.png');
   });
 })();
 // Sending an image as *vision* needs a model that can see, which rules out
@@ -10616,7 +10821,7 @@ function saveSettings(){
   if(isNaN(body.hedge_delay)||body.hedge_delay<0)delete body.hedge_delay;
   if(isNaN(body.worker_max)||body.worker_max<0)delete body.worker_max;   // 0 is valid (disables)
   if(isNaN(body.race_watchdog)||body.race_watchdog<0)delete body.race_watchdog;   // 0 is valid (off)
-  if(isNaN(body.min_count)||body.min_count<0)delete body.min_count;
+  if(isNaN(body.min_count)||body.min_count<1)delete body.min_count;   // at-least-N-hosts: 1 = show all, 0 is meaningless
   // Only send admin_pw when the operator typed a new one (blank = keep current).
   var newPw=document.getElementById('setAdminPw').value;
   if(newPw)body.admin_pw=newPw;

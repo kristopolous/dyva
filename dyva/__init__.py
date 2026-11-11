@@ -32,6 +32,10 @@ import importlib.metadata
 
 import aiohttp
 import aiosqlite
+try:
+    import sqlite_vec           # loadable SQLite KNN extension (vec0); optional at runtime
+except ImportError:             # pragma: no cover - semantic search falls back to keyword
+    sqlite_vec = None
 from aiohttp import web, web_log
 from aiohttp_swagger3 import SwaggerDocs, SwaggerInfo, SwaggerUiSettings
 
@@ -148,7 +152,7 @@ logging.basicConfig(
 _LOG_COLOR = bool(getattr(sys.stderr, "isatty", lambda: False)()) and not os.environ.get("NO_COLOR")
 for _handler in logging.getLogger().handlers:
     _handler.setFormatter((ColorFormatter if _LOG_COLOR else ApacheStyleFormatter)(LOG_FORMAT))
-log = logging.getLogger("dumpster-dyva")
+log = logging.getLogger("dyva")
 
 
 def _permissive_ssl():
@@ -179,6 +183,60 @@ def _permissive_ssl():
 # exposed-host survey.
 INSECURE_SSL = _permissive_ssl()
 log.setLevel(getattr(logging, LOGLEVEL, logging.INFO))
+
+# ---- Outbound proxy (SOCKS/HTTP) for ALL upstream egress -------------------------------
+# dyva opens every upstream connection (inference, probes, the hedged race, embeddings, web
+# read/search, link-unfurl) through ONE shared aiohttp connector. With SOCKS_PROXY set, that
+# connector tunnels all of it through the proxy — the knob for routing egress off a different
+# IP (dodging the soft-ban canaries, or just privacy). None = direct, the default. Set in
+# main() from --socks / $DYVA_SOCKS / $SOCKS_PROXY. aiohttp has NO native proxy-env support,
+# so this is the only path; there is no transparent `SOCKS_PROXY=… ./dyva`.
+SOCKS_PROXY = None
+# curl-style socks5h/socks4a (remote DNS) are accepted and normalized to socks5/socks4 for
+# python-socks in _make_connector — rdns=True already gives the remote DNS the `h`/`a` means.
+# https (TLS-to-proxy) isn't supported by the backend, so it's rejected with a clear message.
+_SOCKS_SCHEMES = ("socks5", "socks5h", "socks4", "socks4a", "http")
+_SOCKS_NORMALIZE = {"socks5h": "socks5", "socks4a": "socks4"}
+
+
+def _resolve_socks(cli, env):
+    """Resolve the proxy URL (or None) for all upstream egress. Precedence: the --socks CLI
+    value, then $DYVA_SOCKS, then $SOCKS_PROXY. A set-but-malformed value RAISES — a typo must
+    fail loud, never silently fall through to a DIRECT connection that leaks the egress the
+    proxy was meant to hide."""
+    url = (cli or env.get("DYVA_SOCKS") or env.get("SOCKS_PROXY") or "").strip()
+    if not url:
+        return None
+    if urllib.parse.urlparse(url).scheme.lower() not in _SOCKS_SCHEMES:
+        raise ValueError(
+            f"unsupported proxy URL {url!r}: scheme must be one of {', '.join(_SOCKS_SCHEMES)} "
+            f"(e.g. socks5h://127.0.0.1:1080)")
+    return url
+
+
+def _make_connector():
+    """The shared outbound connector. With SOCKS_PROXY set, EVERY upstream connection tunnels
+    through it, rdns=True so DNS resolves AT the proxy — the ~2k hostname hosts in the pool must
+    not resolve locally when you're proxying egress, or you leak exactly what the proxy was for.
+    FAIL CLOSED: a requested proxy whose library is missing RAISES; we never silently fall back
+    to a direct connection. Without a proxy it's the tuned direct TCPConnector (async c-ares DNS
+    + a wide pool — see on_startup for why limit=0 and AsyncResolver)."""
+    if SOCKS_PROXY:
+        try:
+            from aiohttp_socks import ProxyConnector
+        except ImportError as e:
+            raise RuntimeError(
+                f"proxy requested ({SOCKS_PROXY}) but aiohttp-socks is not installed "
+                f"— `uv add aiohttp-socks`") from e
+        url = SOCKS_PROXY
+        scheme = urllib.parse.urlparse(url).scheme.lower()
+        if scheme in _SOCKS_NORMALIZE:            # curl-style socks5h/socks4a -> python-socks form
+            url = _SOCKS_NORMALIZE[scheme] + url[len(scheme):]
+        return ProxyConnector.from_url(
+            url, rdns=True, ssl=INSECURE_SSL, keepalive_timeout=120, limit=0)
+    return aiohttp.TCPConnector(
+        ssl=INSECURE_SSL, keepalive_timeout=120, limit=0,
+        resolver=aiohttp.AsyncResolver(), use_dns_cache=True, ttl_dns_cache=300)
 
 access_logger = logging.getLogger("aiohttp.access")
 access_logger.propagate = False
@@ -267,6 +325,14 @@ IMG_HISTORY_FILE = os.path.join(IMG_DIR, "history.json")
 THUMB_DIR = os.path.join(IMG_DIR, "thumbs")
 CHATS_FILE = os.path.join(CACHE_DIR, "chats.json")   # legacy blob, migrated into CHATS_DB
 CHATS_DB = os.path.join(CACHE_DIR, "chats.db")
+# Semantic search index (sqlite-vec vec0) over docs + chats — one embedding model pins
+# the whole thing so every vector is comparable; see the "_sem_*" section near chats.
+SEMINDEX_DB = os.path.join(CACHE_DIR, "semindex.db")
+# The ONE embedding model the semantic index is built with. Heterogeneous pool: different
+# hosts serve different embedders at different dimensions, so the index MUST pin one model
+# or its vectors aren't comparable. Change it (settings `embed_model` / $DYVA_EMBED_MODEL)
+# and the index rebuilds itself on the next search.
+EMBED_MODEL = os.environ.get("DYVA_EMBED_MODEL", "nomic-embed-text").strip() or "nomic-embed-text"
 # Generation jobs — a generic, host-independent "print queue" for proxied
 # generations (see the jobs section below). Deliberately NOT tied to chats.db:
 # a job is router-level delivery state, and this table is keyed by `kind`
@@ -449,7 +515,7 @@ SESSION_MSG_CAP = 200
 # settings session_allow_repin, or env DYVA_SESSION_ALLOW_REPIN=1.
 SESSION_ALLOW_REPIN = False
 _sessions = {}
-MIN_COUNT = 0   # hide models served by fewer than this many hosts (0/1 = show all)
+MIN_COUNT = 2   # show only models served by at least this many hosts (1 = show all; 2 = hide one-offs, the default)
 EXPLORE_MODE = False   # route UNKNOWN/unvisited hosts first to map more of the pool (slower)
 # "Hide dyva": when on, a remote bot/curl GET of a WEB PAGE (the dashboard/HTML, not
 # the /v1 or /api endpoints) gets an empty 404 instead of the UI — so a drive-by
@@ -588,7 +654,7 @@ def _apply_cache_dir(path):
     so they're intentionally left alone."""
     global CACHE_DIR, CACHE_FILE, NOTWORKING_FILE, BAD_FILE, GOOD_FILE, STATUS_DB
     global LAST_FILE, STATS_FILE, STATS_DB, KNOWN_FILE, PROBE_FILE, IMG_DIR, AUDIO_DIR, IMG_HISTORY_FILE, THUMB_DIR
-    global CHATS_FILE, CHATS_DB, JOBS_DB, RERANKER_DB, SETTINGS_FILE, VIDEO_JOBS_FILE
+    global CHATS_FILE, CHATS_DB, SEMINDEX_DB, JOBS_DB, RERANKER_DB, SETTINGS_FILE, VIDEO_JOBS_FILE
     global VIDEO_JOBS_DIR, CLEANSED_FILE, SURVEY_FILE, MUSIC_JOBS_FILE, MUSIC_JOBS_DIR
     CACHE_DIR = os.path.abspath(os.path.expanduser(path))
     CACHE_FILE = os.path.join(CACHE_DIR, "free-ollama.json")
@@ -607,6 +673,7 @@ def _apply_cache_dir(path):
     THUMB_DIR = os.path.join(IMG_DIR, "thumbs")
     CHATS_FILE = os.path.join(CACHE_DIR, "chats.json")
     CHATS_DB = os.path.join(CACHE_DIR, "chats.db")
+    SEMINDEX_DB = os.path.join(CACHE_DIR, "semindex.db")
     JOBS_DB = os.path.join(CACHE_DIR, "jobs.db")
     RERANKER_DB = os.path.join(CACHE_DIR, "reranker.db")
     SETTINGS_FILE = os.path.join(CACHE_DIR, "settings.json")
@@ -706,7 +773,7 @@ def model_modalities(model):
 def load_settings():
     """Apply persisted runtime settings (workers/timeout/min_count/local) over
     the CLI defaults, so changes made in the dashboard survive restarts."""
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION, RERANK_BUSY_SECS, RERANK_UP_SECS, RERANK_DOWN_SECS, AFFINITY_PREFIX_MSGS, AFFINITY_MIN_TOKENS, AFFINITY_TTL_SECS, AFFINITY_MAX_ENTRIES, AFFINITY_FLOOR_HOSTS
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION, RERANK_BUSY_SECS, RERANK_UP_SECS, RERANK_DOWN_SECS, AFFINITY_PREFIX_MSGS, AFFINITY_MIN_TOKENS, AFFINITY_TTL_SECS, AFFINITY_MAX_ENTRIES, AFFINITY_FLOOR_HOSTS, EMBED_MODEL
     if not os.path.exists(SETTINGS_FILE):
         return
     try:
@@ -741,7 +808,7 @@ def load_settings():
         RACE_WATCHDOG = s["race_watchdog"]
     if isinstance(s.get("fanout"), (int, float)) and s["fanout"] > 0:
         FANOUT = s["fanout"]
-    if isinstance(s.get("min_count"), int) and s["min_count"] >= 0:
+    if isinstance(s.get("min_count"), int) and s["min_count"] >= 1:
         MIN_COUNT = s["min_count"]
     if isinstance(s.get("admin_pw"), str):
         ADMIN_PW = s["admin_pw"]
@@ -759,6 +826,8 @@ def load_settings():
         CLOUD_SKIP = {x.lower() for x in s["cloudskip"] if isinstance(x, str) and x.strip()}
     if isinstance(s.get("base_path"), str):
         BASE_PATH = _normalize_base(s["base_path"])
+    if isinstance(s.get("embed_model"), str) and s["embed_model"].strip():
+        EMBED_MODEL = s["embed_model"].strip()
     if isinstance(s.get("gossiper_url"), str):
         GOSSIPER_URL = s["gossiper_url"].strip()
     if isinstance(s.get("gossiper_enabled"), bool):
@@ -799,6 +868,7 @@ def save_settings(extra=None):
                  "min_count": MIN_COUNT, "local": _LOCAL, "explore": EXPLORE_MODE, "hide_dyva": HIDE_DYVA,
                  "admin_pw": ADMIN_PW, "model_list": MODEL_LIST, "model_list_on": MODEL_LIST_ON,
                  "cloudskip": sorted(CLOUD_SKIP), "base_path": BASE_PATH,
+                 "embed_model": EMBED_MODEL,
                  "gossiper_url": GOSSIPER_URL, "gossiper_enabled": GOSSIPER_ENABLED,
                  "rerank_busy_secs": RERANK_BUSY_SECS, "rerank_up_secs": RERANK_UP_SECS, "rerank_down_secs": RERANK_DOWN_SECS,
                  "session_sticky": SESSION_STICKY, "session_ttl": SESSION_TTL,
@@ -1780,6 +1850,11 @@ async def _unregister_worker(wid, ok=None):
             "prompt_tokens": w.get("ptoks"),
             "completion_tokens": w.get("ctoks"),
             "num_ctx": w.get("num_ctx"),
+            # Host-affinity audit: the conversation fingerprint (crc of the first N user
+            # messages) and the warm host it was handed to ('' = no handout / first turn).
+            # Group rows by affinity_crc to confirm a thread's turns stick to one host.
+            "affinity_crc": w.get("affinity_crc"),
+            "affinity_match": w.get("affinity_match"),
             "tally": dict(w.get("race_tally") or {}),
             # Terminal race state + a derived stall flag: a FAILED job whose candidate list
             # was never exhausted (spent False) and tried far fewer than it had (tried <
@@ -3149,6 +3224,12 @@ _STRUCTURAL_FAIL_RE = re.compile(
     # request. A later success (e.g. after a hardware/quant change, re-probed by graflex)
     # flips it back out of 'bad' automatically.
     r"|process has terminated"
+    # ComfyUI's UNETLoader/CheckpointLoader: "Could not detect model type of: <file>" — this
+    # host's ComfyUI can't load that diffusion file at all (arch newer than its build, or a
+    # foreign quant like a SwarmUI int8_convrot it doesn't understand). Permanent for THIS
+    # (host, model) pair, so hard-exclude it instead of re-racing the same doomed render every
+    # request; a host upgrade / re-quant is picked up by graflex's re-probe, which flips it back.
+    r"|could not detect model type"
     # Auth-gated: a 401/403 means the host needs credentials we don't have — permanent for US, so
     # record once and hard-exclude instead of re-probing it every request. The quick-test phrases it
     # "status 401: …"; the comfy/a1111 image path phrases it "HTTP 401" (e.g. "/models/checkpoints
@@ -4072,6 +4153,21 @@ def affinity_view(crc, now=None):
     return match, reserved
 
 
+def affinity_forget(host):
+    """Drop EVERY affinity pin pointing at `host` — the affinity-map analogue of clear_last.
+    Called when a host stalls/fails (timeout/unreachable/fault) so a thread stops LEADING with a
+    stuck host round after round: the pin re-forms on whichever host next serves (affinity_touch
+    on the next win). Best-effort; a cache hiccup must never break the verdict path."""
+    try:
+        h = _norm_host(host)
+        if not h:
+            return
+        for k in [k for k, (hh, _exp) in list(_affinity.items()) if hh == h]:
+            _affinity.pop(k, None)
+    except Exception as e:
+        log.debug(f"affinity_forget failed: {e}")
+
+
 def _affinity_plan(match, reserved, cand_hosts, floor):
     """Pure. Decide the reorder for one request over its candidate hosts (all _norm_host'd, in
     tier order). `match` = this crc's warm host (or ''), `reserved` = {foreign_host: expire_at}.
@@ -4109,6 +4205,37 @@ def _affinity_touch_ctx(host):
     if aff is not None:
         crc, size = aff
         affinity_touch(crc, host, size)
+
+
+def _affinity_match_host():
+    """The warm host this request's affinity key currently points at ('' if none) — read for
+    the activity feed, BEFORE the win's affinity_touch overwrites it, so it's the host we
+    actually handed out at routing time."""
+    aff = _affinity_ctx.get()
+    if aff is None or aff[0] is None:
+        return ""
+    return affinity_view(aff[0])[0]
+
+
+async def _affinity_handout(servers, model, wid):
+    """Routing-time feed line: if this request matched the affinity cache, note that we're
+    leading with the warm host. Resolved in place later by _affinity_resolve (same aid)."""
+    am = _affinity_match_host()
+    if am and any(_norm_host(h) == am for _p, h, _m in servers):
+        await broadcast_activity(am, model, "affinity",
+                                 "affinity: leading with the warm host",
+                                 wid=wid, aid="aff:" + str(wid))
+
+
+async def _affinity_resolve(host, model, wid):
+    """Win-time feed line: resolve the handout to whether the warm host actually served
+    (stuck) or the request fell through to a different host. No-op if this wasn't a handout."""
+    am = _affinity_match_host()
+    if am:
+        await broadcast_activity(am, model, "affinity",
+                                 "affinity: stuck - warm host served" if _norm_host(host) == am
+                                 else "affinity: warm host fell through, served elsewhere",
+                                 wid=wid, aid="aff:" + str(wid))
 
 
 # (norm-host, resolved-model) pairs that answered with ONLY reasoning — the whole reply
@@ -4860,6 +4987,181 @@ def load_gguf_labels():
         except (ValueError, OSError):
             pass
     return _gguf_labels
+
+
+# --- project documentation index (read_docs / get_doc_section chat tools) ----------
+# The chat can answer questions about dyva from its OWN prose docs. _DOC_FILES is a hard
+# WHITELIST — an explicit, auditable list, NOT a glob/find and NOT reachable from any user
+# input. read_docs/get_doc_section only ever see sections parsed from exactly these files;
+# the query and section args match already-indexed headings/text, never a path, so there
+# is no way to make these tools read anything else on disk. To add a doc, edit this list.
+# To keep the chat context lean the tools ship a heading list, one section, or a short
+# ranked snippet — never a whole file.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_DOC_FILES = (
+    "README.md", "dyva/README.md", "graflex/README.md",
+    "docs/architecture.md", "docs/freeollama.md", "docs/gossiper.md",
+    "docs/survey.md", "docs/video-script.md",
+    "docs/video/README.md", "docs/video/animation-pipeline.md", "docs/video/story.md",
+    "docs/superpowers/plans/2026-10-04-graflex-sqlite-host-store.md",
+    "docs/superpowers/plans/2026-11-03-ctx-size-routing.md",
+    "docs/superpowers/specs/2026-10-04-graflex-sqlite-host-store-design.md",
+    "docs/superpowers/specs/2026-10-19-oversized-prompt-client-compaction-nudge.md",
+    "docs/superpowers/specs/2026-11-03-ctx-size-routing-design.md",
+    "brainstorm/README.md", "brainstorm/auth-required-hosts.md",
+    "brainstorm/canary-detection.md", "brainstorm/dumb-gateway-split.md",
+    "brainstorm/honeypot-score.md", "brainstorm/host-affinity.md",
+    "brainstorm/lora-first-image-gen.md", "brainstorm/reranker.md",
+    "brainstorm/self-update-tab.md", "brainstorm/skip-to-next-host.md",
+)
+_HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*#*\s*$")
+_docs_cache = None
+
+
+def _md_sections(text, path):
+    """Split markdown at ATX headings into ordered {path,heading,level,body} sections.
+    Any text before the first heading is kept as a preamble (heading ""); an empty
+    preamble is dropped."""
+    sections, buf = [], []
+    cur = {"path": path, "heading": "", "level": 0, "body": ""}
+    for line in str(text or "").splitlines():
+        m = _HEADING_RE.match(line)
+        if m:
+            cur["body"] = "\n".join(buf).strip()
+            sections.append(cur)
+            buf = []
+            cur = {"path": path, "heading": m.group(2).strip(),
+                   "level": len(m.group(1)), "body": ""}
+        else:
+            buf.append(line)
+    cur["body"] = "\n".join(buf).strip()
+    sections.append(cur)
+    if sections and not sections[0]["heading"] and not sections[0]["body"]:
+        sections = sections[1:]
+    return sections
+
+
+def _docs_list(sections):
+    """Headings only — for navigation; no bodies (so the no-arg get_doc_section stays tiny)."""
+    return [{"path": s["path"], "heading": s["heading"], "level": s["level"]}
+            for s in sections if s["heading"]]
+
+
+def _docs_get(sections, name):
+    """The one section whose heading best matches `name` (exact, else a loose contains
+    either way), as {path,heading,body}; None if nothing matches."""
+    q = str(name or "").strip().lower()
+    if not q:
+        return None
+    best = None
+    for s in sections:
+        h = s["heading"].lower()
+        if not h:
+            continue
+        if h == q:
+            return {"path": s["path"], "heading": s["heading"], "body": s["body"]}
+        if best is None and (q in h or h in q):
+            best = s
+    if best is not None:
+        return {"path": best["path"], "heading": best["heading"], "body": best["body"]}
+    return None
+
+
+def _doc_snippet(body, words, width=300):
+    """A short window of `body` around the first matched word, bounded to ~width."""
+    b = body or ""
+    low = b.lower()
+    pos = -1
+    for w in words:
+        i = low.find(w)
+        if i >= 0 and (pos < 0 or i < pos):
+            pos = i
+    if pos < 0:
+        return b[:width].strip()
+    start = max(0, pos - width // 3)
+    snip = b[start:start + width].strip()
+    if start > 0:
+        snip = "…" + snip
+    if start + width < len(b):
+        snip = snip + "…"
+    return snip
+
+
+def _docs_search(sections, query, limit=3):
+    """Rank sections by query-word hits (a hit in the heading weighs 5x a body hit) and
+    return up to `limit` {path,heading,snippet}. Empty/again-empty query -> []."""
+    words = [w for w in re.split(r"\W+", str(query or "").lower()) if w]
+    if not words:
+        return []
+    scored = []
+    for s in sections:
+        if not s["heading"] and not s["body"]:
+            continue
+        h, b = s["heading"].lower(), s["body"].lower()
+        score = sum(5 * h.count(w) + b.count(w) for w in words)
+        if score > 0:
+            scored.append((score, s))
+    scored.sort(key=lambda x: -x[0])
+    return [{"path": s["path"], "heading": s["heading"],
+             "snippet": _doc_snippet(s["body"], words)} for _, s in scored[:limit]]
+
+
+def _docs_index():
+    """All documentation sections across the _DOC_FILES whitelist, read once and cached.
+    No globbing: exactly the listed files, each confined to the repo root (defence in
+    depth). An unreadable/missing file is skipped, never fatal."""
+    global _docs_cache
+    if _docs_cache is None:
+        root = os.path.realpath(_REPO_ROOT)
+        out = []
+        for rel in _DOC_FILES:
+            fp = os.path.realpath(os.path.join(root, rel))
+            # never read outside the repo root, whatever the list says
+            if fp != root and not fp.startswith(root + os.sep):
+                continue
+            try:
+                with open(fp, encoding="utf-8") as f:
+                    out.extend(_md_sections(f.read(), rel))
+            except OSError:
+                continue
+        _docs_cache = out
+    return _docs_cache
+
+
+async def handle_dyva_docs(request):
+    """Project documentation for the read_docs / get_doc_section chat tools (PUBLIC —
+    README-class info, no admin gate). `?q=` ranked search with snippets; `?section=` one
+    section by heading; no arg -> the heading list. Context-lean by construction: a whole
+    file is never returned in one call, and the only inputs are a query and a heading name
+    (matched against the in-memory index), never a filesystem path."""
+    secs = _docs_index()
+    q = (request.query.get("q") or "").strip()
+    section = (request.query.get("section") or "").strip()
+    if q:
+        try:
+            limit = max(1, min(5, int(request.query.get("limit", "3"))))
+        except (ValueError, TypeError):
+            limit = 3
+        # Semantic first; falls back to the word-hit ranker when no embedding host is up.
+        hits = await _semantic_search(request.app["session"], EMBED_MODEL, q,
+                                      kinds=("doc",), limit=limit)
+        if hits is None:
+            return web.json_response({"hits": _docs_search(secs, q, limit)})
+        out = []
+        for h in hits:
+            path, _sep, heading = h["ref"].partition("#")
+            out.append({"path": path, "heading": heading, "snippet": h["snippet"]})
+        return web.json_response({"hits": out})
+    if section:
+        got = _docs_get(secs, section)
+        if got is None:
+            return web.json_response(
+                {"error": "no section matching " + repr(section),
+                 "sections": [x["heading"] for x in _docs_list(secs)]}, status=404)
+        if len(got["body"]) > 4000:   # cap one section so a call can't flood the context
+            got = dict(got, body=got["body"][:4000] + "…", truncated=True)
+        return web.json_response(got)
+    return web.json_response({"sections": _docs_list(secs)})
 
 
 MODEL_PRICES_FILE = os.path.join(os.path.dirname(__file__), "model-prices.json")
@@ -5615,8 +5917,10 @@ def parse_model_list(v):
 
 def listed_models():
     """Models for third-party enumeration (/api/tags, /v1/models), with the
-    optional MIN_COUNT floor applied. The dashboard uses all_models() directly
-    and always shows everything.
+    MIN_COUNT host floor applied — show only models served by AT LEAST MIN_COUNT
+    hosts (1 = show all, 2+ hides one-offs). The dashboard (handle_dashboard_models)
+    applies the SAME floor, so the two views agree; it is no longer a listings-only
+    filter.
 
     A non-empty MODEL_LIST replaces the discovered catalog outright. Tools that
     make you pick one id from this endpoint then get a short, stable menu, and
@@ -5919,6 +6223,7 @@ def record_verdict(host, key, outcome, sticky_key=None):
         mark_unreachable(host)
         add_bad(host, key, "conn", reason=outcome.detail)  # ...plus the per-key mark
         clear_last(host)                                   # and stop leading with it (any model)
+        affinity_forget(host)                              # ...including the warm-affinity pin
     elif v == V_TIMEOUT:
         # Alive but didn't deliver (read timeout / stream stall). SOFT demote — good -> maybe_good,
         # never -> bad: a slow/stalling host is sometimes-good, not offline. Keeps it out of the
@@ -5928,10 +6233,13 @@ def record_verdict(host, key, outcome, sticky_key=None):
         clear_last(host, key)   # a stall/timeout must drop the sticky LEAD too — it's checked
                                 # ahead of the tier, so the demotion alone wouldn't stop the host
                                 # getting the exclusive hedge lead (and stalling ~TIMEOUT s) again
+        affinity_forget(host)   # and the affinity pin, for the same reason: a stuck warm host
+                                # fronted by affinity would keep eating the lead window each turn
     elif v in (V_UNSUITABLE, V_FAILED):   # a real fault — this key shows who failed it
         add_bad(host, key, _failure_kind(v, outcome.detail), reason=outcome.detail)
         clear_last(host, key)   # likewise: the sticky outranks the bad tier, so clear it or the
                                 # failed host keeps being tried first
+        affinity_forget(host)   # drop the warm pin too, so it stops fronting the failed host
     # V_SKIP records nothing on purpose
 
 
@@ -6652,6 +6960,18 @@ async def _race_hosts(entries, attempt, key, job_wid=None, workers=None, host_of
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
     finally:
+        # Guaranteed teardown on EVERY exit path — including a cancellation that lands
+        # while the finalization loop above is awaiting (sleep/queue poll). Before this,
+        # a cancel there skipped the in-try teardown (6754-6758) and jumped straight here,
+        # orphaning the watchdog: `done` stayed clear, so it logged "still searching"
+        # for hours, and the worker tasks ran on un-cancelled until the pool drained.
+        # (checked=-1 in those logs = the worker record was already unregistered below
+        # while the watchdog still ran.) done.set()/cancel are idempotent, so the happy
+        # path repeating them is harmless.
+        done.set()
+        _wd.cancel()
+        for _t in tasks:
+            _t.cancel()
         # Stash this race's per-host log onto the worker rather than writing a
         # record here. A record is written ONCE, when the worker COMPLETES (in
         # _unregister_worker) — so it's a record of the whole JOB (all continuation
@@ -7813,6 +8133,7 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
             log.debug(f"  \u2713 {tag}")
             await broadcast_activity(host, model, "connected",
                 f"success: {host}@{model}", duration=dur, wid=wid, rmodel=full)
+            await _affinity_resolve(host, model, wid)
             return accepted(("ok", host, full, data), extra=full)
 
         try:
@@ -7884,6 +8205,7 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
         log.debug(f"  \u2713 {tag}")
         await broadcast_activity(host, model, "connected",
             f"success: {host}@{model}", duration=dur, wid=wid, rmodel=full)
+        await _affinity_resolve(host, model, wid)
         return accepted(("ok_stream", host, full, resp, first_line, first, oai), extra=full)
 
     # Queueing theory: with several requests in flight for the SAME model, each
@@ -8457,7 +8779,8 @@ async def _pump_stream(response, resp, first_line, host, full, openai_format,
 
 
 async def _forward_stream(request, response, resp, first_line, host, full, openai_format,
-                          upstream_openai=False, wid=None, num_ctx=None):
+                          upstream_openai=False, wid=None, num_ctx=None,
+                          cancel=None, skip=None):
     content_type = "text/event-stream" if openai_format else "application/x-ndjson"
     response.headers["Content-Type"] = content_type
     response.headers["Cache-Control"] = "no-cache"
@@ -8471,12 +8794,26 @@ async def _forward_stream(request, response, resp, first_line, host, full, opena
         log.debug("Client disconnected before response headers sent")
         await resp.release()
         return
+    # Re-arm the worker's Stop/Skip handles onto THIS committed stream (mirrors the
+    # chat path's _stream_chat_failover). The race left them pointed at its own, now
+    # finished, cancel — so without this both buttons fire a dead signal once a host
+    # is committed, which is exactly what left /api/generate's Stop and Skip no-ops.
+    if wid:
+        _w = _workers.get(wid)
+        if _w is not None:
+            if cancel is not None:
+                _w["stop"] = cancel.set
+            if skip is not None:
+                _w["skip"] = skip.set
     # This path has no continue/retry machinery, so any status that SWALLOWED the
-    # upstream done ('length'/'truncated'/'capped'/'empty', or an operator 'stopped')
-    # would leave the client hanging. Close the stream with a terminal done unless it
-    # already ended cleanly ('done') or the client is gone ('client').
+    # upstream done ('length'/'truncated'/'capped'/'empty', or an operator 'stopped'/
+    # 'skip') would leave the client hanging. Close the stream with a terminal done
+    # unless it already ended cleanly ('done') or the client is gone ('client'). Skip
+    # has no failover here, so it simply ends the stream — content is undefined (zero
+    # guarantees, esp. mid tool-call); the one promise is the connection isn't dropped.
     status = await _pump_stream(response, resp, first_line, host, full, openai_format,
-                                upstream_openai, wid, num_ctx, ["", 0])
+                                upstream_openai, wid, num_ctx, ["", 0],
+                                cancel=cancel, skip=skip)
     if status not in ("done", "client"):
         with contextlib.suppress(Exception):
             await _write_terminal_done(response, full, openai_format)
@@ -9609,8 +9946,8 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
     # Size for the engage gate only needs to be ROUGH (is this prompt big enough to be worth
     # pinning?), so a cheap chars/4 estimate — never a full tiktoken encode, which would block
     # the event loop on exactly the 100k-token prompts this feature targets.
-    _affinity_ctx.set((_affinity_key(_amsgs),
-                       len(json.dumps(_amsgs, ensure_ascii=False)) // 4 if _amsgs else 0))
+    _acrc = _affinity_key(_amsgs)
+    _affinity_ctx.set((_acrc, len(json.dumps(_amsgs, ensure_ascii=False)) // 4 if _amsgs else 0))
     _servers = find_servers(model_in, req_caps)
     pin_hedge = HEDGE_DELAY
     if sess and sess.get("host"):
@@ -9638,6 +9975,14 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
     # host answers — stash it so the active card can show it during the search/fan-out
     # phase (the MEASURED num_ctx replaces it once a host reports tokens).
     _stash_want_ctx(job_wid, opayload)
+    # Stamp the affinity key + the warm host we're leading with onto the job record, so
+    # worker-jobs.jsonl can CONFIRM the operation: group rows by affinity_crc to see one
+    # conversation's turns, and check they land on the host affinity_match named.
+    _wj = _workers.get(job_wid)
+    if _wj is not None:
+        _wj["affinity_crc"] = _acrc
+        _wj["affinity_match"] = _affinity_match_host()
+    await _affinity_handout(_servers, model_list[0], job_wid)
     try:
         # The sticky (last-good) host is already sorted first in _servers, so
         # the hedged race tries it alone for HEDGE_DELAY seconds and only fans
@@ -9905,9 +10250,13 @@ async def _proxy_generate(request, session):
                 # unchanged. (A native-ollama upstream already streams generate shape; the
                 # proxy's per-line translate is a no-op on those.)
                 gen_out = _GenerateShapeResponse(stream_resp)
+                # Live Stop/Skip for the committed stream: _forward_stream re-arms the
+                # worker's buttons onto these and _pump_stream races them each read.
+                gen_cancel, gen_skip = asyncio.Event(), asyncio.Event()
                 await _forward_stream(request, gen_out, resp, first_line, host, full,
                                       openai_format=False, upstream_openai=_oai,
-                                      wid=job_wid, num_ctx=_effective_num_ctx(body))
+                                      wid=job_wid, num_ctx=_effective_num_ctx(body),
+                                      cancel=gen_cancel, skip=gen_skip)
                 await gen_out.flush_tail()
                 return stream_resp
             msg = "worker manually stopped" if stopped else "all servers failed"
@@ -10525,7 +10874,7 @@ async def handle_unfurl(request):
     _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
            "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36")
     try:
-        conn = aiohttp.TCPConnector(ssl=INSECURE_SSL)
+        conn = _make_connector()   # proxied too when SOCKS_PROXY is set — a preview fetch is egress
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=6), connector=conn) as s:
             async with s.get(url, headers={"User-Agent": _UA, "Accept": "text/html,*/*"},
                              allow_redirects=True, max_redirects=3) as resp:
@@ -10624,6 +10973,180 @@ async def handle_guide(request):
     return web.FileResponse(path, headers={"Cache-Control": "no-cache"})
 
 
+# Cloudflare quick-tunnels (`cloudflared tunnel --url`) mint a fresh random hostname
+# like loan-violin-cute-occurred.trycloudflare.com on every restart, so one ollama
+# behind a tunnel churns through dozens of throwaway hostnames and can advertise a huge
+# model list under each. The name-keyed defences (junk/stub suppression, GGUF-digest
+# collapse) don't catch it — the names look real and vary — so these fold by HOST DOMAIN
+# instead: any model that lives ONLY on *.trycloudflare.com collapses into one row.
+_TCF_RE = re.compile(r"(^|\.)trycloudflare\.com(:\d+)?$")
+
+
+def _is_trycloudflare(host):
+    """True if a pool `server` value is an ephemeral Cloudflare quick-tunnel. Accepts a
+    bare host, host:port, or full URL; matches only the real domain suffix, so a
+    lookalike (nottrycloudflare.com, …trycloudflare.com.evil.net) is rejected."""
+    h = (host or "").strip().lower()
+    if "://" in h:
+        h = h.split("://", 1)[1]
+    h = h.split("/", 1)[0]          # netloc only
+    if "@" in h:
+        h = h.rsplit("@", 1)[1]
+    return bool(_TCF_RE.search(h))
+
+
+def _trycloudflare_fold(model_hosts):
+    """model_hosts maps each model NAME to the set of hosts serving it. A model is
+    'tunnel-only' when it has >=1 host and EVERY host is a *.trycloudflare.com tunnel —
+    a model also served by a real host is left alone so its real presence stays visible.
+    Returns (tunnel_only, host_union): the tunnel-only names and the union of their
+    tunnel hosts (how many distinct tunnels the folded row stands for)."""
+    tunnel_only, host_union = set(), set()
+    for m, hosts in model_hosts.items():
+        if hosts and all(_is_trycloudflare(h) for h in hosts):
+            tunnel_only.add(m)
+            host_union |= hosts
+    return tunnel_only, host_union
+
+
+# Pool-derived dashboard rows (the SLOW half), memoized per re-source. Scanning every
+# host's catalog, hiding junk/stub/imposter names, folding tunnels + rename families, and
+# classifying every distinct name depends ONLY on the sourced pool (free-ollama.json) and
+# the survey — both change at refresh time, not per request — so build it once and reuse
+# it until the next re-source. This was ~1s of CPU on EVERY request (13k hosts, 72k model
+# instances), including every 304, since the body was fully rebuilt just to hash the ETag.
+# Pool HEALTH (good/bad) is live and is NOT cached here — the handler overlays it per
+# request from a cheap GROUP BY. Keyed on _servers_loaded_at, which load_servers() re-stamps
+# every time it re-reads the (invalidated) cache file.
+_dashmodels_cache = None   # (servers_loaded_at, rows_no_health, sizes, kind)
+
+
+def _dashboard_model_rows():
+    """(rows, sizes, kind) for the dashboard, memoized per re-source. `rows` carry NO
+    good/bad — the handler overlays live reputation. Rebuilt only when the pool cache is
+    reloaded (_servers_loaded_at changes); the survey is process-static, so it needs no key."""
+    global _dashmodels_cache
+    servers = load_servers()
+    if _dashmodels_cache is not None and _dashmodels_cache[0] == _servers_loaded_at:
+        return _dashmodels_cache[1], _dashmodels_cache[2], _dashmodels_cache[3]
+    # Per-model GGUF digest from the survey. Renamed junk — probe_zz_*, sysverify-*, zzc_*
+    # — is the same base re-uploaded under throwaway names, so its members share one
+    # digest; we use that to collapse the family into a single row below.
+    survey = load_survey()
+
+    def _model_digest(name):
+        r = survey.get(name)
+        return (r.get("digest") if isinstance(r, dict) else None) or None
+
+    # A sha256 GGUF digest is a model's IDENTITY; a REAL model reports a plausible (>=1MB)
+    # disk size under some name sharing that digest. Byte-sized stubs that carry a digest
+    # but NEVER a real size at any name are exploit/honeypot artifacts — dropped from the
+    # listing (kept in the survey as host signal). No-digest models (openai/vllm/llama.cpp)
+    # and anything ever >=1MB are always kept, so no real model is hidden.
+    real_digest = {str(r["digest"]).lower()
+                   for r in survey.values()
+                   if isinstance(r, dict) and r.get("size") and r.get("digest")}
+
+    def _is_stub(name):
+        dg = _model_digest(name)
+        return bool(dg) and str(dg).lower() not in real_digest
+
+    agg = {}            # model id -> {"count": n, "image": bool}
+    dig_members = {}    # gguf digest -> set of model names sharing it
+    dig_hosts = {}      # gguf digest -> set of hosts serving any member
+    model_hosts = {}    # model name -> set of hosts serving it (for the tunnel fold)
+    for s in servers:
+        host = s.get("server")
+        if not host:
+            continue
+        is_img = s.get("service") in ("a1111", "comfyui")
+        for m in s.get("models") or []:
+            if not m:
+                continue
+            # Hidden from the listing but kept in the pool/survey as host signal: byte-sized
+            # exploit/honeypot stubs, scanner-injected junk namespaces, commercial-name
+            # imposters. None are usable models; listing them just buries the real pool.
+            if (_is_stub(m) or _is_junk_model(m) or _is_fake_name(m)
+                    or _is_commercial_imposter(m)):
+                continue
+            a = agg.get(m)
+            if a is None:
+                a = agg[m] = {"count": 0, "image": is_img}
+            a["count"] += 1
+            if is_img:
+                a["image"] = True
+            model_hosts.setdefault(m, set()).add(host)
+            dg = _model_digest(m)
+            if dg:
+                dig_members.setdefault(dg, set()).add(m)
+                dig_hosts.setdefault(dg, set()).add(host)
+    # Fold the ephemeral tunnels FIRST: every model that lives only on *.trycloudflare.com
+    # drops out of the per-model view and the GGUF families (so a tunnel's churn can't
+    # inflate a real family's host count) and is replaced by one synthetic row below.
+    tunnel_only, tcf_hosts = _trycloudflare_fold(model_hosts)
+    if tunnel_only:
+        for m in tunnel_only:
+            agg.pop(m, None)
+        for dg in list(dig_members):
+            dig_members[dg] -= tunnel_only
+            if not dig_members[dg]:
+                dig_members.pop(dg, None)
+                dig_hosts.pop(dg, None)
+    # Collapse rename families: when FAMILY_MIN+ distinct model NAMES share one GGUF digest,
+    # they're one base under junk names — emit a SINGLE row keyed on a real member name (so
+    # the host drill-down still resolves), carrying `aka` = how many names folded in and a
+    # host count that is the UNION across the family. The representative is the most-served
+    # member (ties broken by name). Image checkpoints never carry a GGUF digest, so untouched.
+    FAMILY_MIN = 3
+    labels = load_gguf_labels()   # digest -> real base name, when known (curated)
+    collapsed = {}      # member name -> representative name (the row that survives)
+    fam_meta = {}       # representative -> {"count", "aka", "label"}
+    for dg, members in dig_members.items():
+        if len(members) < FAMILY_MIN:
+            continue
+        rep = max(members, key=lambda n: (agg.get(n, {}).get("count", 0), n))
+        fam_meta[rep] = {"count": len(dig_hosts.get(dg, ())), "aka": len(members),
+                         "label": labels.get(dg.lower())}
+        for n in members:
+            collapsed[n] = rep
+    rows = []           # NO good/bad — overlaid live in the handler
+    for m, a in agg.items():
+        rep = collapsed.get(m)
+        if rep is not None and rep != m:
+            continue   # folded into its family's representative row
+        _row = {"id": m, "count": a["count"], "image": a["image"]}
+        fm = fam_meta.get(m)
+        if fm:
+            _row["count"] = fm["count"]
+            _row["aka"] = fm["aka"]
+            if fm.get("label"):
+                _row["label"] = fm["label"]
+        if a["image"] and is_nsfw_model(m):   # label image checkpoints only
+            _row["nsfw"] = True
+        rows.append(_row)
+    # One synthetic row standing in for every tunnel-only model: `aka` = how many names
+    # folded in, `count` = how many distinct tunnels, `tunnel` lets the client label it.
+    if tunnel_only:
+        rows.append({"id": "trycloudflare.com", "count": len(tcf_hosts), "image": False,
+                     "aka": len(tunnel_only), "tunnel": True})
+    # Survey per-model sizes (client ">10gb" filter) and the raw classifier KIND per
+    # distinct name (image/image_edit/edit/lora/vision/video/music/audio/other). The RAW
+    # first-match category, NOT model_classes() — the fidelity the image pane's facet needs.
+    sizes = {name: rec["size"] for name, rec in survey.items()
+             if isinstance(rec, dict) and rec.get("size")}
+    kind, _seen = {}, set()
+    for s in servers:
+        for m in s.get("models") or []:
+            if not m or m in _seen:
+                continue
+            _seen.add(m)
+            c = classify_model(m)
+            if c:
+                kind[m] = c
+    _dashmodels_cache = (_servers_loaded_at, rows, sizes, kind)
+    return rows, sizes, kind
+
+
 async def handle_dashboard_models(request):
     """
     Dashboard models (JSON)
@@ -10638,141 +11161,39 @@ async def handle_dashboard_models(request):
             schema:
               type: object
     """
-    servers = load_servers()
-    # Key by MODEL, not by host: the client sorts/facets/filters on aggregates
-    # (how many hosts, how many good/bad), never on the host IPs — those are fetched
-    # on demand (see /dashboard-model-hosts). This turns an (hosts x their models)
-    # payload — the whole private inventory — into one small row per distinct model.
-    # Per-model GGUF digest from the survey (same /api/tags digest graflex already
-    # records). Renamed junk — probe_zz_*, sysverify-*, zzc_* — is the same base
-    # re-uploaded under throwaway names, so its members share one digest; we use
-    # that to collapse the family into a single row below.
-    survey = load_survey()
-
-    def _model_digest(name):
-        r = survey.get(name)
-        return (r.get("digest") if isinstance(r, dict) else None) or None
-
-    # A sha256 GGUF digest is a model's IDENTITY; a REAL model reports a plausible
-    # (>=1MB) disk size under some name sharing that digest (survey records `size`
-    # only from >=1MB sightings). Byte-sized stubs that carry a digest but NEVER a
-    # real size at any name are exploit/honeypot artifacts — cve-*-probe:latest,
-    # ...free.pinggy.net/.../leak_model, .../ns/read (parameter_size "0"/"66K",
-    # sizes of a few bytes). They stay in the survey (signal about the host) but
-    # are NOT usable models, so we drop them from the listing. Guard: a model is
-    # dropped only if it has a digest AND that digest is never real anywhere;
-    # no-digest models (openai/vllm/llama.cpp backends report none) and any model
-    # ever >=1MB are always kept, so no real model is hidden — a junk NAME that
-    # merely re-registers a real digest is kept and collapses into the real row.
-    # (Needs survey.json rebuilt with the size-independent digest vote; on an older
-    # survey digest<->size are coupled, so this drops nothing — a safe no-op.)
-    real_digest = {str(r["digest"]).lower()
-                   for r in survey.values()
-                   if isinstance(r, dict) and r.get("size") and r.get("digest")}
-
-    def _is_stub(name):
-        dg = _model_digest(name)
-        return bool(dg) and str(dg).lower() not in real_digest
-
-    agg = {}            # model id -> {"count": n, "image": bool}
-    dig_members = {}    # gguf digest -> set of model names sharing it
-    dig_hosts = {}      # gguf digest -> set of hosts serving any member
-    for s in servers:
-        host = s.get("server")
-        if not host:
-            continue
-        is_img = s.get("service") in ("a1111", "comfyui")
-        for m in s.get("models") or []:
-            if not m:
-                continue
-            # Hidden from the listing but kept in the pool/survey as host signal:
-            #   * byte-sized exploit/honeypot stubs (digest never >=1MB),
-            #   * scanner-injected junk namespaces (rce.local/, cve-, probe_zz_*,
-            #     sysverify-*, zzc_*, free.pinggy, lima-*-poc-*, IP/attack paths),
-            #   * commercial-name imposters (claude/gpt/gemini spoofs, no open base).
-            # None are usable models; listing them just buries the real pool.
-            if (_is_stub(m) or _is_junk_model(m) or _is_fake_name(m)
-                    or _is_commercial_imposter(m)):
-                continue
-            a = agg.get(m)
-            if a is None:
-                a = agg[m] = {"count": 0, "image": is_img}
-            a["count"] += 1
-            if is_img:
-                a["image"] = True
-            dg = _model_digest(m)
-            if dg:
-                dig_members.setdefault(dg, set()).add(m)
-                dig_hosts.setdefault(dg, set()).add(host)
-    # Complete good/bad host counts per model straight from the reputation DB — one
-    # GROUP BY, and unlike the dashboard-data panes these aren't a truncated slice,
-    # so the coverage bars are exact again.
+    # Slow, pool-derived half: memoized, rebuilt only when the pool is re-sourced.
+    rows, sizes, kind = _dashboard_model_rows()
+    # Live half: good/bad coverage straight from the reputation DB — one GROUP BY, exact
+    # (not a truncated slice). Overlaid per request so the bars stay current even though the
+    # rows above are cached. canon_pattern(id) matches the per-(host,model) status rows.
     gb = {}
     for model, state, n in _get_db().execute(
             f"SELECT model, state, COUNT(*) FROM host_status "
             f"WHERE state IN ('good','bad') AND {_LIVE_REAL} GROUP BY model, state").fetchall():
         gb.setdefault(model, {})[state] = n
-    # Collapse rename families: when FAMILY_MIN+ distinct model NAMES share one GGUF
-    # digest, they're one base under junk names — emit a SINGLE row instead of
-    # hundreds. The surviving row is keyed on a real member name (so the host
-    # drill-down still resolves) and carries `aka` = how many names folded in; its
-    # host count is the UNION across the family. The representative is the
-    # most-served member (ties broken by name) so the row is as "real" as the data
-    # allows. Image checkpoints never carry a GGUF digest, so they're never touched.
-    # (Labeling the row with the true base name is a separate, later layer.)
-    FAMILY_MIN = 3
-    labels = load_gguf_labels()   # digest -> real base name, when known (curated)
-    collapsed = {}      # member name -> representative name (the row that survives)
-    fam_meta = {}       # representative -> {"count", "aka", "label"}
-    for dg, members in dig_members.items():
-        if len(members) < FAMILY_MIN:
-            continue
-        rep = max(members, key=lambda n: (agg.get(n, {}).get("count", 0), n))
-        fam_meta[rep] = {"count": len(dig_hosts.get(dg, ())), "aka": len(members),
-                         "label": labels.get(dg.lower())}
-        for n in members:
-            collapsed[n] = rep
     out = []
-    for m, a in agg.items():
-        rep = collapsed.get(m)
-        if rep is not None and rep != m:
-            continue   # folded into its family's representative row
-        c = gb.get(canon_pattern(m), {})
-        _row = {"id": m, "count": a["count"], "image": a["image"],
-                "good": c.get("good", 0), "bad": c.get("bad", 0)}
-        fm = fam_meta.get(m)
-        if fm:
-            _row["count"] = fm["count"]
-            _row["aka"] = fm["aka"]
-            if fm.get("label"):
-                _row["label"] = fm["label"]
-        if a["image"] and is_nsfw_model(m):   # label image checkpoints only
-            _row["nsfw"] = True
-        out.append(_row)
-    # ship the survey's per-model sizes so the client filter understands ">10gb",
-    # and the release-date lookup so it understands ">2026-02" (fuzzy-matched
-    # client-side, same as the server does for routing).
-    sizes = {name: rec["size"] for name, rec in load_survey().items()
-             if isinstance(rec, dict) and rec.get("size")}
-    # Per-model KIND straight from the hand-curated classifier (CLASSIFIER_FILE ==
-    # graflex/model-classifier.json). This is the RAW first-match category
-    # (image / image_edit / edit / lora / vision / video / music / audio / other),
-    # NOT model_classes() — which consolidates image_edit and drops support assets
-    # (lora/vae/encoder), the very fidelity the image pane's kind facet needs. Text
-    # models don't match any pattern, so this stays scoped to the media/comfy set.
-    kind, _seen = {}, set()
-    for s in servers:
-        for m in s.get("models") or []:
-            if not m or m in _seen:
-                continue
-            _seen.add(m)
-            c = classify_model(m)
-            if c:
-                kind[m] = c
+    for r in rows:
+        c = gb.get(canon_pattern(r["id"]), {})
+        out.append({**r, "good": c.get("good", 0), "bad": c.get("bad", 0)})
+    # Universal MIN_COUNT floor: show only models served by AT LEAST MIN_COUNT hosts, on the
+    # dashboard too. Applied to the final rows so it respects folded family/tunnel counts
+    # (host UNION). 1 = show all; 2+ hides one-offs. Same rule as listed_models().
+    if MIN_COUNT > 1:
+        out = [r for r in out if r.get("count", 0) >= MIN_COUNT]
+    # Trim the companion maps to the models we actually ship: `sizes`/`kind` are built over
+    # the whole surveyed name universe (~2x the shown rows — folded members, hidden junk),
+    # but the client only looks them up by a displayed row id. Pruning roughly halves the
+    # payload with no visible change. (`dates`/`params` are small, keyed differently — kept.)
+    shown = {r["id"] for r in out}
+    sizes = {k: v for k, v in sizes.items() if k in shown}
+    kind = {k: v for k, v in kind.items() if k in shown}
+    # Compact separators (no space after , or :) — this is machine-read by the client,
+    # never eyeballed, so the whitespace is pure payload. Saves ~8% on a map-heavy body.
     body = json.dumps({"models": out, "sizes": sizes, "dates": _load_release_dates(),
-                       "params": _load_ollama_params(), "kind": kind})
-    # This payload is large but changes slowly; serve it with an ETag so the
-    # browser revalidates and gets a tiny 304 instead of re-downloading it.
+                       "params": _load_ollama_params(), "kind": kind}, separators=(",", ":"))
+    # Changes slowly; the ETag lets the browser revalidate to a tiny 304. The expensive
+    # body build is now memoized (above), so producing this ETag no longer costs ~1s of
+    # CPU per request — a 304 is cheap on both ends now, not just the wire.
     etag = '"' + hashlib.md5(body.encode("utf-8")).hexdigest() + '"'
     if request.headers.get("If-None-Match") == etag:
         return web.Response(status=304, headers={"ETag": etag, "Cache-Control": "no-cache"})
@@ -11081,7 +11502,7 @@ async def handle_settings_get(request):
     Get runtime settings (JSON)
     ---
     tags: [UI]
-    summary: Current worker count, timeout, and minimum model count
+    summary: Current worker count, timeout, and minimum hosts per model
     responses:
       '200':
         description: Current settings
@@ -11115,12 +11536,12 @@ async def handle_settings_post(request):
     Update runtime settings (JSON)
     ---
     tags: [UI]
-    summary: Set worker count, timeout, and/or minimum model count (persisted)
+    summary: Set worker count, timeout, and/or minimum hosts per model (persisted)
     responses:
       '200':
         description: Updated settings
     """
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION, RERANK_BUSY_SECS, RERANK_UP_SECS, RERANK_DOWN_SECS, AFFINITY_PREFIX_MSGS, AFFINITY_MIN_TOKENS, AFFINITY_TTL_SECS, AFFINITY_MAX_ENTRIES, AFFINITY_FLOOR_HOSTS
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION, RERANK_BUSY_SECS, RERANK_UP_SECS, RERANK_DOWN_SECS, AFFINITY_PREFIX_MSGS, AFFINITY_MIN_TOKENS, AFFINITY_TTL_SECS, AFFINITY_MAX_ENTRIES, AFFINITY_FLOOR_HOSTS, EMBED_MODEL
     resp = await _check_local(request) or _check_admin(request)
     if resp:
         return resp
@@ -11164,7 +11585,7 @@ async def handle_settings_post(request):
         RACE_WATCHDOG = min(int(body["race_watchdog"]), 3600)   # 0 = off; seconds between logs
     if isinstance(body.get("fanout"), (int, float)) and body["fanout"] > 0:
         FANOUT = body["fanout"]
-    if isinstance(body.get("min_count"), int) and body["min_count"] >= 0:
+    if isinstance(body.get("min_count"), int) and body["min_count"] >= 1:
         MIN_COUNT = body["min_count"]
     if isinstance(body.get("local"), bool):
         _LOCAL = body["local"]
@@ -12011,6 +12432,86 @@ async def handle_refresh(request):
                               "loaded": _hosts_loaded_str()})
 
 
+def _read_log_tail(n=60):
+    """Last n lines of the most recent dyva-<date>.log under CACHE_DIR/logs (bounded);
+    [] if there are none. For the do_action 'read_logs' operator tool."""
+    d = os.path.join(CACHE_DIR, "logs")
+    try:
+        files = sorted(f for f in os.listdir(d)
+                       if f.startswith("dyva-") and f.endswith(".log"))
+    except OSError:
+        return []
+    if not files:
+        return []
+    try:
+        with open(os.path.join(d, files[-1]), encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+    except OSError:
+        return []
+    return [ln.rstrip("\n") for ln in lines[-max(1, n):]]
+
+
+def _analyze_workers():
+    """Compact snapshot of the live race/worker pool for the do_action 'analyze_workers'
+    tool: how many are running, a capped list, and the open-connection count."""
+    snap = _worker_snapshot() or []
+    return {"count": len(snap), "workers": snap[:30], "connections": _conn_count()}
+
+
+async def handle_dyva_action(request):
+    """Operator actions for the do_action chat tool, ALL admin-gated (X-Admin-Key):
+      - update_sources: re-pull sources + reload pool (the work behind /refresh)
+      - read_logs: a bounded tail of today's log
+      - analyze_workers: a compact snapshot of the running race pool
+      - query: a READ-ONLY SELECT against a whitelisted DB (see _safe_select)
+    Returns small, bounded payloads so a call can't flood the chat context."""
+    denied = _check_admin(request)
+    if denied:
+        return denied
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    action = (body.get("action") or "").strip()
+    if action == "update_sources":
+        global _servers_cache, _dead_cache
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, refresh_cache)
+        _servers_cache = None
+        _dead_cache = None
+        servers = load_servers()
+        await loop.run_in_executor(None, gossiper_sync)
+        return web.json_response({"ok": True, "servers": len(servers),
+                                  "models": len(all_models())})
+    if action == "read_logs":
+        try:
+            n = max(1, min(200, int(body.get("lines", 60))))
+        except (TypeError, ValueError):
+            n = 60
+        return web.json_response({"ok": True, "lines": _read_log_tail(n)})
+    if action == "analyze_workers":
+        return web.json_response(dict({"ok": True}, **_analyze_workers()))
+    if action == "query":
+        db = (body.get("db") or "").strip()
+        sql = body.get("sql") or ""
+        try:
+            limit = int(body.get("limit", 50))
+        except (TypeError, ValueError):
+            limit = 50
+        try:
+            res = _safe_select(db, sql, limit)
+        except ValueError as e:
+            return web.json_response({"ok": False, "error": str(e)}, status=400)
+        except sqlite3.Error as e:
+            return web.json_response({"ok": False, "error": "SQL error: " + str(e)}, status=400)
+        return web.json_response(dict({"ok": True}, **res))
+    return web.json_response(
+        {"ok": False, "error": "unknown action %r; use update_sources, read_logs, "
+         "analyze_workers, or query" % action}, status=400)
+
+
 async def handle_api_ps(request):
     """
     Running models (Ollama-compatible)
@@ -12154,6 +12655,92 @@ async def _embed_one(session, host, full, text):
     return embs[0] if embs else None
 
 
+# ---- embedding-quality smoke gate ------------------------------------------------------
+# A host can answer /api/embeddings with a correctly-shaped, fast, deterministic vector that
+# carries NO semantic meaning — a honeypot, or a broken model. Those vectors poison the
+# semantic index: every search then ranks by noise. The #000000 colour smoke screens CHAT
+# hosts, but it can't test an embedder (an embedding model has no chat to answer with), so a
+# fast fake won every embed race and every stored vector came from it. This is the embedder's
+# equivalent smoke: embed a known-SIMILAR pair and one DISSIMILAR item, and check that a real
+# model puts the pair measurably closer than the odd one out. A fake (random vectors) scores
+# ~0 for every pair; a constant embedder (same vector for everything) scores ~1 for every
+# pair — both have ~0 margin and fail. The probe strings are fixed so a host's verdict is
+# reproducible and cacheable.
+EMBED_SMOKE_A = "a photograph of a dog"
+EMBED_SMOKE_B = "a picture of a puppy"                    # ~ A (near-synonym)
+EMBED_SMOKE_C = "quarterly tax accounting spreadsheet"   # far from A/B
+EMBED_SMOKE_MIN_SIM = 0.30      # the similar pair must be at least this close (real nomic ~0.79)
+EMBED_SMOKE_MIN_MARGIN = 0.10   # and at least this much closer than the odd one out (fake ~0)
+
+# (host, full-model) pairs that PASSED / conclusively FAILED the embed smoke in THIS process.
+# The pass set skips re-probing a verified host on every embed; the fail set means a confirmed
+# fake is smoked at most once per run even before add_bad() propagates to find_servers (a
+# 498-item rebuild would otherwise re-smoke the same fake hundreds of times). A FAIL is also
+# persisted via add_bad(), so find_servers drops the fake pair across restarts too. An
+# INCONCLUSIVE result (unreachable) is cached in neither — it stays re-testable.
+_embed_verified = set()
+_embed_failed = set()
+
+
+def _embed_cos(a, b):
+    """Cosine of two equal-length non-zero vectors; None on any degenerate input."""
+    if not a or not b or len(a) != len(b):
+        return None
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    if na <= 0 or nb <= 0:
+        return None
+    return sum(x * y for x, y in zip(a, b)) / (na * nb)
+
+
+def _embed_quality_ok(va, vb, vc,
+                      min_sim=EMBED_SMOKE_MIN_SIM, min_margin=EMBED_SMOKE_MIN_MARGIN):
+    """True iff these three embeddings show real semantic structure: the SIMILAR pair
+    (va,vb) is close AND measurably closer than the DISSIMILAR third vector (vc). Random
+    vectors (all cosines ~0) and constant vectors (all cosines ~1) both have ~0 margin, so
+    both fail. Any degenerate input (zero vector, dimension mismatch) -> False."""
+    sim = _embed_cos(va, vb)
+    da = _embed_cos(va, vc)
+    db = _embed_cos(vb, vc)
+    if sim is None or da is None or db is None:
+        return False
+    margin = sim - max(da, db)
+    return sim >= min_sim and margin >= min_margin
+
+
+async def _embed_verify(session, host, full, model_in=None, wid=None):
+    """Run the embedding smoke against one host. Returns True (real embedder), False (a
+    fake/broken embedder — marked bad per (host,model) so find_servers drops it), or None
+    (couldn't reach/complete the probe — no verdict, re-testable). Mirrors _quick_probe's
+    gate role: it records the verdict, nothing more."""
+    model_in = model_in or full
+    try:
+        va = await _embed_one(session, host, full, EMBED_SMOKE_A)
+        vb = await _embed_one(session, host, full, EMBED_SMOKE_B)
+        vc = await _embed_one(session, host, full, EMBED_SMOKE_C)
+    except (asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
+        await broadcast_activity(host, model_in, "failed",
+            f"embed smoke: {host}@{model_in} - {type(e).__name__}", wid=wid)
+        return None
+    if not (va and vb and vc):
+        await broadcast_activity(host, model_in, "failed",
+            f"embed smoke: {host}@{model_in} - no embedding", wid=wid)
+        return None
+    if _embed_quality_ok(va, vb, vc):
+        await broadcast_activity(host, model_in, "connected",
+            f"embed smoke PASSED: {host}@{model_in}", wid=wid)
+        return True
+    # Well-formed vectors with no semantic structure: a fabricated/broken embedder. Condemn
+    # just this (host, model) embed pair (per-model, reversible) so every embedding consumer
+    # routes around it; the honeypot's other models are left to their own smoke tests.
+    sim = _embed_cos(va, vb)
+    add_bad(host, full, reason=f"embed smoke: no semantic structure (sim={sim:+.3f})")
+    await broadcast_activity(host, model_in, "failed",
+        f"embed smoke: {host}@{model_in} - FAKE, random vectors (sim={sim:+.3f})", wid=wid)
+    log.warning(f"embed smoke FAKE {host} ({full}): similar-pair cos={sim:+.3f} (no structure)")
+    return False
+
+
 async def handle_api_embeddings(request):
     """
     Text embeddings (Ollama /api/embeddings format)
@@ -12214,6 +12801,20 @@ async def handle_api_embeddings(request):
         # same availability-first racing, reputation and failover as everything else.
         _p, host, ms = item
         full = ms[0]
+        # Embedding-quality gate — screen each host ONCE before trusting it, same as _embed_text.
+        # Without this the endpoint counts a fake's well-formed noise as a success and add_good's
+        # it back to state='good', undoing the _embed_verify add_bad and letting the fastest fake
+        # keep winning every race.
+        if (host, full) in _embed_failed:
+            return skip("embed smoke: known fake")
+        if (host, full) not in _embed_verified:
+            sok = await _embed_verify(session, host, full, model, wid=wid)
+            if sok is False:
+                _embed_failed.add((host, full))
+                return skip("failed embed smoke: fake/random vectors")
+            if sok is None:
+                return skip("embed smoke inconclusive")
+            _embed_verified.add((host, full))
         t0 = time.time()
         await broadcast_activity(host, model, "trying", f"trying: {host}@{model}", wid=wid)
         try:
@@ -13260,11 +13861,420 @@ def _chat_delete(cid):
     db.commit()
 
 
+def _chats_search(query, limit=8):
+    """Search saved chats (title + message text) for ALL query words, newest-first.
+    Returns up to `limit` {id, title, snippet} — a short context window around the first
+    match (via _doc_snippet). Bodies are read here but never returned whole. Same store
+    the sidebar lists, so this exposes nothing the chat list doesn't already."""
+    words = [w for w in re.split(r"\W+", str(query or "").lower()) if w]
+    if not words:
+        return []
+    out = []
+    for cid, title, data in _get_chats_db().execute(
+            "SELECT id, title, data FROM chats ORDER BY created DESC").fetchall():
+        try:
+            obj = json.loads(data or "")
+        except (ValueError, TypeError):
+            continue
+        parts = [title or ""]
+        for m in (obj.get("messages") or []) if isinstance(obj, dict) else []:
+            c = m.get("content") if isinstance(m, dict) else None
+            if isinstance(c, str):
+                parts.append(c)
+            elif isinstance(c, list):   # OpenAI-style content parts
+                parts.extend(p.get("text", "") for p in c
+                             if isinstance(p, dict) and isinstance(p.get("text"), str))
+        hay = "\n".join(parts)
+        low = hay.lower()
+        if all(w in low for w in words):
+            out.append({"id": cid, "title": title or "", "snippet": _doc_snippet(hay, words)})
+            if len(out) >= limit:
+                break
+    return out
+
+
+# --- Semantic search index (sqlite-vec) over docs + chats --------------------
+# The substring search_chats is a poor tool: "I talked about routing hiccups" won't find a
+# chat that said "the proxy kept stalling". This index embeds every doc section and chat
+# with ONE pinned model (EMBED_MODEL) so their vectors are comparable, stores them in a
+# vec0 KNN table, and ranks by cosine. It's built LAZILY — a search embeds only the new or
+# changed items ("build up the database on search"), so it costs nothing until used and
+# stays incremental after. No embedding host for the pinned model -> the query can't be
+# embedded -> the search functions return None and the callers fall back to keyword search.
+_sem_db = None
+SEM_TEXT_CHARS = 2000      # cap per-item text fed to the embedder (and stored for snippets)
+SEM_MAX_BUILD = 400        # cap items (re)embedded per search; first build does the corpus
+SEM_BUILD_CONCURRENCY = 16  # embeds fanned out at once (serial over a corpus takes minutes)
+SEM_COMMIT_EVERY = 16       # commit every N stores so an interrupted build keeps its progress
+
+
+def _sem_hash(text):
+    return hashlib.sha1((text or "").encode("utf-8", "ignore")).hexdigest()
+
+
+def _sem_normalize(vec):
+    """Unit-length copy of `vec` (so L2 KNN ranks identically to cosine); None if the
+    vector is empty or all-zero."""
+    try:
+        fv = [float(a) for a in vec]
+    except (TypeError, ValueError):
+        return None
+    n = math.sqrt(sum(a * a for a in fv))
+    if n <= 0 or not fv:
+        return None
+    return [a / n for a in fv]
+
+
+def _get_sem_db():
+    """Open (once) the sqlite-vec index DB with the vec0 extension loaded. Returns None if
+    sqlite-vec isn't importable or the extension won't load — callers then fall back to
+    keyword search instead of crashing."""
+    global _sem_db
+    if _sem_db is None:
+        if sqlite_vec is None:
+            return None
+        try:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            db = sqlite3.connect(SEMINDEX_DB, check_same_thread=False)
+            db.enable_load_extension(True)
+            sqlite_vec.load(db)
+            db.enable_load_extension(False)
+        except (sqlite3.Error, AttributeError, OSError):
+            log.exception("semantic index: sqlite-vec unavailable; keyword search only")
+            return None
+        db.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT)")
+        db.execute("CREATE TABLE IF NOT EXISTS items("
+                   "rowid INTEGER PRIMARY KEY, kind TEXT, ref TEXT, title TEXT, "
+                   "text TEXT, hash TEXT, UNIQUE(kind, ref))")
+        db.commit()
+        _sem_db = db
+    return _sem_db
+
+
+def _sem_meta_get(db, key):
+    r = db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+    return r[0] if r else None
+
+
+def _sem_meta_set(db, key, value):
+    db.execute("INSERT INTO meta(key,value) VALUES(?,?) "
+               "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+
+
+def _sem_ensure_vec(db, dim):
+    """Create the vec0 table at `dim` on first use and remember the dim. Idempotent."""
+    cur = _sem_meta_get(db, "dim")
+    if cur is None:
+        db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS vec_items USING vec0(embedding float[%d])"
+                   % int(dim))
+        _sem_meta_set(db, "dim", int(dim))
+        db.commit()
+        return int(dim)
+    return int(cur)
+
+
+def _sem_check_model(db, model):
+    """If the pinned embedding model changed, every stored vector is from a different model
+    (likely a different dimension) and is no longer comparable — wipe the index so it
+    rebuilds under the new model on the next search."""
+    if _sem_meta_get(db, "model") != model:
+        db.execute("DROP TABLE IF EXISTS vec_items")
+        db.execute("DELETE FROM items")
+        db.execute("DELETE FROM meta WHERE key='dim'")
+        _sem_meta_set(db, "model", model)
+        db.commit()
+
+
+def _chat_text(obj, title):
+    """Title + all message text of one chat, flattened (str content and OpenAI list parts),
+    for embedding/snippets. Same extraction the keyword _chats_search uses."""
+    parts = [title or ""]
+    for m in (obj.get("messages") or []) if isinstance(obj, dict) else []:
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, str):
+            parts.append(c)
+        elif isinstance(c, list):
+            parts.extend(p.get("text", "") for p in c
+                         if isinstance(p, dict) and isinstance(p.get("text"), str))
+    return "\n".join(p for p in parts if p)
+
+
+def _corpus_items():
+    """The unified corpus the index covers: one dict per doc section and per saved chat,
+    {kind, ref, title, text, hash}. `ref` identifies the source (doc 'path#heading', chat
+    id); `text` is capped to SEM_TEXT_CHARS; `hash` is over that capped text so change
+    detection matches exactly what was embedded."""
+    out = []
+    for s in _docs_index():
+        if not s["heading"] and not s["body"]:
+            continue
+        text = ((s["heading"] + "\n" + s["body"]).strip())[:SEM_TEXT_CHARS]
+        out.append({"kind": "doc", "ref": s["path"] + "#" + s["heading"],
+                    "title": s["heading"] or s["path"], "text": text, "hash": _sem_hash(text)})
+    for cid, title, data in _get_chats_db().execute(
+            "SELECT id, title, data FROM chats ORDER BY created DESC").fetchall():
+        try:
+            obj = json.loads(data or "")
+        except (ValueError, TypeError):
+            continue
+        text = _chat_text(obj, title)[:SEM_TEXT_CHARS]
+        if not text:
+            continue
+        out.append({"kind": "chat", "ref": str(cid), "title": title or "",
+                    "text": text, "hash": _sem_hash(text)})
+    return out
+
+
+def _sem_plan(db, items):
+    """Diff the live corpus against what's indexed. Returns (to_delete_rowids, to_embed):
+    items whose (kind,ref) is new or whose hash changed need embedding; rows whose (kind,ref)
+    is gone from the corpus get deleted."""
+    have = {(k, r): (rid, h)
+            for rid, k, r, h in db.execute("SELECT rowid, kind, ref, hash FROM items")}
+    live, to_embed = set(), []
+    for it in items:
+        key = (it["kind"], it["ref"])
+        live.add(key)
+        cur = have.get(key)
+        if cur is None or cur[1] != it["hash"]:
+            to_embed.append(it)
+    to_delete = [rid for (k, r), (rid, _h) in have.items() if (k, r) not in live]
+    return to_delete, to_embed
+
+
+def _sem_remove(db, rowids):
+    for rid in rowids:
+        db.execute("DELETE FROM items WHERE rowid=?", (rid,))
+        db.execute("DELETE FROM vec_items WHERE rowid=?", (rid,))
+
+
+def _sem_store(db, item, vec):
+    """Upsert one item and (re)place its vector. `vec` is already unit-normalized and its
+    length must equal the table's dim (the caller guards that)."""
+    db.execute("INSERT INTO items(kind,ref,title,text,hash) VALUES(?,?,?,?,?) "
+               "ON CONFLICT(kind,ref) DO UPDATE SET "
+               "title=excluded.title, text=excluded.text, hash=excluded.hash",
+               (item["kind"], item["ref"], item["title"], item["text"], item["hash"]))
+    rid = db.execute("SELECT rowid FROM items WHERE kind=? AND ref=?",
+                     (item["kind"], item["ref"])).fetchone()[0]
+    db.execute("DELETE FROM vec_items WHERE rowid=?", (rid,))
+    db.execute("INSERT INTO vec_items(rowid, embedding) VALUES(?,?)",
+               (rid, sqlite_vec.serialize_float32(vec)))
+
+
+def _sem_knn(db, qvec, kinds=None, limit=8):
+    """Nearest items to `qvec` (unit vector), optionally restricted to `kinds`. Returns
+    [{kind, ref, title, snippet, score}] best-first; score is cosine in [0,1]."""
+    if _sem_meta_get(db, "dim") is None:
+        return []
+    want = max(1, min(50, int(limit)))
+    over = want * 5 if kinds else want      # over-fetch so the kind filter can still fill `want`
+    pairs = db.execute(
+        "SELECT rowid, distance FROM vec_items WHERE embedding MATCH ? ORDER BY distance LIMIT ?",
+        (sqlite_vec.serialize_float32(qvec), over)).fetchall()
+    out = []
+    for rid, dist in pairs:
+        row = db.execute("SELECT kind, ref, title, text FROM items WHERE rowid=?", (rid,)).fetchone()
+        if not row:
+            continue
+        kind, ref, title, text = row
+        if kinds and kind not in kinds:
+            continue
+        out.append({"kind": kind, "ref": ref, "title": title or "",
+                    "snippet": (text or "")[:300].strip(),
+                    "score": round(max(0.0, 1.0 - float(dist) * float(dist) / 2.0), 4)})
+        if len(out) >= want:
+            break
+    return out
+
+
+async def _embed_text(session, model, text):
+    """One embedding for `text` from any host serving the pinned `model`, tried in priority
+    order; None if no host produced a vector (caller falls back to keyword search). Each host
+    is screened ONCE by the embedding smoke (_embed_verify) before its vectors are trusted, so
+    a fake/broken embedder that returns well-formed noise can't poison the index or a query —
+    it's skipped and marked bad, and find_servers then routes every consumer around it."""
+    for item in find_servers(model):
+        host, full = item[1], item[2][0]
+        if (host, full) in _embed_failed:         # confirmed fake earlier this run -> skip
+            continue
+        if (host, full) not in _embed_verified:
+            ok = await _embed_verify(session, host, full, model)
+            if ok is False:
+                _embed_failed.add((host, full))   # don't re-smoke a known fake this run
+                continue
+            if ok is None:                        # unreachable -> no verdict, re-testable
+                continue
+            _embed_verified.add((host, full))
+        try:
+            vec = await _embed_one(session, host, full, text)
+        except (asyncio.TimeoutError, aiohttp.ClientError, OSError):
+            continue
+        if vec:
+            return vec
+    return None
+
+
+async def _sem_build(session, model, kinds=None, max_embed=None):
+    """Bring the index in line with the live corpus under the pinned `model`: prune dropped
+    items, then embed new/changed ones (up to SEM_MAX_BUILD, or `max_embed`). The items of
+    the kind(s) being searched are embedded FIRST, so a chat search is never starved by the
+    hundreds of doc sections _corpus_items lists ahead of the chats. Embeds run concurrently
+    (SEM_BUILD_CONCURRENCY at a time) — serial embedding of a whole corpus takes minutes.
+    Best-effort: hosts that fail are skipped and left for the next search. Returns the count
+    embedded."""
+    db = _get_sem_db()
+    if db is None:
+        return 0
+    cap = SEM_MAX_BUILD if max_embed is None else max_embed
+    _sem_check_model(db, model)
+    to_delete, to_embed = _sem_plan(db, _corpus_items())
+    _sem_remove(db, to_delete)
+    db.commit()
+    if kinds:                                       # searched kind first, order stable otherwise
+        to_embed.sort(key=lambda it: 0 if it["kind"] in kinds else 1)
+    if cap:
+        to_embed = to_embed[:cap]
+    if not to_embed:
+        return 0
+
+    gate = asyncio.Semaphore(SEM_BUILD_CONCURRENCY)
+
+    async def _one(it):
+        async with gate:
+            try:
+                return it, await _embed_text(session, model, it["text"])
+            except asyncio.CancelledError:
+                raise                               # a real cancel must propagate, not be swallowed
+            except Exception:
+                return it, None
+
+    # Network embeds fan out concurrently; the sqlite writes stay single-threaded. Crucially the
+    # store+commit happens AS EACH embed completes (not after gathering them all), and we commit
+    # every SEM_COMMIT_EVERY plus once in `finally`. A real-embedder build can take minutes, long
+    # enough for the search's client to disconnect and aiohttp to cancel this handler mid-build;
+    # committing incrementally means the embeds finished so far PERSIST, and the next search picks
+    # up where this one left off (the hash diff skips what's already stored) instead of restarting
+    # from empty forever.
+    tasks = [asyncio.ensure_future(_one(it)) for it in to_embed]
+    embedded = 0
+    try:
+        for fut in asyncio.as_completed(tasks):
+            it, vec = await fut
+            if not vec:
+                continue
+            nv = _sem_normalize(vec)
+            if nv is None:
+                continue
+            dim = _sem_ensure_vec(db, len(nv))
+            if len(nv) != dim:                      # model changed dimension mid-flight; skip
+                continue
+            _sem_store(db, it, nv)
+            embedded += 1
+            if embedded % SEM_COMMIT_EVERY == 0:
+                db.commit()
+    finally:
+        db.commit()                                 # persist whatever completed, even on cancel
+        for t in tasks:                             # don't leak the embeds still in flight
+            if not t.done():
+                t.cancel()
+    return embedded
+
+
+async def _semantic_search(session, model, query, kinds=None, limit=8):
+    """Embedding search over the index. Returns ranked hits
+    [{kind, ref, title, snippet, score}], or None when semantic search is unavailable (no
+    embedding host for `model`, or sqlite-vec missing) so the caller falls back to keyword.
+    An empty query returns []."""
+    query = (query or "").strip()
+    if not query:
+        return []
+    qvec = await _embed_text(session, model, query)
+    if qvec is None:
+        return None                                 # can't embed the query -> no semantic search
+    db = _get_sem_db()
+    if db is None:
+        return None                                 # sqlite-vec missing -> fall back to keyword
+    # Past here, any unexpected failure degrades to the keyword fallback (return None)
+    # rather than 500-ing a search — this tool is a convenience, not a critical path.
+    try:
+        try:
+            await _sem_build(session, model, kinds=kinds)   # searched kind first, bounded
+        except Exception:
+            log.exception("semantic index build failed")
+        nq = _sem_normalize(qvec)
+        dim = _sem_meta_get(db, "dim")
+        if nq is None or dim is None or len(nq) != int(dim):
+            return None
+        return _sem_knn(db, nq, kinds=kinds, limit=limit)
+    except Exception:
+        log.exception("semantic search failed; falling back to keyword")
+        return None
+
+
+# Read-only SQL for the do_action "query" tool (admin-gated at the endpoint). Only these
+# dyva DBs are reachable. "No update" is enforced STRUCTURALLY, not by string-matching:
+# the DB is opened mode=ro (any write raises at the engine) AND an authorizer denies
+# ATTACH (a query can't reach another file on disk) and PRAGMA; execute() runs exactly one
+# statement (a second raises). So no write, no cross-file reach, whatever the SQL says.
+_SELECT_DBS = ("stats", "host_status", "chats")
+
+
+def _select_db_path(db):
+    return {"stats": STATS_DB, "host_status": STATUS_DB, "chats": CHATS_DB}.get(db)
+
+
+def _safe_select(db, sql, limit=50):
+    """Run ONE read-only SELECT against a whitelisted DB; return {columns, rows} (rows
+    capped at `limit`, max 500). Raises ValueError for an unknown db or empty sql, and the
+    underlying sqlite error for anything that isn't a single read-only statement."""
+    path = _select_db_path(db)
+    if path is None:
+        raise ValueError("unknown database %r; choose one of %s" % (db, ", ".join(_SELECT_DBS)))
+    sql = str(sql or "").strip().rstrip(";").strip()
+    if not sql:
+        raise ValueError("empty query")
+    try:
+        limit = max(1, min(500, int(limit)))
+    except (TypeError, ValueError):
+        limit = 50
+    conn = sqlite3.connect("file:%s?mode=ro" % path, uri=True)
+    try:
+        def _auth(action, *a):
+            if action in (sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_PRAGMA):
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+        conn.set_authorizer(_auth)
+        cur = conn.execute(sql)
+        cols = [d[0] for d in (cur.description or [])]
+        rows = [list(r) for r in cur.fetchmany(limit)]
+        return {"columns": cols, "rows": rows}
+    finally:
+        conn.close()
+
+
 async def handle_chats_get(request):
-    """List saved chats (id, title, createdAt) — no message bodies, for the sidebar."""
+    """List saved chats (id, title, createdAt) — no message bodies, for the sidebar.
+    With ?q=, instead returns {hits:[{id,title,snippet}]} — a bounded content search for
+    the search_chats chat tool, behind the SAME localhost gate as the list."""
     resp = await _check_local(request)
     if resp:
         return resp
+    q = (request.query.get("q") or "").strip()
+    if q:
+        try:
+            limit = max(1, min(20, int(request.query.get("limit", "8"))))
+        except (ValueError, TypeError):
+            limit = 8
+        # Semantic first (embeds the query + lazily indexes chats); if no embedding host is
+        # up it returns None and we fall back to the old all-words substring search.
+        hits = await _semantic_search(request.app["session"], EMBED_MODEL, q,
+                                      kinds=("chat",), limit=limit)
+        if hits is None:
+            return web.json_response({"hits": _chats_search(q, limit)})
+        return web.json_response(
+            {"hits": [{"id": h["ref"], "title": h["title"], "snippet": h["snippet"]}
+                      for h in hits]})
     return web.json_response({"chats": _chats_list()})
 
 
@@ -13906,6 +14916,18 @@ async def handle_txt2img(request):
     model_filter = body.pop("model", None)
     requested_model = model_filter or ""
     activity_label = (model_filter or body.get("prompt", "txt2img"))[:60]
+
+    # Optional output shape (long/square/tall), the text-to-image mirror of
+    # edit_image's `aspect`. Map it to width/height here so BOTH the A1111
+    # passthrough and the ComfyUI path honor it; an explicit width/height from the
+    # caller always wins. Anchored on the same 512 budget as the default square, so
+    # "square" stays 512x512 and only the shape changes (snapped to a 64px grid).
+    _asp = str(body.pop("aspect", "") or "").strip().lower()
+    if _asp in VIDEO_ASPECTS and not body.get("width") and not body.get("height"):
+        _ratio = VIDEO_ASPECTS[_asp]
+        _budget = 512 * 512
+        body["width"] = max(64, int(round(math.sqrt(_budget * _ratio) / 64)) * 64)
+        body["height"] = max(64, int(round(math.sqrt(_budget / _ratio) / 64)) * 64)
 
     # One worker for the whole request. Without this the sticky-host fast path
     # below served images with no card in the Workers pane at all — only the
@@ -20061,10 +21083,9 @@ def make_app():
             # (c-ares/aiodns) resolves fully async: thousands of slow lookups in flight
             # cost ~0 threads and never block the loop. ttl_dns_cache=300 stops us
             # re-resolving the same names every 10s (the default).
-            connector=aiohttp.TCPConnector(
-                ssl=INSECURE_SSL, keepalive_timeout=120, limit=0,
-                resolver=aiohttp.AsyncResolver(),
-                use_dns_cache=True, ttl_dns_cache=300),
+            # Direct TCPConnector by default; a SOCKS/HTTP ProxyConnector when SOCKS_PROXY is
+            # set, so the entire pipeline below egresses through the proxy. See _make_connector.
+            connector=_make_connector(),
             timeout=aiohttp.ClientTimeout(total=None),
         )
         app["semaphore"] = asyncio.Semaphore(WORKER_COUNT)
@@ -20207,6 +21228,8 @@ def make_app():
     app.router.add_post("/api/chats/{cid}", handle_chat_post)
     app.router.add_post("/api/chats/{cid}/delete", handle_chat_delete)
     app.router.add_get("/docs/{cid}/{doc}", handle_doc_share)   # shareable document link
+    app.router.add_get("/dyva-docs", handle_dyva_docs)          # read_docs / get_doc_section corpus
+    app.router.add_post("/dyva-action", handle_dyva_action)     # do_action (admin-gated)
     # Chat jobs (the print queue). Plain router: path params + control bodies.
     app.router.add_post("/api/chat/jobs", handle_chat_job_submit)
     app.router.add_get("/api/chat/jobs", handle_chat_jobs_list)
@@ -20288,9 +21311,9 @@ def banner():
             time.sleep(0.04)
 
 def main():
-    global TIMEOUT, PORT, WORKER_COUNT, _LOCAL, _CURLIFY, BASE_PATH, ACTIVITY_LOG
+    global TIMEOUT, PORT, WORKER_COUNT, _LOCAL, _CURLIFY, BASE_PATH, ACTIVITY_LOG, SOCKS_PROXY
 
-    parser = argparse.ArgumentParser(description="dumpster-dyva - Like the Ollama :cloud models, but you don't pay.")
+    parser = argparse.ArgumentParser(description="dyva - Like the Ollama :cloud models, but you don't pay.")
     parser.add_argument("-p", "--port",     type=int, default=PORT, help=f"port to listen on (default: {PORT})")
     parser.add_argument("-u", "--host",     action="append", default=None, metavar="ADDR", help="host address to bind to; repeat to bind several, e.g. -u 127.0.0.1 -u 10.0.0.1 (default: all interfaces)")
     parser.add_argument("--base",           type=str, default=None, help="secret URL path to serve dyva under, e.g. /some-path -> /some-path/v1/models (overrides the base_path setting; default: served at root)")
@@ -20302,6 +21325,7 @@ def main():
     parser.add_argument("--cleanse", nargs="*", metavar="TYPE", help="expunge fake MODEL entries from the pool (hosts are never removed; removals logged to free-ollama.cleansed.json): '--cleanse' dry-run report of all; '--cleanse fake|cloud|junk|all [apply]' to act on one type")
     parser.add_argument("-w", "--workers",  type=int, default=3, help="number of workers (default: 3)")
     parser.add_argument("-l", "--local",    action="store_true", help="restrict inference endpoints to localhost only")
+    parser.add_argument("--socks", type=str, default=None, metavar="URL", help="route ALL upstream connections through a SOCKS/HTTP proxy, e.g. --socks socks5h://127.0.0.1:1080 (DNS resolves at the proxy, no leak). Also honored: $DYVA_SOCKS, $SOCKS_PROXY.")
     parser.add_argument("--source", nargs="+", metavar=("CMD"),
                         help="manage host sources: '--source list', '--source add <url>', "
                              "'--source disable <name>|all', '--source enable <name>|all' "
@@ -20323,6 +21347,12 @@ def main():
     if args.virgin:
         print("🤷 Made by Chris McKenzie")
         return
+    try:
+        SOCKS_PROXY = _resolve_socks(args.socks, os.environ)   # all upstream egress; None = direct
+    except ValueError as e:
+        parser.error(str(e))
+    if SOCKS_PROXY:
+        log.info(f"routing all upstream egress through proxy {SOCKS_PROXY} (DNS at the proxy)")
     if args.config:      # repoint every store BEFORE any command/server touches disk
         _apply_cache_dir(args.config)
     PORT = args.port     # so early ops (e.g. --cleanse apply's reload poke) target the right port
@@ -20421,7 +21451,7 @@ def main():
         log.warning(f"port {PORT} is in use — binding {_cand} instead")
         PORT = _cand
 
-    log.info(f"Starting dumpster-dyva on port {PORT}, WORKER_COUNT={WORKER_COUNT}, TIMEOUT={TIMEOUT}, MIN_COUNT={MIN_COUNT}, LOCAL={_LOCAL}")
+    log.info(f"Starting dyva on port {PORT}, WORKER_COUNT={WORKER_COUNT}, TIMEOUT={TIMEOUT}, MIN_COUNT={MIN_COUNT}, LOCAL={_LOCAL}")
 
     # Big, obvious, clickable (OSC8) links so there's zero hunting for where to go.
     # One line per bound interface (-u may be repeated); a wildcard bind shows as

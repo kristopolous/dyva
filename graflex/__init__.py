@@ -126,6 +126,60 @@ def bogus_score_from_payload(payload):
     return bogus_score_from_models(models or [])
 
 
+# Closed-weight proprietary model FAMILIES whose weights are NOT publicly downloadable — a
+# SELF-HOSTED inference endpoint (ollama/llama.cpp/vllm/localai/...) cannot actually run them.
+# Advertising them is a tell: a costume/honeypot that parrots frontier names (157.245.193.55
+# answered "I'm claude-opus-5.5, hosted with LocalAI" to a verbatim-echo probe), OR a real host
+# someone polluted with fake entries — "probably junk" either way, so dyva low-ranks it. Matched
+# on the bare family AFTER stripping a vendor prefix ("anthropic/claude", "cc/claude", "ag/...").
+# The OPEN lookalikes are excluded BY CONSTRUCTION, never flagged: `gpt-?[0-9]` needs a digit so
+# gpt-oss (Apache-2.0) misses; `gemini` never matches gemma (open); llama/qwen/mistral/deepseek/
+# phi/kimi/command-r are open weights a real host legitimately serves.
+_CLOSED_FAMILY_RE = re.compile(
+    r"""^(?:
+          claude          # Anthropic Claude — never released
+        | gpt-?[0-9]      # OpenAI GPT-3/4/4o/4.1/5/6...  (NOT gpt-oss: needs a digit here)
+        | o[134](?:$|[-:.])  # OpenAI o1 / o3 / o4 reasoning series, standalone
+        | gemini          # Google Gemini  (NOT gemma)
+        | grok            # xAI Grok
+    )""",
+    re.VERBOSE,
+)
+
+
+def _closed_family(name):
+    """True if `name` is a closed-weight proprietary model a self-hosted endpoint cannot run.
+    Drops a vendor prefix ("anthropic/claude..." -> "claude...") and lowercases; open lookalikes
+    (gpt-oss, gemma) are excluded by the pattern itself. Tolerates None / non-str."""
+    if not isinstance(name, str):
+        return False
+    base = name.rsplit("/", 1)[-1].strip().lower()   # drop "anthropic/", "cc/", "ag/", ...
+    return bool(_CLOSED_FAMILY_RE.match(base))
+
+
+def closed_catalog_score_from_models(models):
+    """How many of a host's advertised models are closed-weight names it cannot self-host
+    (per host, additive; 0 = clean). A positive count means the catalogue is a costume or a
+    polluted real host — low-rank it. Reconstitutable: recomputed from the raw model list, so
+    like bogus_score it needs no persisted state. Accepts either dialect's model objects."""
+    n = 0
+    for m in models or []:
+        if _closed_family(_fp_model_name(m)):
+            n += 1
+    return n
+
+
+def closed_catalog_score_from_payload(payload):
+    """closed_catalog_score for a raw check payload — ollama /api/tags (`models`) or openai
+    /v1/models (`data`)."""
+    if not isinstance(payload, dict):
+        return 0
+    models = payload.get("models")
+    if models is None:
+        models = payload.get("data")
+    return closed_catalog_score_from_models(models or [])
+
+
 def _latest_check_dir(session=None):
     base = "/tmp/graflex"
     if session:
@@ -159,6 +213,7 @@ def score_bogus(session=None, name=None):
                   + (f" for session {session}" if session else ""))
         return
     scores = {}
+    closed_flagged = 0
     for fn in os.listdir(check_dir):
         if not fn.endswith(".json"):
             continue
@@ -167,13 +222,22 @@ def score_bogus(session=None, name=None):
             continue
         host = snap.get("host")
         if host:
-            scores[host.rstrip("/")] = bogus_score_from_payload(snap.get("payload") or {})
+            payload = snap.get("payload") or {}
+            # bogus_score sums every survey-time "this host is junk" signal, additively:
+            #   - clone fingerprints (a cloned honeypot image reuses the same model+timestamp)
+            #   - closed-catalogue claims (self-hosting Claude/GPT/Gemini weights is impossible)
+            # Both recomputed from the raw payload, so the stamp stays reconstitutable.
+            closed = closed_catalog_score_from_payload(payload)
+            if closed:
+                closed_flagged += 1
+            scores[host.rstrip("/")] = bogus_score_from_payload(payload) + closed
     dist = {}
     for s in scores.values():
         dist[s] = dist.get(s, 0) + 1
     flagged = sum(v for k, v in dist.items() if k > 0)
     log.info(f"score-bogus: {len(scores)} hosts from {check_dir} | "
-             f"clean={dist.get(0, 0)} bogus={flagged} | dist={dict(sorted(dist.items()))}")
+             f"clean={dist.get(0, 0)} bogus={flagged} (closed-catalogue={closed_flagged}) "
+             f"| dist={dict(sorted(dist.items()))}")
     # Full bogus list to a file (sorted worst-first) so the hundreds are inspectable
     # without scrolling the terminal.
     bogus_sorted = sorted(((s, h) for h, s in scores.items() if s), reverse=True)
@@ -280,6 +344,10 @@ SURVEY_FILE = os.path.join(CACHE_DIR, "survey.json")
 TIMEOUT = 60
 BACKOFF = 11
 MAX_BACKOFF = 300
+# A single FOFA query that keeps timing out is slow-walked server-side, not a dead
+# session — but don't retry it forever. Once one query has burned this many seconds in
+# timeout-retries, drop just that query (the run is resumable via --id) and move on.
+TIMEOUT_GIVEUP_S = 900
 SLEEP_DEFAULT = 4
 STATS_EVERY = 50
 # Partial results reach dyva by re-exporting the current service's json mid-sweep, but the
@@ -295,12 +363,6 @@ def _clean_cookie(value):
 
 FOFA_COOKIE = os.getenv("FOFA_COOKIE", "")
 FOFA_WEB = "https://en.fofa.info/result"
-# Public root, fetched WITHOUT a cookie to tell "FOFA/network is down" apart from
-# "our session is bad". The login-button / daily-limit / access-denied checks only
-# catch auth trouble when FOFA returns a readable page; a stale cookie that instead
-# surfaces as timeouts/connection errors slips past them, so a liveness probe here
-# is the backstop (see _fofa_reachable).
-FOFA_ROOT = "https://en.fofa.info/"
 # Appended to the FOFA result URL to bias toward recently-seen (likelier-alive)
 # hosts. Trial — set to "" to back out. It does NOT affect the cache-file label
 # (which is built from the query axes), so a resumed session still skips pages it
@@ -314,7 +376,9 @@ SHODAN_PAGES = 2
 # ZoomEye's JSON search API. The session cookie is a SECRET, read only from the
 # environment (ZOOMEYE_COOKIE in .env) — never hard-code it or commit it.
 ZOOMEYE_API = "https://www.zoomeye.ai/api/search"
-# ZoomEye serves only the first ~250 results (pageSize 50 -> 5 pages); page 6+ errors.
+# ZoomEye only serves pages 1-5 (page 6+ errors). Without a pageSize param the API
+# returns its default 10 results/page, so a query now tops out at ~50 results (was
+# ~250 when pageSize=50 was accepted — see _fetch_zoomeye).
 ZOOMEYE_MAX_PAGES = 5
 # Always constrain to hosts SEEN in the last N days (after=today-N, before=future),
 # so the limited points budget is spent on fresh, likelier-alive hosts.
@@ -427,6 +491,7 @@ SERVICE_CONFIG = {
         "port": 8188,
         "fofa_query": 'title="ComfyUI"',
         "shodan_query": 'http.title:"ComfyUI"',
+        "zoomeye_query": 'app="comfyui"',
         "check_path": "/models/checkpoints",
         "stats_path": "/api/system_stats",
     },
@@ -1489,24 +1554,6 @@ def _shodan_path(label, run_ts, svc="any"):
     return os.path.join("/tmp/graflex", run_ts, "shodan", f"{svc}-{label}.txt")
 
 
-def _fofa_reachable():
-    """Probe FOFA's public root with NO cookie, to split "FOFA (or our network) is
-    down" from "our FOFA session is bad". A 200 means FOFA itself is up and
-    answering, so repeated failures on our authenticated search requests are almost
-    certainly an auth problem — a stale/expired FOFA_COOKIE — not an outage. Returns
-    True if the root is up, False if even the no-cookie root fails (genuinely down /
-    we're offline). Deliberately no cookie and a short timeout; never raises."""
-    import requests
-    try:
-        r = requests.get(
-            FOFA_ROOT, timeout=10, allow_redirects=True,
-            headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                                   "(KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"})
-        return r.status_code == 200
-    except Exception:
-        return False
-
-
 def _fetch_web(dry, service, combined, country=None, port=None, server=None, run_ts=None, curlify=False, label="", pname="any"):
     import base64
     import re
@@ -1541,6 +1588,7 @@ def _fetch_web(dry, service, combined, country=None, port=None, server=None, run
     backoff = BACKOFF
     attempt = 0
     timeouts = 0
+    timeout_waited = 0
     while True:
         try:
             resp = requests.get(url, headers=headers, timeout=30)
@@ -1615,30 +1663,28 @@ def _fetch_web(dry, service, combined, country=None, port=None, server=None, run
                 log.error(f"FOFA web request failed on query {combined!r} [{pname}]: {e}")
                 return None
         except requests.exceptions.Timeout as e:
-            # Read/connect timeouts are transient network conditions — retry
-            # with backoff instead of silently dropping the query. This branch
-            # retries indefinitely (the run is resumable; dropping a query loses
-            # its hosts), so the message names the query and the running count so
-            # a single stuck query is distinguishable from cache progress.
+            # A read timeout means FOFA accepted the request but is slow-walking THIS
+            # authenticated search (a heavy multi-facet query, or server-side throttling)
+            # — NOT a bad session. A stale/expired cookie makes FOFA serve the logged-OUT
+            # page, which the `login-button` check above catches deterministically and
+            # fast; a dead cookie does not time out. So retry with backoff, but bound it:
+            # once one query has burned TIMEOUT_GIVEUP_S in retries, drop just that query
+            # (return None — the run is resumable; it wrote no cache file, so a later --id
+            # run re-fetches it) instead of spinning forever. We never probe the no-cookie
+            # root to guess "stale cookie" and hard-stop the whole run: that inference is
+            # invalid (the landing page says nothing about the authenticated search
+            # endpoint) and kills a long survey over a single slow query.
             timeouts += 1
+            if timeout_waited >= TIMEOUT_GIVEUP_S:
+                log.error(f"FOFA query {combined!r} [{pname}] still timing out after "
+                          f"{_fmt_duration(timeout_waited)} ({timeouts} timeouts) — "
+                          f"dropping this query; resume with --id {run_ts} to retry it.")
+                return None
             waited = f", {timeouts} timeouts so far" if timeouts > 1 else ""
             log.warning(f"timeout ({type(e).__name__}) reading FOFA for query "
                         f"{combined!r} [{pname}]{waited}, retrying in {backoff}s")
-            # A stale cookie can surface as a read timeout rather than the logged-out
-            # page, so the login-button check never sees it and this branch would
-            # otherwise retry forever. After a couple of timeouts (and periodically
-            # after), probe FOFA's root with NO cookie: if the root is up, FOFA isn't
-            # down — our session is. That's a hard stop, same as the logged-out page.
-            if timeouts == 2 or (timeouts > 2 and timeouts % 8 == 0):
-                if _fofa_reachable():
-                    log.error(f"FOFA root responds (200) without a cookie but our "
-                              f"authenticated requests keep timing out — almost "
-                              f"certainly a stale FOFA_COOKIE, not an outage. Refresh "
-                              f"FOFA_COOKIE in .env, then resume with --id {run_ts}")
-                    raise SystemExit(3)
-                log.warning("FOFA root unreachable too — treating as a real outage, "
-                            "still retrying")
             time.sleep(backoff)
+            timeout_waited += backoff
             backoff = min(int(backoff * 1.2), MAX_BACKOFF)
             continue
         except Exception as e:
@@ -3253,12 +3299,22 @@ async def _check_hosts(hosts, service, working_file, notworking_file, check_time
                 result, method = {"error": (str(e) or type(e).__name__)[:200]}, None
             except Exception as e:
                 result, method = {"error": f"{type(e).__name__}: {e}"[:200]}, None
-            # Honeypot gate, INSIDE the check: a host that probes OK but whose whole
-            # freshly-listed catalog is the phantom frozen set gets one benign
-            # /wp-login.php GET (tiny subset). 200 => record as honeypot, not working.
-            honeypot = (isinstance(result, dict) and "error" not in result
-                        and _host_models(result) and _host_models(result) <= HONEYPOT_MODELS
-                        and await _is_honeypot(session, entry["host"], check_timeout))
+            # Honeypot gate, INSIDE the check. Two independent tells, either is enough:
+            #   - synthetic /api/tags digests: a costume mints its catalog from a rolling
+            #     counter (byte-ramps + shifted copies), so the "digests" are valid hex but
+            #     not random. These hosts parrot frontier names they can't run and stall
+            #     agentic runs (no real tool calls). Detected from already-fetched data, no
+            #     extra probe, no /wp-login.php needed — the digest math is proof enough.
+            #   - whole freshly-listed catalog is the phantom frozen set: one benign
+            #     /wp-login.php GET (tiny subset), 200 => honeypot.
+            honeypot_detail = None
+            if isinstance(result, dict) and "error" not in result:
+                if synthetic_digest_catalog(result):
+                    honeypot_detail = "synthetic /api/tags digests"
+                elif (_host_models(result) and _host_models(result) <= HONEYPOT_MODELS
+                      and await _is_honeypot(session, entry["host"], check_timeout)):
+                    honeypot_detail = "phantom catalog + /wp-login.php 200"
+            honeypot = honeypot_detail is not None
 
         key = _entry_host(entry)
         ok = False
@@ -3270,7 +3326,7 @@ async def _check_hosts(hosts, service, working_file, notworking_file, check_time
                       "reason": "honeypot", "result": "honeypot",
                       "checked": datetime.now(timezone.utc).isoformat()}
                 _store_record(service, entry["host"], "notworking", nr)
-                log.warning(f"~ {entry['host']}: honeypot (phantom catalog + /wp-login.php 200)")
+                log.warning(f"~ {entry['host']}: honeypot ({honeypot_detail})")
             elif isinstance(result, dict) and "error" not in result:
                 result["checked"] = result.get("checked", datetime.now(timezone.utc).isoformat())
                 # Identity stays the claimed host (stable survey key); how it was
@@ -3425,6 +3481,68 @@ async def _is_honeypot(session, host, timeout):
             return r.status == 200
     except Exception:
         return False
+
+
+# A model `digest` that is a real sha256 (optionally sha256:-prefixed), captured so we can
+# tell it apart from a byte-sized/ASCII costume value. Distinct from the _SHA used in the
+# refresh builder; module-level so the honeypot gate and tests share it.
+_DIGEST_HEX_RE = re.compile(r'(?:sha256:)?([0-9a-f]{64})$', re.I)
+
+
+def _digest_hex(value):
+    """The 64-char sha256 hex of a model `digest`, lowercased, or None if it isn't one."""
+    if not isinstance(value, str):
+        return None
+    m = _DIGEST_HEX_RE.match(value.strip())
+    return m.group(1).lower() if m else None
+
+
+def _synthetic_digest(value):
+    """True if a single digest is machine-generated rather than a real sha256. A costume
+    mints its "digests" from a rolling counter, so consecutive bytes advance by a fixed
+    step (a ramp) or cycle with a short period; a genuine sha256's 31 consecutive byte
+    deltas are nearly all distinct (~28-31 unique). Collapsing to half or fewer = fake."""
+    hexd = _digest_hex(value)
+    if not hexd:
+        return False
+    b = bytes.fromhex(hexd)
+    diffs = [(b[i + 1] - b[i]) % 256 for i in range(len(b) - 1)]
+    return len(set(diffs)) <= len(diffs) // 2
+
+
+def _shares_run(a, b, n):
+    """True if hex strings a and b share any identical substring of length >= n."""
+    runs = {a[i:i + n] for i in range(len(a) - n + 1)}
+    return any(b[i:i + n] in runs for i in range(len(b) - n + 1))
+
+
+def synthetic_digest_catalog(payload):
+    """True if a check payload's /api/tags digests are machine-generated — the costume
+    tell behind a honeypot that parrots model names it cannot run. The digests are VALID
+    hex (so `_SHA` and the ouroboros guard pass them); the giveaway is that they are NOT
+    random: a single ramp digest, or a whole catalog minted from one rolling sequence so
+    two digests share a long substring. Fires on ANY such evidence, tolerating the few
+    real-looking digests a costume sprinkles in. openai/vllm /v1/models carry no digests,
+    so this never fires there (they fall through to the closed-family bogus_score)."""
+    if isinstance(payload, dict):
+        items = payload.get("models") or payload.get("data") or []
+    elif isinstance(payload, list):
+        items = payload
+    else:
+        return False
+    hexes = [h for m in items if isinstance(m, dict)
+             for h in (_digest_hex(m.get("digest")),) if h]
+    if not hexes:
+        return False
+    if any(_synthetic_digest(h) for h in hexes):
+        return True
+    # 32 hex = 16 bytes: two independent sha256 colliding on a run this long is ~2**-128,
+    # so a shared run means both were cut from one generated sequence (byte-shifted copies).
+    for i in range(len(hexes)):
+        for j in range(i + 1, len(hexes)):
+            if _shares_run(hexes[i], hexes[j], 32):
+                return True
+    return False
 
 
 async def _check_working(service, name=None, check_timeout=60, workers=10, session=None,

@@ -231,7 +231,7 @@ ENDL
   # expires, so run this by hand after refreshing the cookie (unlike the stable
   # Shodan API key). ZoomEye caps a query at ~250 results, so it's a quick pass.
   zoomeye)
-    for service in ollama llamacpp lmstudio; do
+    for service in comfyui ollama llamacpp lmstudio; do
       "$CMD" zoomeye-"$service" "${SUB_ARGS[@]}" 
     done
     exit 0
@@ -250,6 +250,12 @@ ENDL
     SITE=zoomeye
     COUNTRIES="US,CN,IR,DE,FR"
     PORTS="8082,8001,8000,11434,8090,8081"
+    ;;
+
+  zoomeye-comfyui)
+    SERVICE=comfyui
+    SITE=zoomeye
+    COUNTRIES="US,CN,RU,TR,KR,TH,RO,TW,DE,HK,JP,BR,VN,CA,FR,ES,IN,SG,CL,IT,NL,GB"
     ;;
 
   zoomeye-lmstudio)

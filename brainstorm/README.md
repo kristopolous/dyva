@@ -17,6 +17,7 @@ shipped have graduated out of here (into the code and `docs/`).
 | [dumb-gateway-split.md](dumb-gateway-split.md) | idea | split dyva into a dumb host-racing gateway + a light app tier that owns chat features & detachable jobs |
 | [skip-to-next-host.md](skip-to-next-host.md) | designed | restore the per-worker "skip" control — abandon a stalled host for the next, connection never dropped, partial toolcalls truncated to invalid |
 | [auth-required-hosts.md](auth-required-hosts.md) | idea | recognize 401 "API token required" (LM Studio/Bearer) and quarantine the host instead of re-racing it |
+| [self-update-tab.md](self-update-tab.md) | designed, knobs open | a tab of packaged updater-agents that refresh web-sourced reference data (pricing, evals…) over dyva's own pool, feeding **alias routes** (`=image-edit`) |
 
 Status legend: **designed** = written down, ready to build, not built · **parked** =
 deliberately on hold with a named trigger to revisit · **idea** = early thinking,
