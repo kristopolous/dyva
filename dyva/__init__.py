@@ -10918,8 +10918,10 @@ async def handle_dashboard_models(request):
     shown = {r["id"] for r in out}
     sizes = {k: v for k, v in sizes.items() if k in shown}
     kind = {k: v for k, v in kind.items() if k in shown}
+    # Compact separators (no space after , or :) — this is machine-read by the client,
+    # never eyeballed, so the whitespace is pure payload. Saves ~8% on a map-heavy body.
     body = json.dumps({"models": out, "sizes": sizes, "dates": _load_release_dates(),
-                       "params": _load_ollama_params(), "kind": kind})
+                       "params": _load_ollama_params(), "kind": kind}, separators=(",", ":"))
     # Changes slowly; the ETag lets the browser revalidate to a tiny 304. The expensive
     # body build is now memoized (above), so producing this ETag no longer costs ~1s of
     # CPU per request — a 304 is cheap on both ends now, not just the wire.
