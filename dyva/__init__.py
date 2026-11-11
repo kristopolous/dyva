@@ -503,7 +503,7 @@ CONTINUATION_HEDGE_PROBE = 45
 # host is probably cold/evicted (prompt cache gone, maybe the box rebooted), so the
 # hedge's reason to prefer it is stale — drop the stickiness and race normally.
 STICKY_TTL = 2 * 3600   # 2 hours
-MIN_COUNT = 0   # hide models served by fewer than this many hosts (0/1 = show all)
+MIN_COUNT = 2   # show only models served by at least this many hosts (1 = show all; 2 = hide one-offs, the default)
 EXPLORE_MODE = False   # route UNKNOWN/unvisited hosts first to map more of the pool (slower)
 # "Hide dyva": when on, a remote bot/curl GET of a WEB PAGE (the dashboard/HTML, not
 # the /v1 or /api endpoints) gets an empty 404 instead of the UI — so a drive-by
@@ -796,7 +796,7 @@ def load_settings():
         RACE_WATCHDOG = s["race_watchdog"]
     if isinstance(s.get("fanout"), (int, float)) and s["fanout"] > 0:
         FANOUT = s["fanout"]
-    if isinstance(s.get("min_count"), int) and s["min_count"] >= 0:
+    if isinstance(s.get("min_count"), int) and s["min_count"] >= 1:
         MIN_COUNT = s["min_count"]
     if isinstance(s.get("admin_pw"), str):
         ADMIN_PW = s["admin_pw"]
@@ -5716,8 +5716,10 @@ def parse_model_list(v):
 
 def listed_models():
     """Models for third-party enumeration (/api/tags, /v1/models), with the
-    optional MIN_COUNT floor applied. The dashboard uses all_models() directly
-    and always shows everything.
+    MIN_COUNT host floor applied — show only models served by AT LEAST MIN_COUNT
+    hosts (1 = show all, 2+ hides one-offs). The dashboard (handle_dashboard_models)
+    applies the SAME floor, so the two views agree; it is no longer a listings-only
+    filter.
 
     A non-empty MODEL_LIST replaces the discovered catalog outright. Tools that
     make you pick one id from this endpoint then get a short, stable menu, and
@@ -10903,6 +10905,12 @@ async def handle_dashboard_models(request):
             c = classify_model(m)
             if c:
                 kind[m] = c
+    # Universal MIN_COUNT floor: show only models served by AT LEAST MIN_COUNT hosts,
+    # on the dashboard too (it was listings-only before). Applied to the final rows so it
+    # respects folded family/tunnel counts (host UNION), which is the honest host coverage.
+    # 1 = show all; 2+ hides one-offs. Same rule as listed_models(); keeps the two in sync.
+    if MIN_COUNT > 1:
+        out = [r for r in out if r.get("count", 0) >= MIN_COUNT]
     body = json.dumps({"models": out, "sizes": sizes, "dates": _load_release_dates(),
                        "params": _load_ollama_params(), "kind": kind})
     # This payload is large but changes slowly; serve it with an ETag so the
@@ -11215,7 +11223,7 @@ async def handle_settings_get(request):
     Get runtime settings (JSON)
     ---
     tags: [UI]
-    summary: Current worker count, timeout, and minimum model count
+    summary: Current worker count, timeout, and minimum hosts per model
     responses:
       '200':
         description: Current settings
@@ -11247,7 +11255,7 @@ async def handle_settings_post(request):
     Update runtime settings (JSON)
     ---
     tags: [UI]
-    summary: Set worker count, timeout, and/or minimum model count (persisted)
+    summary: Set worker count, timeout, and/or minimum hosts per model (persisted)
     responses:
       '200':
         description: Updated settings
@@ -11296,7 +11304,7 @@ async def handle_settings_post(request):
         RACE_WATCHDOG = min(int(body["race_watchdog"]), 3600)   # 0 = off; seconds between logs
     if isinstance(body.get("fanout"), (int, float)) and body["fanout"] > 0:
         FANOUT = body["fanout"]
-    if isinstance(body.get("min_count"), int) and body["min_count"] >= 0:
+    if isinstance(body.get("min_count"), int) and body["min_count"] >= 1:
         MIN_COUNT = body["min_count"]
     if isinstance(body.get("local"), bool):
         _LOCAL = body["local"]

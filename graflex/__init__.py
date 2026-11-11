@@ -3299,12 +3299,22 @@ async def _check_hosts(hosts, service, working_file, notworking_file, check_time
                 result, method = {"error": (str(e) or type(e).__name__)[:200]}, None
             except Exception as e:
                 result, method = {"error": f"{type(e).__name__}: {e}"[:200]}, None
-            # Honeypot gate, INSIDE the check: a host that probes OK but whose whole
-            # freshly-listed catalog is the phantom frozen set gets one benign
-            # /wp-login.php GET (tiny subset). 200 => record as honeypot, not working.
-            honeypot = (isinstance(result, dict) and "error" not in result
-                        and _host_models(result) and _host_models(result) <= HONEYPOT_MODELS
-                        and await _is_honeypot(session, entry["host"], check_timeout))
+            # Honeypot gate, INSIDE the check. Two independent tells, either is enough:
+            #   - synthetic /api/tags digests: a costume mints its catalog from a rolling
+            #     counter (byte-ramps + shifted copies), so the "digests" are valid hex but
+            #     not random. These hosts parrot frontier names they can't run and stall
+            #     agentic runs (no real tool calls). Detected from already-fetched data, no
+            #     extra probe, no /wp-login.php needed — the digest math is proof enough.
+            #   - whole freshly-listed catalog is the phantom frozen set: one benign
+            #     /wp-login.php GET (tiny subset), 200 => honeypot.
+            honeypot_detail = None
+            if isinstance(result, dict) and "error" not in result:
+                if synthetic_digest_catalog(result):
+                    honeypot_detail = "synthetic /api/tags digests"
+                elif (_host_models(result) and _host_models(result) <= HONEYPOT_MODELS
+                      and await _is_honeypot(session, entry["host"], check_timeout)):
+                    honeypot_detail = "phantom catalog + /wp-login.php 200"
+            honeypot = honeypot_detail is not None
 
         key = _entry_host(entry)
         ok = False
@@ -3316,7 +3326,7 @@ async def _check_hosts(hosts, service, working_file, notworking_file, check_time
                       "reason": "honeypot", "result": "honeypot",
                       "checked": datetime.now(timezone.utc).isoformat()}
                 _store_record(service, entry["host"], "notworking", nr)
-                log.warning(f"~ {entry['host']}: honeypot (phantom catalog + /wp-login.php 200)")
+                log.warning(f"~ {entry['host']}: honeypot ({honeypot_detail})")
             elif isinstance(result, dict) and "error" not in result:
                 result["checked"] = result.get("checked", datetime.now(timezone.utc).isoformat())
                 # Identity stays the claimed host (stable survey key); how it was
@@ -3471,6 +3481,68 @@ async def _is_honeypot(session, host, timeout):
             return r.status == 200
     except Exception:
         return False
+
+
+# A model `digest` that is a real sha256 (optionally sha256:-prefixed), captured so we can
+# tell it apart from a byte-sized/ASCII costume value. Distinct from the _SHA used in the
+# refresh builder; module-level so the honeypot gate and tests share it.
+_DIGEST_HEX_RE = re.compile(r'(?:sha256:)?([0-9a-f]{64})$', re.I)
+
+
+def _digest_hex(value):
+    """The 64-char sha256 hex of a model `digest`, lowercased, or None if it isn't one."""
+    if not isinstance(value, str):
+        return None
+    m = _DIGEST_HEX_RE.match(value.strip())
+    return m.group(1).lower() if m else None
+
+
+def _synthetic_digest(value):
+    """True if a single digest is machine-generated rather than a real sha256. A costume
+    mints its "digests" from a rolling counter, so consecutive bytes advance by a fixed
+    step (a ramp) or cycle with a short period; a genuine sha256's 31 consecutive byte
+    deltas are nearly all distinct (~28-31 unique). Collapsing to half or fewer = fake."""
+    hexd = _digest_hex(value)
+    if not hexd:
+        return False
+    b = bytes.fromhex(hexd)
+    diffs = [(b[i + 1] - b[i]) % 256 for i in range(len(b) - 1)]
+    return len(set(diffs)) <= len(diffs) // 2
+
+
+def _shares_run(a, b, n):
+    """True if hex strings a and b share any identical substring of length >= n."""
+    runs = {a[i:i + n] for i in range(len(a) - n + 1)}
+    return any(b[i:i + n] in runs for i in range(len(b) - n + 1))
+
+
+def synthetic_digest_catalog(payload):
+    """True if a check payload's /api/tags digests are machine-generated — the costume
+    tell behind a honeypot that parrots model names it cannot run. The digests are VALID
+    hex (so `_SHA` and the ouroboros guard pass them); the giveaway is that they are NOT
+    random: a single ramp digest, or a whole catalog minted from one rolling sequence so
+    two digests share a long substring. Fires on ANY such evidence, tolerating the few
+    real-looking digests a costume sprinkles in. openai/vllm /v1/models carry no digests,
+    so this never fires there (they fall through to the closed-family bogus_score)."""
+    if isinstance(payload, dict):
+        items = payload.get("models") or payload.get("data") or []
+    elif isinstance(payload, list):
+        items = payload
+    else:
+        return False
+    hexes = [h for m in items if isinstance(m, dict)
+             for h in (_digest_hex(m.get("digest")),) if h]
+    if not hexes:
+        return False
+    if any(_synthetic_digest(h) for h in hexes):
+        return True
+    # 32 hex = 16 bytes: two independent sha256 colliding on a run this long is ~2**-128,
+    # so a shared run means both were cut from one generated sequence (byte-shifted copies).
+    for i in range(len(hexes)):
+        for j in range(i + 1, len(hexes)):
+            if _shares_run(hexes[i], hexes[j], 32):
+                return True
+    return False
 
 
 async def _check_working(service, name=None, check_timeout=60, workers=10, session=None,
