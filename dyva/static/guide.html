@@ -7,7 +7,7 @@
 <!-- Crawlers found this: bingbot walked the dashboard and indexed a 496KB page of
      live host addresses. /robots.txt is not reliably ours to serve (a reverse proxy
      may own the root), but this tag ships inside the page itself. -->
-<title>free-ollama guide</title>
+<title>dyva guide</title>
 <style>
 :root{--bg:#161616;--surface:#1e1e1e;--card:#232323;--border:#333;--text:#e6e6e6;
       --text-2:#b9b9b9;--dim:#8a8a8a;--accent:#7aa2f7;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
@@ -38,7 +38,7 @@ footer{margin-top:3em;color:var(--dim);font-size:.85rem;border-top:1px solid var
 <body>
 <div class="wrap">
 
-<h1>free-ollama</h1>
+<h1>dyva</h1>
 <p class="lead">Instrumentation for surveying the open inference servers sitting on the public internet — and a proxy that routes to them. Two parts: <b>graflex</b> finds and classifies hosts; <b>dyva</b> serves them behind one API.</p>
 <div class="top-links">
   <span class="pill">API reference</span> <a href="docs/" target="_blank">Swagger / OpenAPI docs →</a>
@@ -76,7 +76,7 @@ curl http://THIS-HOST:PORT/api/chat -d '{"model":"gemma3","messages":[{"role":"u
 
 # OpenAI-style
 curl http://THIS-HOST:PORT/v1/chat/completions -d '{"model":"qwen3","messages":[...]}'</code></pre>
-<p>Model names are <b>routing patterns</b>: partials and globs work (<code>qwen*27b</code>, <code>abliterated</code>), as do comma fallbacks (<code>gemma3,qwen</code>), size filters by disk heft (<code>&gt;10gb</code>, <code>qwen &lt;=4gb</code>) and release-date filters (<code>qwen&gt;2026-02</code>, even <code>qwen&gt;2026-02&gt;5gb</code>). One name covers every matching variant on every host. Media (image / edit / video / TTS) rides the OpenAI-ish endpoints under <code>/v1/…</code> and <code>/sdapi/…</code> — see the <a href="docs/" target="_blank">Swagger docs</a>.</p>
+<p>Model names are <b>routing patterns</b>: partials and globs work (<code>qwen*27b</code>, <code>abliterated</code>), as do comma fallbacks (<code>gemma3,qwen</code>), size filters by disk heft (<code>&gt;10gb</code>, <code>qwen &lt;=4gb</code>) and release-date filters (<code>qwen&gt;2026-02</code>, even <code>qwen&gt;2026-02&gt;5gb</code>). One name covers every matching variant on every host. There's more — host-reputation facets (<code>;tps&gt;40</code>, <code>;state=good</code>) and a capability override (<code>;caps=text;qwen3</code> to attach an image yet route to a non-vision model); see the <a href="https://github.com/kristopolous/free-ollama/blob/main/docs/syntax-query.md" target="_blank">full query-syntax reference</a>. Media (image / edit / video / TTS) rides the OpenAI-ish endpoints under <code>/v1/…</code> and <code>/sdapi/…</code> — see the <a href="docs/" target="_blank">Swagger docs</a>.</p>
 
 <h3>Adding a source (settings)</h3>
 <p>dyva's host list comes from one or more <b>sources</b>: the public discovery cache, or a private federation you point it at. Manage them in the dashboard <b>Settings</b> tab (paste a source URL), or from the CLI:</p>
@@ -102,7 +102,7 @@ curl http://THIS-HOST:PORT/v1/chat/completions -d '{"model":"qwen3","messages":[
 ./dyva.py -l                       # localhost-only inference</code></pre>
 
 <footer>
-free-ollama · <a href="docs/" target="_blank">API docs</a> · <a href="https://github.com/kristopolous/free-ollama" target="_blank">github.com/kristopolous/free-ollama</a>
+dyva · <a href="docs/" target="_blank">API docs</a> · <a href="https://github.com/kristopolous/free-ollama" target="_blank">github.com/kristopolous/free-ollama</a>
 <br>Host geolocation: IP data by <a href="https://db-ip.com" target="_blank" rel="noopener">DB-IP</a> (CC BY 4.0).
 </footer>
 

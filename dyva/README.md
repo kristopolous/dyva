@@ -378,7 +378,8 @@ Notes:
 
 A model name is a query, not an exact id — the same syntax everywhere a model is
 named (the `model` field of any endpoint, the chat model picker, the dashboard's
-Server-Room filter, and the map's compare boxes):
+Server-Room filter, and the map's compare boxes). For a one-page cheat sheet of every
+option, see [`docs/syntax-query.md`](../docs/syntax-query.md); the full prose follows:
 
 - **Partials and globs** — `qwen` matches every qwen variant on every host;
   `*` and `?` wildcards work (`qwen*27b`, `flux*2`, `llama3?70b`); matching is
@@ -435,6 +436,20 @@ Server-Room filter, and the map's compare boxes):
   lookup; a query with no `;` never touches the DB. A reputation that's thin or
   cold simply returns little — the predicate is only as good as the data behind
   it, which is why it wants a mature database to shine.
+- **Capability override (`;caps=…`)** — by default dyva *infers* the capabilities a
+  request needs from its messages: an attached image requires a `vision` model,
+  `tool_calls` require `tools`, audio requires `audio`. A custom app built on dyva can
+  state them **explicitly** instead, as a leading `;caps=cap1,cap2;` directive on the
+  model string — it **replaces** the inferred set. The motivating case: attach an image
+  for a *tool* (say `edit_image`) but have a smart **non-vision** model drive the turn —
+  `;caps=text;qwen3` sends the picture along yet never demands a vision host, so routing
+  is free to pick any qwen3. Caps are `completion`/`text`, `vision`/`image`, `tools`,
+  `audio`, `thinking` (common aliases accepted); `completion` is always implied, and a
+  blank or all-unknown directive (`;caps=;qwen3`) just falls back to inference. Unlike
+  the host-reputation facets above — which filter *which host* serves — this sets what
+  the *model* must be able to do. It's universal: every endpoint routes on the model
+  string, so the directive works through `/v1/chat/completions`, `/api/chat`,
+  `/api/generate` and the info/hosts previews alike.
 
 ### Context window
 

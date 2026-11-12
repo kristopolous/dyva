@@ -160,9 +160,11 @@ about ahead of time. The router needs them all to look like one thing.
 - **Model names are routing patterns.** The query *is* the model field, everywhere
   a model is named: globs (`qwen*27b`), end-anchor `$` (exact-name, skip quant
   variants), comma fallback chains (`gemma3,qwen`), size predicates (`>10gb`),
-  release-date predicates (`qwen>2026-02`), and `;`-facet filters on measured
-  host reputation (`;tps>40`, `;state=good`, `;ttft<0.5`). Order-free and
-  composable; a query with no `;` never touches the DB.
+  release-date predicates (`qwen>2026-02`), `;`-facet filters on measured
+  host reputation (`;tps>40`, `;state=good`, `;ttft<0.5`), and a `;caps=` override
+  that states required model capabilities explicitly (`;caps=text;qwen3` — attach an
+  image for a tool yet route to a non-vision model). Order-free and composable; a query
+  with no `;` never touches the DB. Full reference: [`docs/syntax-query.md`](syntax-query.md).
 - **Capability detection, learned not declared.** Vision marking per host; TTS/edit
   node detection read off a host's live `/object_info`; per-`(host, capability,
   model)` reputation keys so "can't run Flux.2" doesn't condemn "good at

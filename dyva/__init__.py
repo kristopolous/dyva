@@ -4608,6 +4608,50 @@ def needs_caps(messages):
     return sorted(caps)
 
 
+# Canonical capabilities a request can require; a ';caps=...' override is validated against these.
+# Aliases let an app say the natural word (image/text/think) and get the internal cap name.
+_CAP_ALIASES = {
+    "completion": "completion", "text": "completion", "chat": "completion", "generation": "completion",
+    "vision": "vision", "image": "vision", "images": "vision", "img": "vision",
+    "tools": "tools", "tool": "tools", "tool_call": "tools", "tool_calls": "tools", "function": "tools",
+    "audio": "audio", "speech": "audio", "voice": "audio",
+    "thinking": "thinking", "think": "thinking", "reasoning": "thinking", "reason": "thinking",
+}
+_CAPS_DIRECTIVE_RE = re.compile(r"^\s*;\s*caps\s*=\s*([^;]*);(.*)$", re.I | re.S)
+
+
+def _strip_caps_directive(model_str):
+    """Parse an optional leading ';caps=cap1,cap2;<model query>' directive off the model string.
+    Returns (clean_model, override_caps_or_None). The override lets a dyva-based app state the
+    required caps EXPLICITLY — e.g. attach an image for a tool yet route to a non-vision model —
+    instead of dyva inferring them from the messages. Unknown/blank names are dropped; a directive
+    that yields no valid cap means 'no override' (fall back to inference), but the directive is
+    still stripped. 'completion' is always implied. Universal because every path routes on the
+    model string."""
+    m = _CAPS_DIRECTIVE_RE.match(str(model_str or ""))
+    if not m:
+        return model_str, None
+    caps = {_CAP_ALIASES.get(c.strip().lower()) for c in m.group(1).split(",")}
+    caps.discard(None)
+    clean = m.group(2)
+    return clean, (caps | {"completion"}) if caps else None
+
+
+def caps_for(model_str, messages, tools=False, images=False):
+    """(clean_model, req_caps) for a request. A ';caps=...' override in the model string REPLACES
+    the message-inferred caps; otherwise caps are derived from the messages, plus 'tools'/'vision'
+    when the payload carries tools / top-level images."""
+    clean, override = _strip_caps_directive(model_str)
+    if override is not None:
+        return clean, sorted(override)
+    caps = set(needs_caps(messages))
+    if tools:
+        caps.add("tools")
+    if images:
+        caps.add("vision")
+    return clean, sorted(caps)
+
+
 async def probe_host(session, host):
     """Liveness probe: is this host REACHABLE (socket connects, host answers)? NOT 'is it
     ollama'. /api/ps is just a cheap ping — a non-ollama box (llama.cpp/vLLM/... on :8080) 404s
@@ -4840,7 +4884,7 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DOC_FILES = (
     "README.md", "dyva/README.md", "graflex/README.md",
     "docs/architecture.md", "docs/freeollama.md", "docs/gossiper.md",
-    "docs/survey.md", "docs/video-script.md",
+    "docs/syntax-query.md", "docs/survey.md", "docs/video-script.md",
     "docs/video/README.md", "docs/video/animation-pipeline.md", "docs/video/story.md",
     "docs/superpowers/plans/2026-10-04-graflex-sqlite-host-store.md",
     "docs/superpowers/plans/2026-11-03-ctx-size-routing.md",
@@ -5445,6 +5489,10 @@ def _favorability(model, servers):
 
 
 def find_servers(sub, caps=None):
+    # Defensive: a ';caps=...' override may still be attached to the model string on some paths.
+    # The caps belong to req_caps (passed in as `caps`), not the NAME we match on, so strip the
+    # directive here so routing never tries to match it. (See _strip_caps_directive / caps_for.)
+    sub, _ = _strip_caps_directive(sub)
     # A size predicate (">3gb") is a query modifier, not part of the model name.
     # Strip it, match on the name as usual, then keep only candidates whose
     # recorded size satisfies it — models with an UNKNOWN size are kept (the
@@ -9702,6 +9750,10 @@ async def _stream_info_test_all(request, session, model_in, tools, openai_format
 
 
 async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_format):
+    # ';caps=...' override (universal): strip it off the model string up front so the split and
+    # everything downstream see a clean model; the override is applied to req_caps below.
+    model_in, _caps_ov = _strip_caps_directive(model_in)
+    opayload = dict(opayload, model=model_in)
     model_list = _split_fallback(model_in)
 
     # Do this before needs_caps(): flattening lifts inline images out to the
@@ -9709,9 +9761,12 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
     if isinstance(opayload.get("messages"), list):
         opayload = dict(opayload, messages=_flatten_content(opayload["messages"]))
 
-    req_caps = needs_caps(opayload.get("messages", []))
-    if opayload.get("tools"):
-        req_caps = sorted(set(req_caps) | {"tools"})
+    if _caps_ov is not None:
+        req_caps = sorted(_caps_ov)                 # explicit caps replace message inference
+    else:
+        req_caps = needs_caps(opayload.get("messages", []))
+        if opayload.get("tools"):
+            req_caps = sorted(set(req_caps) | {"tools"})
 
     if _has_info_tag(opayload):
         if _info_wants_test_all(opayload):
@@ -9972,11 +10027,11 @@ async def _proxy_generate(request, session):
     log.debug(f"Ollama generate request: model={model}, stream={do_stream}")
     endpoint = "/api/generate"
 
-    req_caps = needs_caps(body.get("messages", []))
-    if body.get("images"):
-        req_caps = sorted(set(req_caps) | {"vision"})
-    if body.get("tools"):
-        req_caps = sorted(set(req_caps) | {"tools"})
+    # ';caps=...' override (universal) + inference. caps_for strips the directive and, absent one,
+    # derives caps from messages plus top-level images/tools.
+    model, req_caps = caps_for(model, body.get("messages", []),
+                               tools=bool(body.get("tools")), images=bool(body.get("images")))
+    body["model"] = model
 
     if _has_info_tag(body):
         if _info_wants_test_all(body):
@@ -13061,9 +13116,7 @@ async def handle_chat_job_submit(request):
                     f"no server for '{model}' passed the quick test",
                     "model_not_found"), status=404)
         elif _info_wants_hosts(body):
-            req_caps = needs_caps(body.get("messages", []))
-            if body.get("tools"):
-                req_caps = sorted(set(req_caps) | {"tools"})
+            model0, req_caps = caps_for(model0, body.get("messages", []), tools=bool(body.get("tools")))
             info = _info_hosts(model0, req_caps)
             info_text = "\n".join(c["host"] for c in info)
         else:
@@ -13072,9 +13125,7 @@ async def handle_chat_job_submit(request):
                 prev = get_last(model0)
                 exclude = prev[0] if prev else None
                 _drop_last_host(model0)
-            req_caps = needs_caps(body.get("messages", []))
-            if body.get("tools"):
-                req_caps = sorted(set(req_caps) | {"tools"})
+            model0, req_caps = caps_for(model0, body.get("messages", []), tools=bool(body.get("tools")))
             info = _would_use(model0, req_caps, exclude=exclude)
             if info is None:
                 return web.json_response(err_obj(
@@ -16817,9 +16868,11 @@ async def _run_chat_job(session, jid):
         {**opayload, "messages": opayload.get("messages")}, prior)
     opayload["stream"] = True
 
-    req_caps = needs_caps(opayload.get("messages", []))
-    if opayload.get("tools"):
-        req_caps = sorted(set(req_caps) | {"tools"})
+    # ';caps=...' override (universal): honour an explicit caps directive on the model string,
+    # stripping it from model_in and the sent payload. Overrides message-inferred caps.
+    model_in, req_caps = caps_for(model_in, opayload.get("messages", []),
+                                  tools=bool(opayload.get("tools")))
+    opayload["model"] = model_in
 
     await _job_set(jid, status=JOB_PROCESSING, phase="dispatching", error=None)
     model_list = _split_fallback(model_in)
