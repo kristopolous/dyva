@@ -4509,6 +4509,45 @@ def _part_text(part):
     return ""
 
 
+# Real image DATA in an `images` entry: raw base64 (no scheme) or a data: URL we reduce to
+# its base64. Anything with a scheme/path character (a browser blob: URL, a remote http URL)
+# is NOT image data — forwarded to a host it 400s the whole pool on base64 it can't decode.
+_IMG_B64_RE = re.compile(r"^[A-Za-z0-9+/\s]+=*\s*$")
+
+
+def _usable_images(imgs):
+    """(kept_base64_list, dropped_count). Keep only entries that are real image data — raw
+    base64, or a data:…;base64 URL reduced to its payload. Drop a blob:/http(s)/junk ref."""
+    kept, dropped = [], 0
+    for im in imgs or []:
+        s = im.strip() if isinstance(im, str) else ""
+        mt = _DATA_URL_RE.match(s) if s else None
+        if mt and mt.group(2):                       # data:…;base64,<b64>
+            kept.append(mt.group(3))
+        elif s and len(s) >= 40 and _IMG_B64_RE.match(s):   # raw base64 (long enough to be an image)
+            kept.append(s)
+        else:                                        # blob:, http(s)://, empty, too-short -> not data
+            dropped += 1
+    return kept, dropped
+
+
+def _swap_unusable_images(m, images):
+    """Set m['images'] to the usable entries only; for each dropped one, leave a short text
+    note on m['content'] so the turn CONTINUES as text (no vision required, no 400 storm,
+    no human in the loop). Mutates and returns m."""
+    images, dropped = _usable_images(images)
+    if dropped:
+        note = (f"[{dropped} attached image{'s' if dropped > 1 else ''} couldn't be read "
+                "and were omitted]")
+        base = m.get("content")
+        m["content"] = (base + "\n" + note) if isinstance(base, str) and base else note
+    if images:
+        m["images"] = images
+    else:
+        m.pop("images", None)
+    return m
+
+
 def _flatten_content(messages):
     """Collapse OpenAI-style content *arrays* into Ollama's native shape.
 
@@ -4522,8 +4561,12 @@ def _flatten_content(messages):
     """
     out = []
     for m in messages or []:
-        if not isinstance(m, dict) or not isinstance(m.get("content"), list):
+        if not isinstance(m, dict):
             out.append(m)
+            continue
+        if not isinstance(m.get("content"), list):
+            # No content array to flatten — but a native `images` field still needs the swap.
+            out.append(_swap_unusable_images(dict(m), m.get("images")) if m.get("images") else m)
             continue
         m = dict(m)
         texts = []
@@ -4576,8 +4619,7 @@ def _flatten_content(messages):
                 if extra:
                     texts.append(extra)
         m["content"] = "\n".join(t for t in texts if t)
-        if images:
-            m["images"] = images
+        _swap_unusable_images(m, images)
         out.append(m)
     return out
 

@@ -1303,6 +1303,9 @@ async def _check_host(session, host, port, service, timeout=TIMEOUT):
                     }
                     if version:
                         result["version"] = version
+                    # Digests are gone from `models` (Form A); decide the synthetic-digest
+                    # honeypot verdict here from the RAW /api/tags and carry it for the gate.
+                    _flag_synthetic_digests(result, data)
                     return result
 
                 elif service == "llama.cpp":
@@ -3309,7 +3312,9 @@ async def _check_hosts(hosts, service, working_file, notworking_file, check_time
             #     /wp-login.php GET (tiny subset), 200 => honeypot.
             honeypot_detail = None
             if isinstance(result, dict) and "error" not in result:
-                if synthetic_digest_catalog(result):
+                # `_doorknock` already ran the digest catalog on the RAW /api/tags and
+                # left this flag — the normalized result no longer carries the digests.
+                if result.get("honeypot_digests"):
                     honeypot_detail = "synthetic /api/tags digests"
                 elif (_host_models(result) and _host_models(result) <= HONEYPOT_MODELS
                       and await _is_honeypot(session, entry["host"], check_timeout)):
@@ -3543,6 +3548,20 @@ def synthetic_digest_catalog(payload):
             if _shares_run(hexes[i], hexes[j], 32):
                 return True
     return False
+
+
+def _flag_synthetic_digests(result, raw_payload):
+    """Carry the synthetic-digest honeypot verdict from the RAW /api/tags payload onto
+    the normalized result. _filter_models collapses the catalog to Form A ({name: {}})
+    and discards every digest, so the check gate — which only has the result — cannot
+    re-derive the verdict itself (it saw an empty digest set and never fired, which is
+    how 157.245.193.55:8080 slipped through). Computed here, where the raw data still
+    exists; the gate just reads `result["honeypot_digests"]`. Set only when True, so a
+    real host's result stays untouched. Returns the verdict."""
+    synthetic = synthetic_digest_catalog(raw_payload)
+    if synthetic:
+        result["honeypot_digests"] = True
+    return synthetic
 
 
 async def _check_working(service, name=None, check_timeout=60, workers=10, session=None,

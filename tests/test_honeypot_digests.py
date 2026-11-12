@@ -85,6 +85,95 @@ def test_junk_payloads_are_not_flagged():
     assert not graflex.synthetic_digest_catalog({"models": [{"name": "x"}]})   # no digest key
 
 
+# ---- the verdict must survive normalization --------------------------------
+# REGRESSION (157.245.193.55:8080 slipped through): the check gate ran the digest
+# catalog on the NORMALIZED doorknock result, but _filter_models collapses /api/tags
+# to Form A ({name: {}}) and throws every digest away — so the gate always saw an
+# empty digest set and never fired. The verdict has to be computed from the RAW
+# payload and carried onto the result for the gate to read.
+
+def test_filter_models_drops_the_digests_the_catalog_needs():
+    raw = [{"name": f"m{i}", "digest": d} for i, d in enumerate(SYNTH)]
+    norm = graflex._filter_models(raw)                       # the pipeline's shape
+    # digests are gone, so re-running the catalog on the normalized result is blind:
+    assert not graflex.synthetic_digest_catalog({"models": norm})
+
+
+def test_flag_synthetic_digests_carries_verdict_from_raw():
+    raw = {"models": [{"name": f"m{i}", "digest": d} for i, d in enumerate(SYNTH)]}
+    result = {"service": "ollama", "models": graflex._filter_models(raw["models"])}
+    assert graflex._flag_synthetic_digests(result, raw) is True
+    assert result.get("honeypot_digests") is True            # gate reads this
+
+
+def test_flag_synthetic_digests_absent_for_real_catalog():
+    raw = {"models": [{"name": f"m{i}", "digest": d}
+                      for i, d in enumerate(_real_digests(30))]}
+    result = {"service": "ollama", "models": graflex._filter_models(raw["models"])}
+    assert graflex._flag_synthetic_digests(result, raw) is False
+    assert "honeypot_digests" not in result                  # clean host unmarked
+
+
+# ---- the verdict both probe paths must share ------------------------------
+# REGRESSION (157.245.193.55:8080 stayed in the pool): the honeypot gate lived
+# only in check_one (the initial `check`). The `check-working` rescan of the
+# EXISTING pool had no gate at all — it refreshed any answering host, costume or
+# not, straight back into `working`, so a host already in the pool was never
+# evicted. Both paths must call one shared verdict so they cannot drift again.
+
+import asyncio   # noqa: E402
+
+
+class _FakeResp:
+    def __init__(self, status):
+        self.status = status
+    async def __aenter__(self):
+        return self
+    async def __aexit__(self, *a):
+        return False
+
+
+class _FakeSession:
+    """Minimal stand-in for aiohttp session.get — records whether /wp-login.php was hit."""
+    def __init__(self, status=200):
+        self.status = status
+        self.hit = False
+    def get(self, url, **kw):
+        self.hit = True
+        return _FakeResp(self.status)
+
+
+def test_honeypot_detail_flags_synthetic_digests_without_probing():
+    # The digest tell is proof enough: it must NOT spend a /wp-login.php probe.
+    result = {"service": "ollama", "models": [{"name": "x"}], "honeypot_digests": True}
+    sess = _FakeSession()
+    detail = asyncio.run(graflex._honeypot_detail(sess, "1.2.3.4:8080", result, 10))
+    assert detail == "synthetic /api/tags digests"
+    assert sess.hit is False
+
+
+def test_honeypot_detail_clears_a_real_host():
+    # A broad catalog that isn't the phantom frozen set, no digest flag -> real.
+    result = {"service": "ollama",
+              "models": [{"name": n} for n in ("mistral:7b", "llama3:8b", "qwen2.5:72b")]}
+    sess = _FakeSession(status=404)
+    detail = asyncio.run(graflex._honeypot_detail(sess, "1.2.3.4:8080", result, 10))
+    assert detail is None
+
+
+def test_honeypot_detail_flags_phantom_catalog_via_wp_login():
+    # Whole catalog is the frozen phantom set + /wp-login.php 200 -> honeypot.
+    result = {"service": "ollama", "models": [{"name": "llama2:latest"}]}
+    sess = _FakeSession(status=200)
+    detail = asyncio.run(graflex._honeypot_detail(sess, "1.2.3.4:8080", result, 10))
+    assert detail == "phantom catalog + /wp-login.php 200"
+    assert sess.hit is True
+
+
+def test_honeypot_detail_ignores_error_results():
+    assert asyncio.run(graflex._honeypot_detail(_FakeSession(), "h", {"error": "timeout"}, 10)) is None
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))

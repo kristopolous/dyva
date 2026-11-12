@@ -1464,7 +1464,7 @@ body.dragging-image .hist-item{cursor:grabbing}
 <button type="button" class="htab" data-pane="bad" title="Bad">💀<span class="htab-count" id="cnt-bad"></span></button>
 </div>
 <div class="filter-row">
-<input type="text" id="hostLookup" placeholder="look up a host — IP or host:port, then Enter" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" title="Type a host address (full ip:port, or just an IP) and press Enter to open its host card. A partial that matches several hosts shows a pick-list." onkeydown="if(event.key==='Enter'&&this.value.trim()){event.preventDefault();hostLookup(this.value);}">
+<input type="text" id="hostLookup" placeholder="look up a host — IP or host:port, then Enter" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" title="Type a host address (full ip:port, or just an IP) and press Enter to open its host card. A partial that matches several hosts shows a pick-list. While the Workers tab is open, typing also filters the worker rows live." oninput="applyWorkerFilter()" onkeydown="if(event.key==='Enter'&&this.value.trim()){event.preventDefault();hostLookup(this.value);}">
 </div>
 <div id="pane-last" style="display:none">
 <div id="lastList"></div>
@@ -3055,6 +3055,10 @@ function renderWorkers(workers){
     var card=document.createElement('div');card.className='worker-card'
       +(w.done?' worker-done'+(w.ok===false?' worker-failed':''):'');
     card.setAttribute('data-wid',w.wid);
+    // Everything the live worker-filter box matches against: routing key, resolved
+    // model, host address, service, kind. One lowercased haystack per card.
+    card.setAttribute('data-wsearch',
+      [w.model,w.rmodel,w.host,w.service,w.kind].filter(Boolean).join(' ').toLowerCase());
     card.title='wid '+w.wid;   // hover to read the unique worker id (for debugging)
     var body=document.createElement('div');body.className='worker-body';
     var top=document.createElement('div');top.className='worker-title';
@@ -3234,6 +3238,33 @@ function renderWorkers(workers){
     doneArr.forEach(function(w){dw.appendChild(buildCard(w))});
     c.appendChild(dw);
   }
+  applyWorkerFilter();   // the list was just rebuilt — re-apply the live filter
+}
+// Live filter over the worker cards: substring of model / resolved model / host /
+// service / kind. Runs on every keystroke AND after each rebuild (above), so a filter
+// stays applied as workers come and go. Pure show/hide — nothing is refetched.
+function applyWorkerFilter(){
+  var inp=document.getElementById('hostLookup');
+  var list=document.getElementById('workersList'); if(!list)return;
+  var q=((inp&&inp.value)||'').trim().toLowerCase();
+  var cards=list.querySelectorAll('.worker-card');
+  var shownLive=0,shownDone=0;
+  Array.prototype.forEach.call(cards,function(card){
+    var hit=!q||(card.getAttribute('data-wsearch')||'').indexOf(q)>=0;
+    card.style.display=hit?'':'none';
+    if(hit){card.classList.contains('worker-done')?shownDone++:shownLive++;}
+  });
+  // Collapse the "Previous (N)" header + its scroll box when the filter hides them all.
+  var dh=list.querySelector('.workers-done-hdr'),dw=list.querySelector('.workers-done-scroll');
+  var hideDone=!!q&&!shownDone;
+  if(dh)dh.style.display=hideDone?'none':'';
+  if(dw)dw.style.display=hideDone?'none':'';
+  // A "nothing matches" line when a non-empty filter hides every card.
+  var note=document.getElementById('workerFilterEmpty');
+  if(q&&!shownLive&&!shownDone&&cards.length){
+    if(!note){note=document.createElement('div');note.id='workerFilterEmpty';note.className='workers-empty';list.appendChild(note);}
+    note.textContent='No workers match “'+q+'”';note.style.display='';
+  }else if(note){note.style.display='none';}
 }
 setInterval(function(){
   var pane=document.getElementById('pane-workers');
