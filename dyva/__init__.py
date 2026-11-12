@@ -10804,6 +10804,62 @@ async def handle_guide(request):
     return web.FileResponse(path, headers={"Cache-Control": "no-cache"})
 
 
+# The query-syntax reference is rendered from the LOCAL docs/syntax-query.md that ships with
+# THIS install — not a GitHub link, which would show whatever git main happens to say rather
+# than what the running version actually supports. (marked is the same renderer the dashboard
+# uses.) The .md stays the single source; this just serves it styled.
+_SYNTAX_PAGE = """<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>dyva — query syntax</title>
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+<style>
+:root{--bg:#161616;--card:#232323;--border:#333;--text:#e6e6e6;--text-2:#b9b9b9;--dim:#8a8a8a;--accent:#7aa2f7;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.6 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+.wrap{max-width:820px;margin:0 auto;padding:32px 20px 80px}
+.top{font-size:.9rem;margin-bottom:1em}
+a{color:var(--accent);text-decoration:none}a:hover{text-decoration:underline}
+h1{font-size:1.6rem;margin:.2em 0 .4em}
+h2{font-size:1.15rem;margin:1.6em 0 .4em;padding-top:.6em;border-top:1px solid var(--border)}
+p,li{color:var(--text-2)}
+code{font-family:var(--mono);font-size:.86em;background:var(--card);padding:.1em .4em;border-radius:4px}
+pre{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:12px 14px;overflow-x:auto}
+pre code{background:none;padding:0}
+table{border-collapse:collapse;width:100%;margin:.5em 0;font-size:.92rem}
+td,th{border:1px solid var(--border);padding:.4em .6em;text-align:left;vertical-align:top}
+th{color:var(--text-2)}td code{white-space:nowrap}
+</style></head><body><div class="wrap">
+<div class="top"><a href="guide">&larr; dyva guide</a></div>
+<div id="doc"></div>
+<textarea id="src" hidden>{{MD}}</textarea>
+<script>
+document.getElementById('doc').innerHTML =
+  window.marked ? marked.parse(document.getElementById('src').value) : '<pre>'+document.getElementById('src').value+'</pre>';
+</script>
+</div></body></html>"""
+
+
+async def handle_syntax_guide(request):
+    """
+    Model query-syntax reference (this install)
+    ---
+    tags: [UI]
+    summary: GET /guide/syntax — the query syntax THIS install supports, from the local doc
+    responses:
+      '200': {description: HTML reference page}
+    """
+    try:
+        with open(os.path.join(_REPO_ROOT, "docs", "syntax-query.md"), encoding="utf-8") as f:
+            md = f.read()
+    except OSError:
+        md = "# Model query syntax\n\nThe reference doc isn't bundled with this install."
+    esc = md.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return web.Response(text=_SYNTAX_PAGE.replace("{{MD}}", esc),
+                        content_type="text/html", headers={"Cache-Control": "no-cache"})
+
+
 # Cloudflare quick-tunnels (`cloudflared tunnel --url`) mint a fresh random hostname
 # like loan-violin-cute-occurred.trycloudflare.com on every restart, so one ollama
 # behind a tunnel churns through dozens of throwaway hostnames and can advertise a huge
@@ -21239,6 +21295,7 @@ def make_app():
     swagger.add_get("/", handle_dashboard)
     swagger.add_get("/robots.txt", handle_robots)
     swagger.add_get("/guide", handle_guide)
+    swagger.add_get("/guide/syntax", handle_syntax_guide)
     swagger.add_get("/reload-hosts", handle_reload_hosts)
     swagger.add_post("/shutdown", handle_shutdown)
     swagger.add_get("/host-info", handle_host_info)

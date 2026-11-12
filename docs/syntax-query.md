@@ -27,6 +27,40 @@ match. A query with no `;` facet never touches the reputation DB.
 Everything is **order-free and composable** — `qwen;tps>40`, `;tps>40;qwen` and
 `tps>40;qwen` all mean the same thing.
 
+## How it all composes
+
+One query is a comma-separated list of **alternatives** tried in order; each alternative is a
+name/filter **term** plus any number of `;`-**facets**, and term and facets may appear in any
+order:
+
+```
+query       = alternative ("," alternative)*
+alternative = term (";" facet)*                 ; order-free
+term        = [ capability "/" ] name? predicate*
+name        = text with * and ? globs, optional trailing $
+predicate   = sizepred | datepred
+sizepred    = ("<"|">"|"<="|">=") number unit   ; unit = kb|mb|gb|tb  (the "b" is optional)
+datepred    = ("<"|">"|"<="|">=") year ["-" month ["-" day]]
+facet       = "caps=" cap ("," cap)*            ; required-capability override
+            | key ("<="|">="|"<"|">"|"=") value ; host_status column: tps, ttft, state, fail_smoke, …
+            | "live" | "dead" | "cloud" | "nocloud" | service | provider   ; meta (map)
+cap         = completion|text | vision|image | tools | audio | thinking
+```
+
+So this is **one valid query** — a capability override, a host throughput floor, and a named
+model narrowed by date and size, all at once:
+
+```
+;caps=vision;tps>100;qwen>2026-06>10gb
+  caps=vision   require a model that can see
+  tps>100       served by a host measured above 100 tok/s
+  qwen          named qwen
+  >2026-06      released after June 2026
+  >10gb         at least 10 GB on disk
+```
+
+Because it's order-free, `qwen>2026-06>10gb;tps>100;caps=vision` is the exact same query.
+
 ## Details worth knowing
 
 - **Containment vs. `$`.** A bare name matches as a substring, so `qwen3.8:27b` also
