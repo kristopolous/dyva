@@ -173,6 +173,23 @@ def test_excluded_names_are_not_tts():
     assert dyva.tts_excluded("Qwen3TTSEngineNode") is False
 
 
+# ---- the GenericTTS catch-all is case-insensitive -------------------------
+# REGRESSION: the catch-all patterns were the bare strings "TTS"/"tts" compiled
+# WITHOUT re.IGNORECASE (the node-classifier compiles each pattern as-is, unlike
+# the model classifier). So a node class with the literal "tts" in MIXED case —
+# e.g. SomeTtsNode, MyTtsEngineNode — matched no family and was never recognized
+# as TTS, even though "those are probably tts models".
+
+def test_generic_catchall_matches_tts_in_any_case():
+    for n in ("SomeTtsNode", "MyTtsEngineNode", "FooTTSNode", "barttsnode", "WeirdTtSNode"):
+        fam = dyva._tts_node_family(n)
+        assert fam is not None, n
+
+def test_non_tts_node_still_matches_no_family():
+    assert dyva._tts_node_family("KSampler") is None
+    assert dyva._tts_node_family("VAEDecode") is None
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))

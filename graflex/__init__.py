@@ -3302,23 +3302,9 @@ async def _check_hosts(hosts, service, working_file, notworking_file, check_time
                 result, method = {"error": (str(e) or type(e).__name__)[:200]}, None
             except Exception as e:
                 result, method = {"error": f"{type(e).__name__}: {e}"[:200]}, None
-            # Honeypot gate, INSIDE the check. Two independent tells, either is enough:
-            #   - synthetic /api/tags digests: a costume mints its catalog from a rolling
-            #     counter (byte-ramps + shifted copies), so the "digests" are valid hex but
-            #     not random. These hosts parrot frontier names they can't run and stall
-            #     agentic runs (no real tool calls). Detected from already-fetched data, no
-            #     extra probe, no /wp-login.php needed — the digest math is proof enough.
-            #   - whole freshly-listed catalog is the phantom frozen set: one benign
-            #     /wp-login.php GET (tiny subset), 200 => honeypot.
-            honeypot_detail = None
-            if isinstance(result, dict) and "error" not in result:
-                # `_doorknock` already ran the digest catalog on the RAW /api/tags and
-                # left this flag — the normalized result no longer carries the digests.
-                if result.get("honeypot_digests"):
-                    honeypot_detail = "synthetic /api/tags digests"
-                elif (_host_models(result) and _host_models(result) <= HONEYPOT_MODELS
-                      and await _is_honeypot(session, entry["host"], check_timeout)):
-                    honeypot_detail = "phantom catalog + /wp-login.php 200"
+            # Honeypot gate, INSIDE the check. Shared with the check-working rescan via
+            # _honeypot_detail so the two paths can't drift (see that helper).
+            honeypot_detail = await _honeypot_detail(session, entry["host"], result, check_timeout)
             honeypot = honeypot_detail is not None
 
         key = _entry_host(entry)
@@ -3486,6 +3472,29 @@ async def _is_honeypot(session, host, timeout):
             return r.status == 200
     except Exception:
         return False
+
+
+async def _honeypot_detail(session, host, result, timeout):
+    """The honeypot verdict for a SUCCESSFUL doorknock result, shared by the initial
+    `check` (check_one) and the `check-working` rescan (probe) so the two paths can't
+    drift apart — they did: the rescan had no gate and refreshed costumes straight back
+    into the pool (157.245.193.55:8080 never left). Two independent tells, either is
+    enough; returns a short reason string, or None if the host looks real.
+      - synthetic /api/tags digests: a costume mints its catalog from a rolling counter
+        (byte-ramps + shifted copies), valid hex but not random. `_doorknock` already ran
+        the catalog on the RAW /api/tags and left `honeypot_digests` (the normalized
+        result has no digests left). Proof enough — no extra probe.
+      - whole freshly-listed catalog is the phantom frozen set: one benign /wp-login.php
+        GET (tiny subset, never touches an ordinary host), 200 => honeypot.
+    """
+    if not (isinstance(result, dict) and "error" not in result):
+        return None
+    if result.get("honeypot_digests"):
+        return "synthetic /api/tags digests"
+    if (_host_models(result) and _host_models(result) <= HONEYPOT_MODELS
+            and await _is_honeypot(session, host, timeout)):
+        return "phantom catalog + /wp-login.php 200"
+    return None
 
 
 # A model `digest` that is a real sha256 (optionally sha256:-prefixed), captured so we can
@@ -3667,6 +3676,22 @@ async def _check_working(service, name=None, check_timeout=60, workers=10, sessi
             except Exception as e:
                 result, method = {"error": str(e)}, None
             if isinstance(result, dict) and "error" not in result:
+                # Same honeypot gate as the initial check (shared helper): a costume
+                # already IN the pool is caught on rescan and demoted, instead of being
+                # refreshed straight back into working. SOFT-DELETE, same as a dead host.
+                hp = await _honeypot_detail(session, host, result, check_timeout)
+                if hp:
+                    nw = {"url": f"http://{host}", "reason": "honeypot", "result": "honeypot",
+                          "checked": datetime.now(timezone.utc).isoformat()}
+                    for _gk in _GEO_CARRY:
+                        if _gk in entry:
+                            nw[_gk] = entry[_gk]
+                    _store_record(svc, host, "notworking", nw)
+                    removed += 1
+                    log.warning(f"~ {svc} {host} demoted (honeypot: {hp})")
+                    _audit_prune(svc, host, "working", f"honeypot: {hp}")
+                    completed += 1
+                    return
                 rec = dict(result)
                 rec["host"] = host
                 rec["checked"] = rec.get("checked", datetime.now(timezone.utc).isoformat())

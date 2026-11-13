@@ -184,7 +184,7 @@
     {
       "name": "TTS",
       "patterns": [
-        "^TTS$|^tts$"
+        "(?i)^tts$"
       ],
       "text": "text",
       "voice": null,
@@ -202,8 +202,7 @@
     {
       "name": "GenericTTS",
       "patterns": [
-        "TTS",
-        "tts"
+        "(?i)tts"
       ],
       "text": "text",
       "voice": null,
