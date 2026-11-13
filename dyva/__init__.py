@@ -3537,11 +3537,15 @@ def add_good(host, model):
 
 
 def record_perf(host, model, ttft=None, tps=None):
-    """Store the MOST-RECENT time-to-first-token (seconds) and/or tokens-per-second
-    for a (host, model), overwriting any prior value — the latest reading, not an
-    average. Best-effort: a measurement hiccup must never break the request path.
-    Keyed like verdicts (canon_pattern) and upserts a 'good' row if none exists yet
-    (a real measurement means the host answered)."""
+    """Store time-to-first-token (seconds, MOST-RECENT) and/or tokens-per-second for a
+    (host, model). `tps` is a rolling EWMA — new_stored = 0.9*old + 0.1*new, seeded raw
+    on the first reading — NOT an overwrite: one request's tps can be badly under-measured
+    (a stalling/agentic turn makes the wall-clock fallback report far below the host's true
+    rate, and it can only under-report), so a single reading must nudge the rating, never
+    replace it. `ttft` stays most-recent — it's a first-token latency, not a per-token rate,
+    and isn't the number a mid-stream stall distorts. Best-effort: a measurement hiccup must
+    never break the request path. Keyed like verdicts (canon_pattern) and upserts a 'good'
+    row if none exists yet (a real measurement means the host answered)."""
     cols, vals = [], []
     if ttft is not None:
         cols.append("ttft"); vals.append(round(float(ttft), 3))
@@ -3551,7 +3555,15 @@ def record_perf(host, model, ttft=None, tps=None):
         return
     model = canon_pattern(model)
     ph = ",".join("?" for _ in cols)
-    setc = ",".join(f"{c}=excluded.{c}" for c in cols)
+    # tps blends into the stored value (EWMA, seeded raw when NULL); everything else
+    # overwrites. On INSERT the raw excluded value lands as the seed; the blend is
+    # only reached on CONFLICT, where host_status.tps is the existing reading.
+    def _set_expr(c):
+        if c == "tps":
+            return ("tps=CASE WHEN host_status.tps IS NULL THEN excluded.tps "
+                    "ELSE 0.9*host_status.tps + 0.1*excluded.tps END")
+        return f"{c}=excluded.{c}"
+    setc = ",".join(_set_expr(c) for c in cols)
     try:
         db = _get_db()
         db.execute(
