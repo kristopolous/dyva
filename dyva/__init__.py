@@ -4409,11 +4409,16 @@ def mark_maybe(host, model, reason=None):
 NODE_SURVEY_TTL = 24 * 3600
 
 
-# Bump when the rules that *choose* a node change. A survey is a cached
-# decision, not just cached data: without this, tightening the viability check
-# left every already-surveyed host still pointing at the node it had picked
-# under the old rules — which is why FB_Qwen3TTSVoiceDesign kept being used
-# long after it was ruled out.
+# Bump when the rules that *choose* a node change AND that change can make an
+# EXISTING survey wrong (a tightened viability rule, a node that must stop being
+# picked) — which is why FB_Qwen3TTSVoiceDesign kept being used long after it was
+# ruled out. Do NOT bump for a purely ADDITIVE classifier change (new engines that
+# only make MORE node names match): existing surveys are still correct, and bumping
+# throws away the pool's known-TTS-host knowledge — every host goes unsurveyed at
+# once, so the next speech request re-probes /object_info across the whole pool and
+# stalls on "finding a tts host" with nothing to race. The HF-popular engines added
+# to the classifier (CosyVoice*/VibeVoiceEngineNode/Higgs/VoxCPM/Orpheus/OmniVoice/
+# SpeechT5) are additive, so they roll in as each host's 24h survey TTL lapses.
 NODE_SURVEY_REV = 2
 
 
