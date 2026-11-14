@@ -57,7 +57,7 @@
     {
       "name": "CosyVoice",
       "patterns": [
-        "^CosyVoiceEngineNode"
+        "(?i)cosyvoice"
       ],
       "text": "text",
       "voice": null,
@@ -182,6 +182,51 @@
       "lang": null
     },
     {
+      "name": "Higgs",
+      "patterns": [
+        "(?i)higgs"
+      ],
+      "text": "text",
+      "voice": null,
+      "lang": null
+    },
+    {
+      "name": "VoxCPM",
+      "patterns": [
+        "(?i)voxcpm"
+      ],
+      "text": "text",
+      "voice": null,
+      "lang": null
+    },
+    {
+      "name": "Orpheus",
+      "patterns": [
+        "(?i)orpheus"
+      ],
+      "text": "text",
+      "voice": null,
+      "lang": null
+    },
+    {
+      "name": "OmniVoice",
+      "patterns": [
+        "(?i)omnivoice"
+      ],
+      "text": "text",
+      "voice": null,
+      "lang": null
+    },
+    {
+      "name": "SpeechT5",
+      "patterns": [
+        "(?i)speech_?t5"
+      ],
+      "text": "text",
+      "voice": null,
+      "lang": null
+    },
+    {
       "name": "TTS",
       "patterns": [
         "(?i)^tts$"
@@ -229,7 +274,7 @@
     {
       "name": "VibeVoiceTTS",
       "patterns": [
-        "^VibeVoiceTTS"
+        "(?i)vibevoice"
       ],
       "text": "text",
       "voice": null,
