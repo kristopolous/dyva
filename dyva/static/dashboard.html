@@ -557,6 +557,15 @@ a.host-name:hover{color:var(--accent);text-decoration:underline}
 .hd-badge{font-size:.72rem;padding:2px 9px;border-radius:20px;background:var(--card);border:1px solid var(--border);color:var(--text-2);white-space:nowrap}
 .hd-badge-bad{background:var(--err-bg,rgba(220,80,80,.14));border-color:var(--err,#d05050);color:var(--err,#d05050)}
 .hd-badge.hd-prov{background:var(--accent-bg);border-color:transparent;color:var(--accent);text-transform:capitalize}
+/* admin-only manual flag control on the host card */
+.hd-adminrow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:.5em 0}
+.hd-flag-btn{font-size:.72rem;padding:3px 10px;border-radius:6px;cursor:pointer;background:transparent;
+  border:1px solid var(--err,#d05050);color:var(--err,#d05050)}
+.hd-flag-btn:hover{background:var(--err-bg,rgba(220,80,80,.14))}
+.hd-flag-btn.flagged{border-color:var(--border);color:var(--text-2)}
+.hd-flag-btn.flagged:hover{background:var(--accent-bg);color:var(--text)}
+.hd-flag-btn:disabled{opacity:.5;cursor:default}
+.hd-flag-why{font-size:.68rem;color:var(--text-faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60%}
 .hd-row{display:flex;justify-content:space-between;gap:12px;padding:4px 0;border-bottom:1px solid var(--border);font-size:.84rem}
 .hd-row .hd-k{color:var(--text-dim);flex:0 0 auto}
 .hd-row .hd-v{color:var(--text-2);text-align:right;overflow-wrap:anywhere;font-family:var(--font-mono);font-size:.8rem}
@@ -2709,6 +2718,24 @@ function _wireHostVotes(){
   var body=document.getElementById('hostDetailBody');
   if(!body||body._votesWired)return;body._votesWired=true;
   body.addEventListener('click',function(e){
+    // admin manual flag/unflag (host-wide honeypot). Separate from the per-model votes below.
+    var fb=e.target.closest&&e.target.closest('button[data-flagaction]');
+    if(fb&&!fb.disabled){
+      var fhost=body.getAttribute('data-host'),fact=fb.getAttribute('data-flagaction');
+      if(!fhost)return;
+      var msg=fact==='flag'
+        ?'Flag '+fhost+' as a honeypot?\nIt will be dropped from routing host-wide (reversible).'
+        :'Clear the honeypot flag on '+fhost+'?\nThe flag history is kept either way.';
+      if(!confirm(msg))return;
+      fb.disabled=true;
+      fetch('host-flag',{method:'POST',headers:adminHeaders({'Content-Type':'application/json'}),
+        body:JSON.stringify({host:fhost,action:fact})})
+        .then(function(r){if(r.status===403){alert('Admin password required — unlock Settings first.');throw 0;}
+          if(!r.ok)throw 0;return r.json()})
+        .then(function(){openHostDetail(fhost);if(typeof refreshListsNow==='function')refreshListsNow();})
+        .catch(function(){fb.disabled=false;});
+      return;
+    }
     var b=e.target.closest&&e.target.closest('button[data-vote]');if(!b||b.disabled)return;
     var host=body.getAttribute('data-host'),model=b.getAttribute('data-model'),vote=b.getAttribute('data-vote');
     if(!host||!model)return;
@@ -2793,6 +2820,18 @@ function hostDetailHtml(host,j){
   var _anyCanned=(j.reputation||[]).some(function(r){return r.fail_smoke});
   if((j.host_flags&&j.host_flags.honeypot)||_anyCanned)b.push('<span class="hd-badge hd-badge-bad" title="Honeypot — canned / fake responses (host-wide)">honeypot</span>');
   if(b.length)h.push('<div class="hd-badges">'+b.join('')+'</div>');
+  // ADMIN-ONLY manual flag. Shown only to an unlocked admin (adminKey present); the
+  // server re-checks X-Admin-Key on /host-flag regardless, so this is UI gating, not the
+  // real gate. Toggle: "Flag as honeypot" when clean, "Clear honeypot flag" when flagged.
+  // Clicks are handled by the delegated listener in _wireHostVotes (survives redraws).
+  if(typeof adminKey==='function'&&adminKey()){
+    var _flagged=!!(j.host_flags&&j.host_flags.honeypot);
+    var _why=(_flagged&&j.host_flags.honeypot.reason)?String(j.host_flags.honeypot.reason):'';
+    h.push('<div class="hd-adminrow"><button type="button" class="hd-flag-btn'+(_flagged?' flagged':'')+
+      '" data-flagaction="'+(_flagged?'unflag':'flag')+'">'+
+      (_flagged?'Clear honeypot flag':'Flag as honeypot')+'</button>'+
+      (_why?'<span class="hd-flag-why" title="'+escHtml(_why)+'">'+escHtml(_why)+'</span>':'')+'</div>');
+  }
   function row(k,v){return v?('<div class="hd-row"><span class="hd-k">'+k+'</span><span class="hd-v">'+v+'</span></div>'):''}
   h.push(row('host','<a href="'+escHtml(href)+'" target="_blank" rel="noopener noreferrer">'+escHtml(url)+' ↗</a>'));
   if(j.asn)h.push(row('network','AS'+j.asn+(j.as_org?' · '+escHtml(j.as_org):'')));

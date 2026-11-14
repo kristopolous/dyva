@@ -3111,6 +3111,20 @@ def _get_db():
         _status_db.execute(
             "CREATE TABLE IF NOT EXISTS gossiper_state("
             "source TEXT PRIMARY KEY, last_refresh_at TEXT, server_hwm INTEGER NOT NULL DEFAULT 0)")
+        # ---- manual operator flags (the admin dashboard's Flag button) ----
+        # Append-only AUDIT of human flag/unflag actions, kept apart from the auto-detected
+        # verdicts in host_status. It records WHO-ish/WHEN/WHY a host was manually flagged
+        # AND every reversal: an unflag writes its OWN row instead of deleting the flag, so a
+        # mis-flag is auditable rather than silently undone ("we can't just remove the history
+        # with an unflag"). `kind` is intentionally general — honeypot is the only kind wired
+        # to a live routing effect today, but new kinds need no schema change. `action` in
+        # ('flag','unflag'); `reason` is free-text provenance (an auto default when none given).
+        _status_db.execute(
+            "CREATE TABLE IF NOT EXISTS host_flag_log("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, host TEXT NOT NULL, kind TEXT NOT NULL, "
+            "action TEXT NOT NULL, reason TEXT, ts TEXT NOT NULL)")
+        _status_db.execute(
+            "CREATE INDEX IF NOT EXISTS ix_host_flag_log_host ON host_flag_log(host, id)")
         _status_db.commit()
         if need_migrate:
             _migrate_status_from_txt()
@@ -4324,6 +4338,46 @@ def mark_honeypot(host, reason=None):
         " last_fail=excluded.last_fail, last_fail_reason=excluded.last_fail_reason",
         (host, HONEYPOT_KEY, _now_iso(), reason))
     db.commit()
+
+
+def record_flag_event(host, kind, action, reason=None):
+    """Append one MANUAL flag/unflag event to host_flag_log — the append-only audit of
+    operator actions from the admin dashboard. Nothing is ever overwritten or deleted:
+    an unflag writes its OWN row rather than removing the flag, so the full provenance
+    (what was flagged, when, why, and any later reversal) survives for audit. `kind` is
+    general (honeypot today), `action` is 'flag' or 'unflag', `reason` is free-text."""
+    reason = (" ".join(str(reason).split())[:500] or None) if reason else None
+    db = _get_db()
+    db.execute("INSERT INTO host_flag_log(host, kind, action, reason, ts) VALUES(?,?,?,?,?)",
+               (host, kind, action, reason, _now_iso()))
+    db.commit()
+
+
+def flag_host(host, kind="honeypot", reason=None):
+    """An operator MANUALLY flags a host from the dashboard. Audits the action (provenance)
+    and applies the live effect for `kind`. Only kind='honeypot' has a routing effect today
+    — condemn the machine host-wide via mark_honeypot so find_servers drops it for every
+    model — but the audit log and `kind` are intentionally general so new flag kinds can be
+    added later without a schema change. `reason` defaults to an auto provenance string."""
+    reason = reason or f"manually flagged via dashboard {_now_iso()}"
+    record_flag_event(host, kind, "flag", reason)
+    if kind == "honeypot":
+        mark_honeypot(host, reason=reason)
+
+
+def unflag_host(host, kind="honeypot", reason=None):
+    """An operator MANUALLY clears a flag. The unflag is itself provenance — it APPENDS its
+    own audit row and never erases the original flag ("we can't just remove the history
+    with an unflag") — then removes the live routing effect. For honeypot: delete ONLY the
+    host-wide HONEYPOT_KEY sentinel so the machine can route again; the per-(host,model)
+    smoke history and any auto-detected fail_smoke verdicts are left intact (a manual
+    override can lift the manual mark, but it can't un-say what a smoke probe caught)."""
+    reason = reason or f"manually unflagged via dashboard {_now_iso()}"
+    record_flag_event(host, kind, "unflag", reason)
+    if kind == "honeypot":
+        db = _get_db()
+        db.execute("DELETE FROM host_status WHERE host=? AND model=?", (host, HONEYPOT_KEY))
+        db.commit()
 
 
 def mark_maybe(host, model, reason=None):
@@ -10650,13 +10704,15 @@ async def handle_host_info(request):
         # doesn't render a fake model called "unreachable".
         _SENTINELS = {UNREACHABLE_KEY: "unreachable", HONEYPOT_KEY: "honeypot"}
         rep, host_flags = [], {}
-        for (m, st, lg, fs, ttft, tps, fsm, sd, succ, fail, rw, rl, dep) in db.execute(
+        for (m, st, lg, fs, ttft, tps, fsm, sd, succ, fail, rw, rl, dep, lfr) in db.execute(
                 f"SELECT model, state, last_good, failure_streak, ttft, tps, fail_smoke, smoke_date, "
-                f"success, failure, race_won, race_lost, deprio "
+                f"success, failure, race_won, race_lost, deprio, last_fail_reason "
                 f"FROM host_status WHERE host=? AND {_LIVE_REAL} ORDER BY model", (server_url,)).fetchall():
             if m in _SENTINELS:
+                # last_fail_reason is the provenance: for a manual flag it's the dashboard
+                # "manually flagged …" string; for an auto honeypot it's the raw bait reply.
                 host_flags[_SENTINELS[m]] = {"state": st, "failure_streak": fs,
-                                             "failure": fail, "last_good": lg}
+                                             "failure": fail, "last_good": lg, "reason": lfr}
                 continue
             rep.append({"model": m, "state": st, "last_good": lg, "failure_streak": fs,
                         "ttft": ttft, "tps": tps, "fail_smoke": fsm, "smoke_date": sd,
@@ -10689,6 +10745,60 @@ async def handle_host_info(request):
     if rec is None and not out.get("reputation"):
         return web.json_response(out, status=404)
     return web.json_response(out)
+
+
+async def handle_host_flag(request):
+    """
+    Manually flag (or unflag) a host — the host-detail card's admin Flag button.
+    ---
+    tags: [Admin]
+    summary: POST /host-flag — ADMIN-GATED manual host flag/unflag
+    description: >
+      An operator action, admin-gated exactly like settings/shutdown (X-Admin-Key when a
+      password is set). Body: {host, action: "flag"|"unflag", kind?, reason?}. kind defaults
+      to "honeypot" — the only kind wired to a routing effect today: a flag condemns the
+      machine host-wide (find_servers drops it for every model), an unflag lifts that mark.
+      Every action is recorded in the append-only host_flag_log with its provenance; an
+      unflag never erases the earlier flag. reason defaults to an auto "manually …" string.
+    responses:
+      '200': {description: Flagged/unflagged}
+      '400': {description: Bad request}
+      '403': {description: Admin password required}
+    """
+    gate = _check_admin(request)
+    if gate:
+        return gate
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+    host = (body.get("host") or "").strip()
+    if not host:
+        return web.json_response({"error": "host required"}, status=400)
+    action = (body.get("action") or "flag").strip()
+    if action not in ("flag", "unflag"):
+        return web.json_response({"error": "action must be 'flag' or 'unflag'"}, status=400)
+    kind = (body.get("kind") or "honeypot").strip() or "honeypot"
+    reason = (body.get("reason") or "").strip() or None   # None -> flag_host supplies the auto default
+
+    # Resolve to the canonical host_status key EXACTLY like host-info, so the mark, the
+    # card's badge, and find_servers all agree on the host form (full URL vs bare).
+    def _bare(u):
+        return re.sub(r"^https?://", "", u or "").rstrip("/")
+    target = _bare(host)
+    rec = next((s for s in load_servers() if _bare(s.get("server")) == target), None)
+    server_url = rec.get("server") if rec else host
+
+    if action == "flag":
+        flag_host(server_url, kind=kind, reason=reason)
+    else:
+        unflag_host(server_url, kind=kind, reason=reason)
+    peer = request.headers.get("X-Forwarded-For") or (request.remote or "?")
+    log.warning(f"host {action} ({kind}) {server_url} via dashboard (from {peer})")
+    return web.json_response({"ok": True, "host": server_url, "kind": kind,
+                              "action": action, "flagged": action == "flag"})
 
 
 HOST_SEARCH_MAX = 200   # cap the pick-list; the search ERRS toward too many, but bounded
@@ -21353,6 +21463,7 @@ def make_app():
     swagger.add_get("/reload-hosts", handle_reload_hosts)
     swagger.add_post("/shutdown", handle_shutdown)
     swagger.add_get("/host-info", handle_host_info)
+    swagger.add_post("/host-flag", handle_host_flag)
     swagger.add_get("/host-search", handle_host_search)
     swagger.add_get("/unfurl", handle_unfurl)
     swagger.add_get("/api/stats", handle_stats)
