@@ -9196,9 +9196,39 @@ function _ttsWhen(ms){
     ? d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'})
     : d.toLocaleDateString([],{month:'short',day:'numeric'});
 }
+// The gallery merges TWO sources: the SERVER speech history (v1/audio/clips \u2014 every
+// clip, including ones generated over the raw API) and this browser's localStorage
+// (older local-only entries, and whatever this tab just made). Deduped by clip file so a
+// clip the dashboard made \u2014 which lands in both \u2014 shows once. Server is the source of
+// truth for API clips; local fills in anything the server doesn't have.
+function _ttsFileOf(e){
+  if(e.file)return e.file;
+  var m=/v1\/audio\/clips\/([^/?#]+)/.exec(e.url||'');
+  return m?m[1]:'';
+}
 function loadTtsHistory(){
-  var hist=JSON.parse(localStorage.getItem('dyva_tts_history')||'[]');
   var el=document.getElementById('ttsGallery');
+  if(!el)return;
+  var local=[];try{local=JSON.parse(localStorage.getItem('dyva_tts_history')||'[]')||[]}catch(e){}
+  var dismissed={};try{(JSON.parse(localStorage.getItem('dyva_tts_dismissed')||'[]')||[]).forEach(function(f){dismissed[f]=1})}catch(e){}
+  fetch('v1/audio/clips',{cache:'no-store'})
+    .then(function(r){return r.ok?r.json():[]}).catch(function(){return []})
+    .then(function(server){
+      var merged=[],seen={};
+      (server||[]).forEach(function(e){
+        var f=e.file||'';if(!f||dismissed[f]||seen[f])return;seen[f]=1;
+        merged.push({file:f,url:'v1/audio/clips/'+f,text:e.text||'',voice:e.voice||'default',
+                     host:e.host||'',node:e.node||'',ts:e.when?Math.round(e.when*1000):0});
+      });
+      local.forEach(function(e){
+        var f=_ttsFileOf(e);if(f&&(dismissed[f]||seen[f]))return;if(f)seen[f]=1;
+        merged.push(e);
+      });
+      merged.sort(function(a,b){return (b.ts||0)-(a.ts||0)});
+      _renderTtsHistory(el,merged);
+    });
+}
+function _renderTtsHistory(el,hist){
   el.innerHTML='';
   hist.forEach(function(e){
     var item=document.createElement('div');
@@ -9211,12 +9241,19 @@ function loadTtsHistory(){
     var del=document.createElement('span');
     del.className='hist-del';
     del.textContent='\u2715';
-    del.title='Remove from history';
+    del.title='Remove from gallery';
     del.addEventListener('click',function(ev){
       ev.stopPropagation();
-      var h=JSON.parse(localStorage.getItem('dyva_tts_history')||'[]');
-      h=h.filter(function(x){return x.ts!==e.ts});
-      localStorage.setItem('dyva_tts_history',JSON.stringify(h));
+      // Drop it from the local history if it lives there, AND remember the file as
+      // dismissed so a server-side clip stays hidden across reloads (non-destructive \u2014
+      // the clip and its server record are untouched; this tab just stops showing it).
+      try{var h=JSON.parse(localStorage.getItem('dyva_tts_history')||'[]');
+        h=h.filter(function(x){return x.ts!==e.ts});
+        localStorage.setItem('dyva_tts_history',JSON.stringify(h));}catch(_){}
+      var f=_ttsFileOf(e);
+      if(f){try{var d=JSON.parse(localStorage.getItem('dyva_tts_dismissed')||'[]')||[];
+        if(d.indexOf(f)<0)d.push(f);
+        localStorage.setItem('dyva_tts_dismissed',JSON.stringify(d.slice(-500)));}catch(_){}}
       loadTtsHistory();
     });
     // text / host / model+timestamp / player, per format.txt

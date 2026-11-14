@@ -321,6 +321,11 @@ IMG_DIR = os.path.join(CACHE_DIR, "images")
 # the response body is raw bytes, which a saved conversation can't hold.
 AUDIO_DIR = os.path.join(CACHE_DIR, "audio")
 AUDIO_KEEP = 200
+# Server-side speech history, the audio twin of IMG_HISTORY_FILE. Every /v1/audio/speech
+# request appends here (UI OR raw API), so the Speech gallery shows clips made over the API
+# too — not just ones the dashboard's own generate flow remembered in localStorage. Capped
+# to AUDIO_KEEP so it tracks the on-disk clip retention (older entries point to pruned files).
+AUDIO_HISTORY_FILE = os.path.join(AUDIO_DIR, "history.json")
 IMG_HISTORY_FILE = os.path.join(IMG_DIR, "history.json")
 THUMB_DIR = os.path.join(IMG_DIR, "thumbs")
 CHATS_FILE = os.path.join(CACHE_DIR, "chats.json")   # legacy blob, migrated into CHATS_DB
@@ -641,7 +646,7 @@ def _apply_cache_dir(path):
     CLASSIFIER_FILE / NODE_CLASSIFIER_FILE are package-relative, not cache-derived,
     so they're intentionally left alone."""
     global CACHE_DIR, CACHE_FILE, NOTWORKING_FILE, BAD_FILE, GOOD_FILE, STATUS_DB
-    global LAST_FILE, STATS_FILE, STATS_DB, KNOWN_FILE, PROBE_FILE, IMG_DIR, AUDIO_DIR, IMG_HISTORY_FILE, THUMB_DIR
+    global LAST_FILE, STATS_FILE, STATS_DB, KNOWN_FILE, PROBE_FILE, IMG_DIR, AUDIO_DIR, AUDIO_HISTORY_FILE, IMG_HISTORY_FILE, THUMB_DIR
     global CHATS_FILE, CHATS_DB, SEMINDEX_DB, JOBS_DB, RERANKER_DB, SETTINGS_FILE, VIDEO_JOBS_FILE
     global VIDEO_JOBS_DIR, CLEANSED_FILE, SURVEY_FILE, MUSIC_JOBS_FILE, MUSIC_JOBS_DIR
     CACHE_DIR = os.path.abspath(os.path.expanduser(path))
@@ -657,6 +662,7 @@ def _apply_cache_dir(path):
     PROBE_FILE = os.path.join(CACHE_DIR, "host-probe.json")
     IMG_DIR = os.path.join(CACHE_DIR, "images")
     AUDIO_DIR = os.path.join(CACHE_DIR, "audio")
+    AUDIO_HISTORY_FILE = os.path.join(AUDIO_DIR, "history.json")
     IMG_HISTORY_FILE = os.path.join(IMG_DIR, "history.json")
     THUMB_DIR = os.path.join(IMG_DIR, "thumbs")
     CHATS_FILE = os.path.join(CACHE_DIR, "chats.json")
@@ -16525,6 +16531,10 @@ def _find_tts_hosts(target_host=None, model_filter=None):
     # of hosts that actually have a TTS node are known from a cold start
     # instead of being rediscovered by probing hundreds of hosts.
     survey = load_node_survey(TTS_KEY)
+    # Temporary, expiring 👎/👍 reorder votes — the SAME reranker find_servers folds in. A
+    # thumbs-down on a finished TTS worker is add_rerank(host,-1); without this the vote was
+    # written and ignored (TTS ranked on tier alone), so the host kept sorting first anyway.
+    rr = rerank_scores()
 
     def rank(h):
         hit = _TTS_NODE_CACHE.get(h)
@@ -16537,6 +16547,8 @@ def _find_tts_hosts(target_host=None, model_filter=None):
                 known, node = True, row.get("spec")
         known_nodeless = known and node is None
         tier = capability_tier(h, tkey, marks, last_host, extra_bad=known_nodeless)
+        # 👎 (-1) sinks below every tier, 👍 (+1) floats above — reversible, self-expiring.
+        tier = _rerank_prio(tier, rr.get(_norm_host(h), 0))
         if known and node is not None:
             # a host whose surveyed node matches what was asked for goes first
             if model_filter and not model_query_match(node.get("class", ""), model_filter):
@@ -19042,7 +19054,9 @@ def _save_audio_clip(raw, filename):
         name = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}{ext}"
         with open(os.path.join(AUDIO_DIR, name), "wb") as f:
             f.write(raw)
-        clips = sorted(os.listdir(AUDIO_DIR))
+        # Prune the oldest clips past AUDIO_KEEP — but never the history.json sidecar that
+        # now lives in this dir (it is not a clip; it sorts after the datestamped names anyway).
+        clips = sorted(n for n in os.listdir(AUDIO_DIR) if n != "history.json")
         for old in clips[:-AUDIO_KEEP]:
             try:
                 os.remove(os.path.join(AUDIO_DIR, old))
@@ -19052,6 +19066,38 @@ def _save_audio_clip(raw, filename):
     except Exception as e:
         log.warning(f"tts: could not save clip: {e}")
         return None
+
+
+def save_audio_history(file, text, voice=None, host="", node=""):
+    """Append one generated clip to the server-side speech history (newest first) — the audio
+    twin of _save_image_history. Written on EVERY /v1/audio/speech, UI or raw API, so the
+    Speech gallery can show clips made over the API, not just ones the dashboard remembered in
+    localStorage. Capped to AUDIO_KEEP to track the on-disk clip retention. Best-effort and
+    atomic (tmp+replace) so a write hiccup can neither break the request nor corrupt the log."""
+    try:
+        os.makedirs(AUDIO_DIR, exist_ok=True)
+        try:
+            with open(AUDIO_HISTORY_FILE, encoding="utf-8") as f:
+                history = json.load(f)
+            if not isinstance(history, list):
+                history = []
+        except Exception:
+            history = []
+        history.insert(0, {
+            "file": file,
+            "text": (text or "")[:200],
+            "voice": voice or "default",
+            "host": host or "",
+            "node": node or "",
+            "when": time.time(),
+        })
+        history = history[:AUDIO_KEEP]
+        tmp = AUDIO_HISTORY_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(history, f)
+        os.replace(tmp, AUDIO_HISTORY_FILE)
+    except Exception as e:
+        log.debug(f"audio history: {e}")
 
 
 async def handle_audio_clip(request):
@@ -19076,6 +19122,28 @@ async def handle_audio_clip(request):
     return web.Response(body=body,
                         content_type=_TTS_MIME.get(ext, "application/octet-stream"),
                         headers={"Cache-Control": "public, max-age=86400"})
+
+
+async def handle_audio_clips(request):
+    """
+    Recent generated speech clips (JSON)
+    ---
+    tags: [Audio]
+    summary: GET /v1/audio/clips — metadata list of recently generated clips, newest first
+    description: >
+      The server-side speech history (text, voice, host, node, file, when), the audio twin of
+      the image gallery's list. Populated by every /v1/audio/speech call, so clips made over
+      the API appear in the Speech gallery too. Each entry's audio is at /v1/audio/clips/{file}.
+    responses:
+      '200':
+        description: Speech history entries
+    """
+    try:
+        with open(AUDIO_HISTORY_FILE, encoding="utf-8") as f:
+            history = json.load(f)
+    except Exception:
+        history = []
+    return web.json_response(history if isinstance(history, list) else [])
 
 
 async def handle_tts_speech(request):
@@ -19240,6 +19308,10 @@ async def handle_tts_speech(request):
             continue
 
         clip = _save_audio_clip(raw, filename)
+        if clip:
+            # Record server-side so this clip shows in the Speech gallery even when the
+            # request came over the raw API (the dashboard's localStorage never saw it).
+            save_audio_history(clip, input_text, voice=voice, host=host, node=node)
         # GOOD on completion, not on accept (the race ran defer_good).
         record_verdict(host, tkey, accepted(None, node), sticky_key=tkey)
         headers = {
@@ -21520,6 +21592,7 @@ def make_app():
     app.router.add_post("/v1/images/edits", handle_image_edit)
     swagger.add_get("/v1/images/edit-models", handle_edit_models)
     swagger.add_get("/v1/audio/voices", handle_audio_voices)
+    swagger.add_get("/v1/audio/clips", handle_audio_clips)   # the speech-history list (gallery source)
     app.router.add_get("/v1/audio/clips/{name}", handle_audio_clip)
     # Registered on the plain router (not swagger) so path params and the
     # sendBeacon POST body aren't subject to swagger request validation.
