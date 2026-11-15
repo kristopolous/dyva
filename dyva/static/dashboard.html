@@ -1356,6 +1356,14 @@ body.dragging-image .hist-item{cursor:grabbing}
 .tts-item .tts-time{margin-left:auto;flex-shrink:0;font-variant-numeric:tabular-nums}
 .tts-item .tts-prov{font-family:var(--font-mono);font-size:var(--fs-2xs);color:var(--text-dim);margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #ttsResult .tts-prov{font-family:var(--font-mono);font-size:var(--fs-xs);color:var(--text-dim);margin-top:var(--sp-2)}
+/* voices list: every voice + how many hosts offer it, popularity-sorted, click to pick */
+.tts-voice-list{display:flex;flex-direction:column;gap:2px;max-height:260px;overflow:auto;margin-bottom:var(--sp-3)}
+.tts-voice-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:4px 8px;border-radius:var(--r-sm);cursor:pointer;font-size:.82rem}
+.tts-voice-row:hover{background:var(--accent-bg)}
+.tts-voice-row.active{background:var(--accent-bg-active);color:var(--text)}
+.tts-voice-name{font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tts-voice-count{color:var(--text-faint);font-variant-numeric:tabular-nums;flex-shrink:0}
+.tts-voice-empty{color:var(--text-faint);font-size:.8rem;padding:4px 8px}
 .hist-item{position:relative;display:flex;gap:10px;align-items:center;cursor:zoom-in;border:1px solid var(--border);border-radius:var(--r-lg);padding:var(--sp-2);background:var(--bg-sunken-alt)}
 .hist-item:hover{border-color:var(--border-accent)}
 .hist-del{position:absolute;top:2px;right:var(--sp-1);color:var(--border-hover);cursor:pointer;font-size:var(--fs-xs);line-height:1;padding:2px 5px;border-radius:var(--r-sm);z-index:2}
@@ -1739,6 +1747,8 @@ body.dragging-image .hist-item{cursor:grabbing}
 </div>
 <div class="studio-out">
 <div id="ttsResult" class="media-result"></div>
+<div class="img-side-title">Voices</div>
+<div id="ttsVoiceList" class="tts-voice-list"></div>
 <div class="img-side-title">Recent</div>
 <div id="ttsGallery" class="media-gallery"></div>
 </div>
@@ -5769,7 +5779,10 @@ async function runStream(chatId,chatCreated,chatTitle,model,msgs,bubble,depth,ex
             }else{
               var jm2=await rm.json(),rows=[];
               if(mtype==='speech'){
-                rows=(jm2.voices||[]).map(function(v){return {id:v}});
+                // voices are now {voice, hosts} — carry the host count through as `count`
+                // so the model sees [voice, host_count] pairs, same shape as models.
+                rows=(jm2.voices||[]).map(function(v){
+                  return (v&&typeof v==='object')?{id:v.voice,count:v.hosts}:{id:v};});
               }else{
                 rows=(jm2.data||[]).map(function(o){return {id:o.id,count:o.count,family:o.family}});
               }
@@ -9082,16 +9095,42 @@ function loadTtsVoices(){
     if(!r.ok)throw new Error('no hosts');
     return r.json();
   }).then(function(j){
+    // voices are {voice, hosts}, popularity-sorted by the server
+    var vs=(j.voices||[]),inp=document.getElementById('ttsVoice');
+    var hosts=(j.hosts||[]).length;
     var dl=document.getElementById('ttsVoices');
     dl.innerHTML='';
-    (j.voices||[]).forEach(function(v){
-      var o=document.createElement('option');o.value=v;dl.appendChild(o);
+    vs.forEach(function(v){
+      var o=document.createElement('option');o.value=v.voice;
+      o.label=v.hosts+' host'+(v.hosts===1?'':'s');dl.appendChild(o);
     });
-    var inp=document.getElementById('ttsVoice');
-    var hosts=(j.hosts||[]).length;
-    inp.placeholder=(j.voices||[]).length
-      ? (j.voices.length+' voices from '+hosts+' host'+(hosts===1?'':'s'))
+    inp.placeholder=vs.length
+      ? (vs.length+' voices from '+hosts+' host'+(hosts===1?'':'s'))
       : 'host default';
+    // the scannable, popularity-sorted list — voice + host count, click to pick,
+    // same idea as the models panel
+    var list=document.getElementById('ttsVoiceList');
+    if(list){
+      list.innerHTML='';
+      if(!vs.length){
+        var e=document.createElement('div');e.className='tts-voice-empty';
+        e.textContent=j.surveying?'surveying hosts for voices…':'no voices advertised yet';
+        list.appendChild(e);
+      }
+      vs.forEach(function(v){
+        var row=document.createElement('div');row.className='tts-voice-row';row.title='Use '+v.voice;
+        var nm=document.createElement('span');nm.className='tts-voice-name';nm.textContent=v.voice;
+        var ct=document.createElement('span');ct.className='tts-voice-count';
+        ct.textContent=v.hosts;ct.title=v.hosts+' host'+(v.hosts===1?'':'s')+' offer this voice';
+        row.appendChild(nm);row.appendChild(ct);
+        row.addEventListener('click',function(){
+          inp.value=v.voice;inp.focus();
+          Array.prototype.forEach.call(list.children,function(c){c.classList.remove('active')});
+          row.classList.add('active');
+        });
+        list.appendChild(row);
+      });
+    }
   }).catch(function(){_ttsVoicesLoaded=false});
 }
 async function generateSpeech(){

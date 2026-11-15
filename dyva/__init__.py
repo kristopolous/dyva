@@ -15965,6 +15965,58 @@ def _tts_voices_of(node_class, info, fam):
     return []
 
 
+def _aggregate_voices(survey):
+    """Roll the per-host TTS survey up into [{voice, hosts}] — how many hosts offer
+    each voice — sorted by host count (desc) then name, for the voices list. Dedups
+    case-insensitively (the live survey carried both "Uncle_fu" and "Uncle_Fu"; they
+    are one voice and their hosts sum) and drops the zero-shot/custom placeholders
+    that are selectors, not voices. The display name is the dominant casing."""
+    agg = {}   # lower -> {"casings": {name: host_count}, "hosts": set}
+    for host, row in (survey or {}).items():
+        if not isinstance(row, dict) or not row.get("node"):
+            continue
+        for v in row.get("voices") or []:
+            if not isinstance(v, str):
+                continue
+            name = v.strip()
+            if not name or _VOICE_PLACEHOLDER.search(name):
+                continue
+            slot = agg.setdefault(name.lower(), {"casings": {}, "hosts": set()})
+            slot["casings"][name] = slot["casings"].get(name, 0) + 1
+            slot["hosts"].add(host)
+    out = [{"voice": max(slot["casings"].items(), key=lambda kv: kv[1])[0],
+            "hosts": len(slot["hosts"])} for slot in agg.values()]
+    out.sort(key=lambda d: (-d["hosts"], d["voice"].lower()))
+    return out
+
+
+def _voice_rank(voice, row):
+    """Routing preference when a specific voice was asked for (0 = best).
+
+    Most TTS hosts run LongCatTTS, which has no voice field and silently ignores
+    whatever voice you requested — so if the race lands on one, every clip comes
+    out the same voice. When a voice is named we sink those voiceless hosts below
+    any host that can actually honour it. With no voice named this is inert (0 for
+    everyone), leaving the reputation ordering untouched.
+
+    `row` is the host's survey entry ({"node":..., "voices":[...]}) or None/{} when
+    the host hasn't been surveyed. An unknown host might well be voice-capable, so
+    it is NOT buried below a host we KNOW ignores voices.
+    """
+    if not voice or not voice.strip():
+        return 0
+    node = row.get("node") if isinstance(row, dict) else None
+    voices = (row.get("voices") if isinstance(row, dict) else None) or []
+    if node and voices:
+        want = voice.strip().lower()
+        if any(isinstance(v, str) and v.strip().lower() == want for v in voices):
+            return 0            # advertises the exact voice asked for
+        return 1                # voice-capable, different catalog
+    if node:
+        return 2                # known node with NO voice field — will ignore the voice
+    return 1                    # unknown host; can't tell, don't rank below voiceless
+
+
 def _tts_node_family(node_class):
     """Return the surveyed TTS-family spec whose name-pattern matches a node
     class name, or None if the node isn't a recognized (popular) TTS node."""
@@ -16505,7 +16557,7 @@ async def _tts_collect(session, host, prompt_id, timeout=180, cancel=None):
                                cancel=cancel)
 
 
-def _find_tts_hosts(target_host=None, model_filter=None):
+def _find_tts_hosts(target_host=None, model_filter=None, voice=None):
     """ComfyUI hosts that can generate TTS, best-first.
 
     TTS is a *node* feature, not a model-file feature: a host with a Qwen3TTS
@@ -16542,18 +16594,22 @@ def _find_tts_hosts(target_host=None, model_filter=None):
     rr = rerank_scores()
 
     def rank(h):
+        srow = survey.get(h)
         hit = _TTS_NODE_CACHE.get(h)
         fresh = bool(hit) and now - hit[1] < _TTS_NODE_CACHE_TTL
         node = hit[0] if fresh else None
         known = fresh
         if not known:
-            row = survey.get(h)
-            if row and now - (row.get("checked") or 0) <= NODE_SURVEY_TTL:
-                known, node = True, row.get("spec")
+            if srow and now - (srow.get("checked") or 0) <= NODE_SURVEY_TTL:
+                known, node = True, srow.get("spec")
         known_nodeless = known and node is None
         tier = capability_tier(h, tkey, marks, last_host, extra_bad=known_nodeless)
         # 👎 (-1) sinks below every tier, 👍 (+1) floats above — reversible, self-expiring.
         tier = _rerank_prio(tier, rr.get(_norm_host(h), 0))
+        # When a voice is named, a voiceless node (LongCatTTS) that would ignore it
+        # sinks below any host that can honour it — otherwise every clip is the same
+        # voice. Inert (0) when no voice is named, so ordering is otherwise unchanged.
+        vrank = _voice_rank(voice, srow)
         if known and node is not None:
             # a host whose surveyed node matches what was asked for goes first
             if model_filter and not model_query_match(node.get("class", ""), model_filter):
@@ -16564,7 +16620,7 @@ def _find_tts_hosts(target_host=None, model_filter=None):
             within = 1
         else:
             within = 2
-        return (tier, within)
+        return (tier, vrank, within)
 
     hosts.sort(key=rank)
     return _idle_first(hosts)
@@ -19211,7 +19267,8 @@ async def handle_tts_speech(request):
     # for one TTS node isn't written off for all of them.
     tkey = tts_key(str(body.get("model") or "").strip() or None)
     hosts = _find_tts_hosts(request.query.get("host"),
-                            str(body.get("model") or "").strip() or None)
+                            str(body.get("model") or "").strip() or None,
+                            voice=voice)
     if not hosts:
         return web.json_response({"error": "no ComfyUI hosts available for tts"}, status=503)
 
@@ -19416,18 +19473,14 @@ async def handle_audio_voices(request):
                     pass
         asyncio.create_task(_fill())
 
-    voices, details, seen = [], [], set()
-    for host in hosts:
-        row = survey.get(host)
-        if not row or not row.get("node"):
-            continue
-        details.append({"host": host,
-                        "nodes": [{"node": row["node"], "voices": row.get("voices") or []}],
-                        "checked": row.get("checked")})
-        for v in row.get("voices") or []:
-            if v not in seen:
-                seen.add(v)
-                voices.append(v)
+    # Only the surveyed candidate hosts that actually have a node, so the voice
+    # counts and the host list agree. `voices` is [{voice, hosts}] — every voice and
+    # how many hosts offer it, popularity-sorted — so the UI can list them like models.
+    sub = {h: survey[h] for h in hosts if h in survey and survey[h].get("node")}
+    voices = _aggregate_voices(sub)
+    details = [{"host": h,
+                "nodes": [{"node": sub[h]["node"], "voices": sub[h].get("voices") or []}],
+                "checked": sub[h].get("checked")} for h in hosts if h in sub]
     return web.json_response({"voices": voices, "hosts": details,
                               "surveying": len(stale) if not force else 0})
 
