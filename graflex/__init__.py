@@ -556,6 +556,22 @@ SERVICE_CONFIG = {
         "hunter_query": 'web.title="localai"',
         "check_path": "/v1/models",
     },
+    "chatterbox": {
+        # devnen/Chatterbox-TTS-Server: a keyless (use_auth:false by default) FastAPI
+        # TTS server whose web UI <title> is "Chatterbox TTS Server" (the FOFA
+        # fingerprint, ~88 hosts). OpenAI-compatible — POST /v1/audio/speech returns
+        # WAV. Default port 8004 but operators move it (seen 8081), so FOFA carries
+        # each host's real port and we sweep the common ones. /v1/models and
+        # /v1/audio/voices 404 on this build, so the check_path is /api/model-info,
+        # which returns {"loaded":true,"class_name":"ChatterboxTurboTTS",...}; the
+        # voice list (needed to drive it — voice is the FILENAME) comes from
+        # /get_predefined_voices. Not many in the wild, so US,DE catches ~all.
+        "port": 8004,
+        "fofa_query": 'title="Chatterbox TTS Server"',
+        "countries": "US,DE",
+        "ports": "8004,8081,80,443,8000",
+        "check_path": "/api/model-info",
+    },
     "strata": {
         # Strata: an OpenAI-dialect inference server (web UI page title "Strata").
         # /v1/models returns the standard {"object":"list","data":[...]} shape, landing
@@ -1420,6 +1436,37 @@ async def _check_host(session, host, port, service, timeout=TIMEOUT):
                     if await _comfy_auth_gated(session, base_url, timeout):
                         result["auth_gated"] = True
                     return result
+                elif service == "chatterbox":
+                    # devnen/Chatterbox-TTS-Server. /api/model-info confirms a loaded
+                    # Chatterbox model; /get_predefined_voices lists the voices (the
+                    # FILENAME is what POST /v1/audio/speech wants for `voice`). Record
+                    # the voices so dyva can drive it without re-probing. `models` holds
+                    # the engine class so the host isn't model-matched into text routing.
+                    data = await resp.json()
+                    await resp.release()
+                    if not (isinstance(data, dict) and data.get("loaded")
+                            and "chatterbox" in str(data.get("class_name", "")).lower()):
+                        last_error = {"error": f"not a loaded Chatterbox ({current_scheme})"}
+                        break
+                    voices = []
+                    try:
+                        vr = await asyncio.wait_for(
+                            session.get(f"{base_url}get_predefined_voices", allow_redirects=False),
+                            timeout=timeout)
+                        if vr.status == 200:
+                            vd = await vr.json()
+                            voices = [v.get("filename") for v in vd
+                                      if isinstance(v, dict) and v.get("filename")]
+                        await vr.release()
+                    except Exception:
+                        pass
+                    return {
+                        "service": service,
+                        "url": base_url,
+                        "models": [str(data.get("class_name") or "ChatterboxTTS")],
+                        "voices": voices,
+                        "checked": datetime.now(timezone.utc).isoformat(),
+                    }
                 elif service == "vllm":
                     data = await resp.json()
                     await resp.release()

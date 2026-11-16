@@ -198,6 +198,15 @@ ENDL
     COUNTRIES="US,CN,IR,TW,DE,RU,FR,KR,PL,GB,HK,JP,NL,BR,VN,FI,IN,CA"
     ;;
 
+  chatterbox)
+    # devnen/Chatterbox-TTS-Server: keyless OpenAI-compatible TTS (POST /v1/audio/speech).
+    # Web UI <title> "Chatterbox TTS Server". Default :8004, operators move it. Not many
+    # in the wild, so US,DE catches ~all without country subsplicing.
+    QUERY='title="Chatterbox TTS Server"'
+    PORTS="8004,8081,80,443,8000"
+    COUNTRIES="US,DE"
+    ;;
+
   fooocus)
     COUNTRIES='CN'
     SERVERS='uvicorn,nginx'

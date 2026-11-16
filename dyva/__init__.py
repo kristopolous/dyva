@@ -16443,6 +16443,52 @@ def _apply_param_hints(inputs, required, hints):
             inputs[field] = prefs[0]
 
 
+_OPENAI_TTS_SERVICES = {"chatterbox", "localai"}
+
+
+def _is_openai_tts_service(service):
+    """Services that speak OpenAI `/v1/audio/speech` — TTS by passthrough, not a
+    ComfyUI node graph. chatterbox is always TTS; a localai host is a candidate
+    only when it actually has a TTS model loaded (checked at selection time)."""
+    return service in _OPENAI_TTS_SERVICES
+
+
+def _resolve_chatterbox_voice(requested, voices):
+    """Chatterbox's `voice` must be one of its predefined FILENAMES ("Abigail.wav");
+    a display name or a voice from another engine 404s the host. Match the request
+    against the host's advertised voices (case-insensitively, tolerating a missing
+    .wav) and fall back to the first voice. None when the host advertises none."""
+    voices = [v for v in (voices or []) if isinstance(v, str) and v.strip()]
+    if not voices:
+        return None
+    if requested:
+        want = requested.strip().lower()
+        if want.endswith(".wav"):
+            want = want[:-4]
+        for v in voices:
+            stem = v[:-4] if v.lower().endswith(".wav") else v
+            if stem.lower() == want:
+                return v
+    return voices[0]
+
+
+def _openai_tts_body(service, model, input_text, voice, voices):
+    """(path, json_body) for an OpenAI-compatible `/v1/audio/speech` request,
+    shaped per service. Chatterbox needs a predefined filename voice and ignores
+    `model` (send the literal "chatterbox"); LocalAI/generic takes {model, input}
+    plus an optional voice passthrough."""
+    if service == "chatterbox":
+        body = {"model": "chatterbox", "input": input_text, "response_format": "wav"}
+        v = _resolve_chatterbox_voice(voice, voices)
+        if v:
+            body["voice"] = v
+        return "/v1/audio/speech", body
+    body = {"model": model, "input": input_text}
+    if voice:
+        body["voice"] = voice
+    return "/v1/audio/speech", body
+
+
 def _tts_workflow(spec, schema, input_text, voice, host_info=None):
     cls = spec["class"]
     required = ((schema.get(cls) or {}).get("input") or {}).get("required") or {}
@@ -16670,6 +16716,113 @@ def _find_tts_hosts(target_host=None, model_filter=None, voice=None):
 
     hosts.sort(key=rank)
     return _idle_first(hosts)
+
+
+_OPENAI_TTS_MODEL_RE = re.compile(
+    r"(?i)\btts\b|tts-1|piper|bark|vibevoice|voxcpm|chatterbox|kokoro|xtts|coqui|"
+    r"qwen.?tts|omnivoice|pocket.?tts|fish.?speech|cosyvoice|speecht5|parler|melo|"
+    r"sovits|\bvits\b|glow.?tts|supertonic|kitten|orpheus|higgs")
+
+
+def _openai_tts_model(server):
+    """The TTS model id a host advertises, or None. chatterbox is always TTS;
+    a localai host qualifies only when one of its models looks like a TTS model."""
+    if server.get("service") == "chatterbox":
+        models = server.get("models") or []
+        return models[0] if models else "chatterbox"
+    for m in server.get("models") or []:
+        if isinstance(m, str) and _OPENAI_TTS_MODEL_RE.search(m):
+            return m
+    return None
+
+
+def _find_openai_tts_hosts(voice=None):
+    """Discovered hosts that do TTS by OpenAI `/v1/audio/speech` passthrough
+    (chatterbox always; localai when it has a TTS model). Best-first by the same
+    reputation tiering + 👍/👎 rerank + idle-spread the ComfyUI TTS race uses, so
+    a thumbs-down on one of these sinks it like any other host.
+
+    Returns entries (host, service, model, voices) for the race; `host_of` is
+    entry[0]. A requested voice doesn't reorder here — these hosts each carry
+    their own voice catalog, resolved per-host at request time."""
+    marks = load_marks()
+    tkey = tts_key(None)
+    last = get_last(tkey)
+    last_host = last[0] if last and last[0] else None
+    rr = rerank_scores()
+    entries = []
+    for s in load_servers():
+        svc, host = s.get("service"), s.get("server")
+        if not host or not _is_openai_tts_service(svc):
+            continue
+        model = _openai_tts_model(s)
+        if not model:
+            continue
+        entries.append((host, svc, model, s.get("voices") or []))
+
+    def rank(e):
+        h = e[0]
+        tier = capability_tier(h, tkey, marks, last_host)
+        tier = _rerank_prio(tier, rr.get(_norm_host(h), 0))
+        return tier
+
+    entries.sort(key=rank)
+    order = {h: i for i, h in enumerate(_idle_first([e[0] for e in entries]))}
+    entries.sort(key=lambda e: order.get(e[0], 0))
+    return entries
+
+
+async def _openai_tts_speak(session, host, service, model, voices, input_text, voice):
+    """POST one OpenAI-compatible `/v1/audio/speech` request and return (raw_bytes,
+    content_type). Raises _TtsError on a non-200 or a non-audio body (some hosts
+    answer 200 with a JSON error envelope)."""
+    path, body = _openai_tts_body(service, model, input_text, voice, voices)
+    url = host.rstrip("/") + path
+    budget = _tts_render_budget(input_text)
+    timeout = aiohttp.ClientTimeout(total=budget, sock_connect=CONNECT_TIMEOUT)
+    async with session.post(url, json=body, timeout=timeout) as resp:
+        raw = await resp.read()
+        ctype = resp.headers.get("Content-Type", "")
+        if resp.status != 200:
+            raise _TtsError(f"HTTP {resp.status}: {raw[:120].decode('utf-8', 'ignore')}")
+    if "json" in ctype.lower() or raw[:1] in (b"{", b"["):
+        raise _TtsError(f"non-audio response: {raw[:120].decode('utf-8', 'ignore')}")
+    if len(raw) < 256:
+        raise _TtsError(f"audio too small ({len(raw)}B)")
+    return raw, (ctype or "audio/wav")
+
+
+async def _openai_tts_race(session, entries, input_text, voice, tkey, label, job_wid=None):
+    """Race OpenAI-compatible TTS hosts — one-shot POST, first clean audio wins —
+    through the shared host race, so reputation, 👎/👍 and the activity feed behave
+    exactly like the ComfyUI path. The returned accepted() IS real success (no
+    two-phase collect, so no defer_good). Returns (host, service, model, raw,
+    ctype) or None."""
+    async def attempt(entry, wid, done):
+        host, service, model, voices = entry
+        await broadcast_activity(host, tkey, "trying", f"trying: {host}@{label}", wid=wid)
+        start = time.time()
+        try:
+            raw, ctype = await _openai_tts_speak(
+                session, host, service, model, voices, input_text, voice)
+        except (_TtsError, asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
+            err = str(e) or type(e).__name__
+            dur = time.time() - start
+            await broadcast_activity(host, tkey, "failed",
+                f"failure: {host}@{label} - {err}", duration=dur, wid=wid)
+            if isinstance(e, asyncio.TimeoutError):
+                return timed_out(err)
+            if isinstance(e, (aiohttp.ClientError, OSError)):
+                return unreachable_host(err)
+            return failed(err)
+        dur = time.time() - start
+        await broadcast_activity(host, tkey, "connected",
+            f"success: {host}@{label}", duration=dur, wid=wid, rmodel=service)
+        return accepted((host, service, model, raw, ctype))
+
+    result, _stopped, _tried, _tally = await _race_hosts(
+        entries, attempt, tkey, job_wid=job_wid, host_of=lambda e: e[0], label=label)
+    return result
 
 
 def _host_has_class(host, classes):
@@ -19312,17 +19465,49 @@ async def handle_tts_speech(request):
     # Reputation is keyed by the voice model asked for, so a host written off
     # for one TTS node isn't written off for all of them.
     tkey = tts_key(str(body.get("model") or "").strip() or None)
-    hosts = _find_tts_hosts(request.query.get("host"),
+    target = request.query.get("host")
+    hosts = _find_tts_hosts(target,
                             str(body.get("model") or "").strip() or None,
                             voice=voice)
-    if not hosts:
-        return web.json_response({"error": "no ComfyUI hosts available for tts"}, status=503)
+    # OpenAI-compatible TTS hosts (LocalAI, Chatterbox): clean voiced speech by
+    # `/v1/audio/speech` passthrough, no ComfyUI node graph — the preferred source.
+    oai_hosts = [] if target else _find_openai_tts_hosts(voice)
+    if not hosts and not oai_hosts:
+        return web.json_response({"error": "no hosts available for tts"}, status=503)
 
     session = request.app["session"]
     snippet = input_text[:60] + ("..." if len(input_text) > 60 else "")
     errors_list = []
 
     label = f"tts: {snippet}"
+
+    # Try the OpenAI-compatible hosts first (passthrough, real voices, no graph).
+    # Fall through to the ComfyUI race if none of them delivers.
+    if oai_hosts:
+        oai_wid = await _register_worker(str(body.get("model") or "").strip() or "*",
+                                         len(oai_hosts), lambda: None, kind="speech")
+        oai_result = await _openai_tts_race(session, oai_hosts, input_text, voice,
+                                            tkey, label, job_wid=oai_wid)
+        if oai_result:
+            host, service, model, raw, ctype = oai_result
+            ext = "." + (ctype.split("/")[-1].split(";")[0].strip() or "wav")
+            clip = _save_audio_clip(raw, f"tts{ext}")
+            if clip:
+                save_audio_history(clip, input_text, voice=voice, host=host, node=service)
+            await _unregister_worker(oai_wid, ok=True)
+            headers = {
+                "X-Dyva-Host": host,
+                "X-Dyva-Node": service,
+                "X-Dyva-Service": service,
+                "Access-Control-Expose-Headers":
+                    "X-Dyva-Host, X-Dyva-Node, X-Dyva-Service, X-Dyva-File",
+            }
+            if clip:
+                headers["X-Dyva-File"] = clip
+            return web.Response(body=raw, content_type=ctype, headers=headers)
+        await _unregister_worker(oai_wid)
+    if not hosts:
+        return web.json_response({"error": "no hosts available for tts"}, status=502)
 
     # Same race as text generation: one bounded worker pool over the ranked host
     # list, first success wins, and the same activity vocabulary
