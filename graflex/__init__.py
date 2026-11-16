@@ -1604,14 +1604,18 @@ def _shodan_path(label, run_ts, svc="any"):
     return os.path.join("/tmp/graflex", run_ts, "shodan", f"{svc}-{label}.txt")
 
 
-def _fetch_web(dry, service, combined, country=None, port=None, server=None, run_ts=None, curlify=False, label="", pname="any"):
+def _fetch_web(dry, service, combined, country=None, port=None, server=None, run_ts=None, curlify=False, label="", pname="any", no_timerange=False):
     import base64
     import re
     import requests
     import curlify as curlify_mod
 
     qb64 = base64.b64encode(combined.encode()).decode()
-    url = f"{FOFA_WEB}?qbase64={qb64}{FOFA_FILTER}"
+    # FOFA_FILTER (filter_type=last_month) restricts results to hosts FOFA has seen
+    # in the last month. no_timerange drops it so the FULL catalog comes back — for
+    # small services (NOTIMERANGE=1 in graflex.sh) we can exhaustively check.
+    filt = "" if no_timerange else FOFA_FILTER
+    url = f"{FOFA_WEB}?qbase64={qb64}{filt}"
 
     cookie_header = FOFA_COOKIE
 
@@ -2503,7 +2507,7 @@ def _fetch_zoomeye(dry, svc, base_query, page=1, run_ts=None, curlify=False, lab
     return data
 
 
-def fetch(dry=False, curlify=False, service=None, query=None, name=None, servers=None, ports=None, countries=None, fids=None, sleep=SLEEP_DEFAULT, session=None, shuffle=False, site="fofa", check_batch_fn=None):
+def fetch(dry=False, curlify=False, service=None, query=None, name=None, servers=None, ports=None, countries=None, fids=None, sleep=SLEEP_DEFAULT, session=None, shuffle=False, site="fofa", check_batch_fn=None, no_timerange=False):
     global _RUN_TS
     hosts_file = _cache_file(name, "hosts")
 
@@ -2648,7 +2652,8 @@ def fetch(dry=False, curlify=False, service=None, query=None, name=None, servers
             parts = [base_query]
             if c:
                 parts.append(f'country="{c}"')
-            parts.append(_window)
+            if not no_timerange:
+                parts.append(_window)      # exhaustive mode (small catalogs) drops it
             queries.append(" && ".join(parts))
 
         pool = []
@@ -2995,7 +3000,7 @@ def fetch(dry=False, curlify=False, service=None, query=None, name=None, servers
                     continue
 
             svc = service or name or "unknown"
-            hosts = _fetch_web(dry, svc, combined, country, port, server, run_ts, curlify=curlify, label=label, pname=service or name or "any")
+            hosts = _fetch_web(dry, svc, combined, country, port, server, run_ts, curlify=curlify, label=label, pname=service or name or "any", no_timerange=no_timerange)
             if hosts is None:
                 continue
 
@@ -4677,6 +4682,7 @@ The other actions find hosts, reshape the stores, or mine the snapshots:
     parser.add_argument("-p", "--ports", help="comma-separated port values to cycle")
     parser.add_argument("-q", "--query", help="custom FOFA query (requires --name)")
     parser.add_argument("-r", "--random", dest="shuffle", action="store_true", help="shuffle the ports, servers, countries, and FID lists so the fetch cycles through combinations in random order")
+    parser.add_argument("--no-timerange", dest="no_timerange", action="store_true", help="drop the after/before freshness window from the search query so the FULL catalog is returned, not just hosts seen in the last ZOOMEYE_SEEN_DAYS. For small, exhaustively-scannable services (set NOTIMERANGE=1 in graflex.sh) where every host is worth checking; wasteful for huge pools (comfyui) where the window culls dead hosts.")
     parser.add_argument("-t", "--site", choices=["fofa", "shodan", "zoomeye", "censys", "hunter"], default="fofa", help="site to scrape (default: fofa)")
     parser.add_argument("-s", "--service", choices=list(SERVICE_CONFIG) + ["all"],
                         help="service to search for; 'all' runs the action across every service (each gets its own <service>-*.json cache), for automating the full pipeline")
@@ -4846,7 +4852,7 @@ The other actions find hosts, reshape the stores, or mine the snapshots:
                 fetch(dry=args.dry, curlify=args.curlify, service=_svc, query=args.query,
                       name=_nm, servers=args.servers, ports=args.ports, countries=args.countries,
                       fids=args.fids, sleep=args.sleep, session=args.session, shuffle=args.shuffle,
-                      site=args.site, check_batch_fn=batch_cb)
+                      site=args.site, check_batch_fn=batch_cb, no_timerange=args.no_timerange)
 
                 if not args.dry and not args.curlify:
                     log.info("--- drain remaining new hosts ---")
@@ -4871,7 +4877,7 @@ The other actions find hosts, reshape the stores, or mine the snapshots:
                 fetch(dry=args.dry, curlify=args.curlify, service=_svc, query=args.query,
                       name=_nm, servers=args.servers, ports=args.ports, countries=args.countries,
                       fids=args.fids, sleep=args.sleep, session=args.session, shuffle=args.shuffle,
-                      site=args.site)
+                      site=args.site, no_timerange=args.no_timerange)
                 if not args.dry and not args.curlify:
                     asyncio.run(_run_survey_recovery(
                         _svc, name=_nm, check_timeout=args.check_timeout, workers=args.workers,
@@ -4880,7 +4886,7 @@ The other actions find hosts, reshape the stores, or mine the snapshots:
                 for step in parts:
                     # log.info(f"--- {step} ---")
                     if step == "fetch":
-                        fetch(dry=args.dry, curlify=args.curlify, service=_svc, query=args.query, name=_nm, servers=args.servers, ports=args.ports, countries=args.countries, fids=args.fids, sleep=args.sleep, session=args.session, shuffle=args.shuffle, site=args.site)
+                        fetch(dry=args.dry, curlify=args.curlify, service=_svc, query=args.query, name=_nm, servers=args.servers, ports=args.ports, countries=args.countries, fids=args.fids, sleep=args.sleep, session=args.session, shuffle=args.shuffle, site=args.site, no_timerange=args.no_timerange)
                     elif step == "check":
                         check(service=_svc, name=_nm, check_timeout=args.check_timeout, check_new=check_new, check_all=check_all, workers=args.workers, session=args.session, site=args.site)
                     elif step == "classify":

@@ -152,10 +152,12 @@ ENDL
     
   colibri)
     PORTS="8000"
+    NOTIMERANGE=1   # small catalog — sweep it all, don't cull to the fresh window
     ;;
 
   strata)
     PORTS="8080,8081"
+    NOTIMERANGE=1   # small catalog — sweep it all, don't cull to the fresh window
     ;;
 
   comfyui)
@@ -172,6 +174,7 @@ ENDL
     SERVERS="nginx,nginx/1.22.1,uvicorn"
     COUNTRIES="TH,MX,MY,NZ,BH,SG,KR,GB,AE,US,AU,IN,JP,DE,CA,RU,IL,BR,CN,IE,FR,ES,ID,IT,CH,ZA,HK,PL"
     FID="4OeA79EXS7Z+DdzkAvrBag==,WPcuJSTXuzZQIeov/h9jgA==,NCPjfTODiuNabsua2LTY7Q==,SWCeWGsQp4gTPi4YvgrIdQ=="
+    NOTIMERANGE=1   # small catalog — sweep it all, don't cull to the fresh window
     ;;
 
   llama.cpp)
@@ -204,6 +207,7 @@ ENDL
     # in the wild, so US,DE catches ~all without country subsplicing.
     QUERY='title="Chatterbox TTS Server"'
     COUNTRIES="US,DE"
+    NOTIMERANGE=1   # small catalog (~88) — sweep it all, don't cull to the fresh window
     ;;
 
   fooocus)
@@ -212,6 +216,7 @@ ENDL
     ;;
 
   ds4)
+    NOTIMERANGE=1   # small catalog — sweep it all, don't cull to the fresh window
     ;;
 
   gradio)
@@ -388,6 +393,10 @@ query=()
 [[ -n "$FID" ]] && fid=( "--fid" $FID )
 [[ -n "$SERVERS" ]] && servers=( "--servers" "$SERVERS" )
 [[ -n "$QUERY" ]] && query=( "--query" "$QUERY" )
+# NOTIMERANGE=1 (per-service) drops the after/before freshness window so the FULL
+# catalog is swept — for small services we can exhaustively check, not huge pools.
+notr=()
+[[ -n "$NOTIMERANGE" ]] && notr=( "--no-timerange" )
 
 # gradio has no --service entry; -n gradio alone selects the named query
 svc_args=( --service "$SERVICE" )
@@ -399,7 +408,7 @@ MALLOC_ARENA_MAX=2 exec python3 -OO ./graflex.py \
       "${EXTRA_ARGS[@]}" "${fid[@]}" \
       --ports "$PORTS" \
       --site  "$SITE" \
-      "${query[@]}" --random \
+      "${query[@]}" "${notr[@]}" --random \
       --name    "$SERVICE" "${servers[@]}" \
       "${svc_args[@]}" \
       --sleep   "$SLEEP" \
