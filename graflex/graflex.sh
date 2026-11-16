@@ -32,7 +32,7 @@ esac
 
 case "$SERVICE" in
   all)
-    for i in ds4 strata vllm lmstudio fooocus llama.cpp colibri ollama shodan comfyui a1111 gradio; do
+    for i in chatterbox ds4 strata vllm lmstudio fooocus llama.cpp colibri ollama shodan comfyui a1111 gradio; do
       $CMD $i "${SUB_ARGS[@]}"
       last_res="$?"
       echo ">>   $i -- "$last_res
@@ -203,7 +203,6 @@ ENDL
     # Web UI <title> "Chatterbox TTS Server". Default :8004, operators move it. Not many
     # in the wild, so US,DE catches ~all without country subsplicing.
     QUERY='title="Chatterbox TTS Server"'
-    PORTS="8004,8081,80,443,8000"
     COUNTRIES="US,DE"
     ;;
 
