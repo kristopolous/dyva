@@ -3695,6 +3695,12 @@ def _host_tools_screened(host):
 _FAIL_COLS = {"timeout": "fail_timeout", "4xx": "fail_4xx", "5xx": "fail_5xx",
               "conn": "fail_conn", "other": "fail_other"}
 
+# A maybe_good host stays maybe_good through transient blips (the leniency), but a long run of
+# CONSECUTIVE failures with no success (add_good resets failure_streak) is a dead host coasting on
+# ancient glory, not a blip — demote it to bad at this streak. bad self-revives on the next
+# smoke/success, so a host that merely had an outage comes straight back.
+STREAK_BAD_THRESHOLD = 10
+
 
 def _failure_kind(verdict, detail):
     """Bucket a failure for the survey counters. Derived from the verdict and the
@@ -3703,10 +3709,12 @@ def _failure_kind(verdict, detail):
     if verdict == V_TIMEOUT:
         return "timeout"
     d = detail or ""
-    if d.startswith("status 4"):
-        return "4xx"
-    if d.startswith("status 5"):
-        return "5xx"
+    # Handlers spell the HTTP status two ways: the canonical "status {code}" (chat) and
+    # "HTTP {code}" (the /v1/systemone decision path + a couple of media handlers). Bucket both
+    # by status class, or a decision host's 502s pile into fail_other and never show as 5xx.
+    m = re.match(r"(?:status|HTTP)\s+(\d)", d, re.I)
+    if m:
+        return {"4": "4xx", "5": "5xx"}.get(m.group(1), "other")
     dl = d.lower()
     if "connect" in dl or "errno" in dl or "unreachable" in dl:
         return "conn"
@@ -3753,7 +3761,11 @@ def add_bad(host, model, kind="other", reason=None):
     model = canon_pattern(model)
     reason = (" ".join(str(reason).split())[:500] or None) if reason else None
     db = _get_db()
-    cur = _state_of(host, model)
+    row = db.execute(
+        f"SELECT state, failure_streak FROM host_status WHERE host=? AND model=? AND {_LIVE_REAL}",
+        (host, model)).fetchone()
+    cur = row[0] if row else None
+    new_streak = ((row[1] or 0) if row else 0) + 1   # this failure's streak value (SQL adds +1 too)
     if reason and _STRUCTURAL_FAIL_RE.search(reason):
         # STRUCTURAL/permanent failure (auth-gated 401/403, missing model, unloadable build):
         # it will NEVER work for us, so condemn it to 'bad' from ANY prior state — including
@@ -3767,6 +3779,12 @@ def add_bad(host, model, kind="other", reason=None):
         # decides a tier) — a failure makes it bad. Without the 'unknown' case, a host smoke-probed
         # first (so a row already exists) could NEVER reach 'bad', so load_incompatible() never saw
         # its structural failure and it was re-probed every request.
+        new_state = "bad"
+    elif new_streak >= STREAK_BAD_THRESHOLD:
+        # Leniency has a ceiling: a good/maybe_good host that has failed this many times in a row
+        # with no intervening success isn't blipping, it's down. Drop it to bad so it stops being
+        # fronted; a real recovery re-probes back out of bad. (A single success resets the streak,
+        # so this only fires on a genuine sustained run.)
         new_state = "bad"
     elif cur == "good":
         new_state = "maybe_good"       # one failure right after good -> maybe, not straight to bad

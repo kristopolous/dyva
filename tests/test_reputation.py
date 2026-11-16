@@ -19,11 +19,18 @@ def _db(state):
     conn = sqlite3.connect(":memory:")
     conn.execute("""CREATE TABLE host_status(host TEXT, model TEXT, state TEXT, last_good TEXT,
       failure_streak INTEGER DEFAULT 0, failure INTEGER DEFAULT 0, fail_other INTEGER DEFAULT 0,
+      fail_4xx INTEGER DEFAULT 0, fail_5xx INTEGER DEFAULT 0, fail_timeout INTEGER DEFAULT 0,
+      fail_conn INTEGER DEFAULT 0,
       last_fail TEXT, last_fail_reason TEXT, is_query INTEGER DEFAULT 0, deleted_at TEXT,
       PRIMARY KEY(host,model))""")
     conn.execute("INSERT INTO host_status(host,model,state) VALUES(?,?,?)", (H, M, state))
     conn.commit()
     return conn
+
+
+def _set_streak(conn, n):
+    conn.execute("UPDATE host_status SET failure_streak=? WHERE host=? AND model=?", (n, H, M))
+    conn.commit()
 
 
 def _state(conn):
@@ -55,6 +62,44 @@ def test_transient_from_good_keeps_maybe_good_leniency(monkeypatch):
     conn = _db("good")
     monkeypatch.setattr(dyva, "_status_db", conn, raising=False)
     dyva.add_bad(H, M, reason="timed out")          # not structural
+    assert _state(conn) == "maybe_good"
+
+
+def test_maybe_good_demotes_to_bad_at_streak_threshold(monkeypatch):
+    # A maybe_good host one failure shy of the threshold: the next consecutive failure tips it
+    # to bad. add_good resets failure_streak, so reaching the threshold means a genuine run of
+    # consecutive failures with no intervening success — dead, not blipping.
+    conn = _db("maybe_good")
+    monkeypatch.setattr(dyva, "_status_db", conn, raising=False)
+    _set_streak(conn, dyva.STREAK_BAD_THRESHOLD - 1)
+    dyva.add_bad(H, M, kind="5xx", reason="HTTP 502: Bad Gateway")
+    assert _state(conn) == "bad"
+
+
+def test_maybe_good_stays_below_streak_threshold(monkeypatch):
+    conn = _db("maybe_good")
+    monkeypatch.setattr(dyva, "_status_db", conn, raising=False)
+    _set_streak(conn, dyva.STREAK_BAD_THRESHOLD - 3)
+    dyva.add_bad(H, M, kind="5xx", reason="HTTP 502: Bad Gateway")
+    assert _state(conn) == "maybe_good"
+
+
+def test_streak_demotion_is_kind_agnostic(monkeypatch):
+    # The streak itself is the signal, not the failure class: a long run of plain "other"
+    # failures demotes just like 5xx.
+    conn = _db("maybe_good")
+    monkeypatch.setattr(dyva, "_status_db", conn, raising=False)
+    _set_streak(conn, dyva.STREAK_BAD_THRESHOLD - 1)
+    dyva.add_bad(H, M, kind="other", reason="bad response (not JSON)")
+    assert _state(conn) == "bad"
+
+
+def test_first_transient_failure_still_lenient_despite_threshold(monkeypatch):
+    # The leniency for blips is preserved: a maybe_good host with no prior streak does NOT
+    # demote on a single failure.
+    conn = _db("maybe_good")
+    monkeypatch.setattr(dyva, "_status_db", conn, raising=False)
+    dyva.add_bad(H, M, kind="5xx", reason="HTTP 502: Bad Gateway")
     assert _state(conn) == "maybe_good"
 
 
