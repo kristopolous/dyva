@@ -15995,6 +15995,36 @@ def _aggregate_voices(survey):
     return out
 
 
+def _voice_norm(s):
+    """Voice name -> lowercase-alphanumeric identity: drop path, a known audio/model
+    extension, and every separator, so Adam_US / us-adam / adamus collapse. The voice
+    twin of _norm_model."""
+    s = str(s or "").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    s = re.sub(r"\.(wav|mp3|flac|ogg|opus|m4a|safetensors|pth|onnx|bin|pt|ckpt)$", "",
+               s, flags=re.I)
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def voice_query_match(query, voice):
+    """Case-insensitive, separator-blind partial match with token narrowing — the
+    voice twin of model_query_match. The query splits into tokens on whitespace/
+    separators; the voice matches when EVERY token is a substring of its normalized
+    name. So 'adam' matches any adam, 'adam uk' narrows to adam voices carrying 'uk',
+    and junk in the voice name (24bit, q4) never blocks query⊆voice. Empty -> True.
+    Never an exact-or-fail gate: routing prefers best-available over rejection."""
+    v = _voice_norm(voice)
+    # Strip a trailing audio/model extension from the query too, so a request of
+    # "Dylan.wav" tokenizes to just "dylan", not "dylan"+"wav".
+    q = re.sub(r"\.(wav|mp3|flac|ogg|opus|m4a|safetensors|pth|onnx|bin|pt|ckpt)$", "",
+               str(query or ""), flags=re.I)
+    toks = [n for n in (_voice_norm(t) for t in re.split(r"[\s_\-/,.]+", q)) if n]
+    if not toks:
+        return True
+    if not v:
+        return False
+    return all(t in v for t in toks)
+
+
 def _voice_rank(voice, row):
     """Routing preference when a specific voice was asked for (0 = best).
 
@@ -16013,9 +16043,8 @@ def _voice_rank(voice, row):
     node = row.get("node") if isinstance(row, dict) else None
     voices = (row.get("voices") if isinstance(row, dict) else None) or []
     if node and voices:
-        want = voice.strip().lower()
-        if any(isinstance(v, str) and v.strip().lower() == want for v in voices):
-            return 0            # advertises the exact voice asked for
+        if any(isinstance(v, str) and voice_query_match(voice, v) for v in voices):
+            return 0            # advertises a voice matching what was asked for
         return 1                # voice-capable, different catalog
     if node:
         return 2                # known node with NO voice field — will ignore the voice
@@ -16461,13 +16490,9 @@ def _resolve_chatterbox_voice(requested, voices):
     voices = [v for v in (voices or []) if isinstance(v, str) and v.strip()]
     if not voices:
         return None
-    if requested:
-        want = requested.strip().lower()
-        if want.endswith(".wav"):
-            want = want[:-4]
+    if requested and requested.strip():
         for v in voices:
-            stem = v[:-4] if v.lower().endswith(".wav") else v
-            if stem.lower() == want:
+            if voice_query_match(requested, v):
                 return v
     return voices[0]
 
