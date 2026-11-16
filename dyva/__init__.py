@@ -15946,6 +15946,11 @@ def load_node_classifier():
                             "voice": spec.get("voice"),
                             "lang": spec.get("lang"),
                             "style": spec.get("style"),
+                            # Optional quality recipe (model/steps/guidance) the
+                            # family imposes over the node's raw schema defaults —
+                            # the same idea as flow/DiT image families owning their
+                            # steps+cfg. LongCat's 1B default is noise on short text.
+                            "param_hints": spec.get("param_hints"),
                         })
         except Exception as e:
             log.warning(f"node-classifier: failed to load {NODE_CLASSIFIER_FILE}: {e}")
@@ -16403,6 +16408,41 @@ def _audio_out(node_info):
 DEFAULT_VOICE_STYLE = "A clear, natural speaking voice, calm and even."
 
 
+def _apply_param_hints(inputs, required, hints):
+    """Override filled inputs with a family's quality recipe, honoring each
+    field's schema. Enum hints are a preference list — the first option the node
+    actually offers wins, so a host that lacks the preferred model still gets a
+    valid graph. INT/FLOAT hints are clamped to the field's declared range. A
+    hinted field the node doesn't expose is skipped. No-op when hints is empty.
+
+    This is why a TTS family can insist on a good configuration the node's own
+    defaults don't give: LongCatTTS defaults to the 1B model, which is noise on
+    short text; its recipe forces 3.5B-bf16 + apg, which is intelligible (proven
+    by transcribing real generations on a live host)."""
+    for field, pref in (hints or {}).items():
+        entry = required.get(field)
+        if not isinstance(entry, list) or not entry:
+            continue
+        kind = entry[0]
+        attrs = entry[1] if len(entry) > 1 and isinstance(entry[1], dict) else {}
+        prefs = pref if isinstance(pref, list) else [pref]
+        if isinstance(kind, list):                      # enum: first offered preference
+            for p in prefs:
+                if p in kind:
+                    inputs[field] = p
+                    break
+        elif kind in ("INT", "FLOAT"):
+            v = prefs[0]
+            lo, hi = attrs.get("min"), attrs.get("max")
+            if isinstance(lo, (int, float)) and v < lo:
+                v = lo
+            if isinstance(hi, (int, float)) and v > hi:
+                v = hi
+            inputs[field] = int(v) if kind == "INT" else float(v)
+        else:
+            inputs[field] = prefs[0]
+
+
 def _tts_workflow(spec, schema, input_text, voice, host_info=None):
     cls = spec["class"]
     required = ((schema.get(cls) or {}).get("input") or {}).get("required") or {}
@@ -16453,6 +16493,12 @@ def _tts_workflow(spec, schema, input_text, voice, host_info=None):
         ok, value = _tts_fill(entry)
         if ok:
             inputs[name] = value
+
+    # The family's quality recipe overrides raw schema defaults (e.g. LongCat's
+    # 1B default -> 3.5B-bf16 + apg, which is speech instead of noise).
+    fam = _tts_node_family(cls)
+    if fam and fam.get("param_hints"):
+        _apply_param_hints(inputs, required, fam["param_hints"])
 
     save_node = _tts_save_node(host_info or {})
     if not save_node:

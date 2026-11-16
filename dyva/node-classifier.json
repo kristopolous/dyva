@@ -245,6 +245,23 @@
       "lang": null
     },
     {
+      "name": "LongCat",
+      "patterns": [
+        "(?i)longcat"
+      ],
+      "text": "text",
+      "voice": null,
+      "lang": null,
+      "param_hints": {
+        "model_path": [
+          "LongCat-AudioDiT-3.5B-bf16",
+          "LongCat-AudioDiT-3.5B"
+        ],
+        "guidance_method": "apg",
+        "steps": 32
+      }
+    },
+    {
       "name": "GenericTTS",
       "patterns": [
         "(?i)tts"
