@@ -1630,10 +1630,19 @@ def _trim_done_workers():
         _workers.pop(wid, None)
 
 
+# Decision models — the /v1/systemone family (clef/clef-flash, laya, nimble, kev, tev1, jev).
+# BOUNDED codename match (mirrors the dashboard _KINDS regex) so look-alikes (`nimblefoot`,
+# `clever`) and probe trap names don't catch: tev/jev need a digit or delimiter right after.
+_DECISION_KEY_RE = re.compile(
+    r"(?:^|[-_.:/\\])(?:clef|laya|nimble|kev|tev\d|jev)(?:[-_.:/]|\d|$)", re.I)
+
+
 def _kind_for_key(key):
     k = str(key or "")
     if key == IMG_KEY or k == "image":
         return "image"
+    if _DECISION_KEY_RE.search(k):
+        return "decision"
     if key == TTS_KEY or k.startswith("tts"):
         return "speech"
     if key == VIDEO_KEY or k.startswith("video"):
