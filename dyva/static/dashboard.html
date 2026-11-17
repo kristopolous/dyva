@@ -1070,7 +1070,9 @@ table.sheet .sheet-colh{overflow:visible}
 body.sheet-resizing,body.sheet-resizing *{cursor:col-resize!important;user-select:none}
 table.sheet thead th{position:sticky;top:0;z-index:2}
 table.sheet .sheet-rowh{left:0;z-index:1;min-width:2.2em}
-table.sheet .sheet-corner{left:0;top:0;z-index:3}
+table.sheet .sheet-corner{left:0;top:0;z-index:3;cursor:pointer}
+table.sheet .sheet-corner .sheet-fit{display:inline-block;opacity:.3;transition:opacity .12s,color .12s;line-height:1}
+table.sheet .sheet-corner:hover .sheet-fit{opacity:1;color:var(--accent)}
 table.sheet td.sheet-cell{min-width:5.5em;max-width:16em;padding:2px 6px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 table.sheet td.sheet-f{color:var(--accent)}
 table.sheet input.sheet-in{width:100%;min-width:5em;box-sizing:border-box;border:0;background:transparent;color:var(--text);font:inherit;padding:2px 6px}
@@ -7914,7 +7916,7 @@ function renderSheetDoc(content,editable,body){
   var _rowh=44,_tw=_rowh,_cg='<colgroup><col style="width:'+_rowh+'px">';
   for(var cw=0;cw<nC;cw++){var _ww=widths[cw]||_SHEET_COLW_DEFAULT;_tw+=_ww;_cg+='<col style="width:'+_ww+'px">';}
   _cg+='</colgroup>';
-  var h='<div class="sheet-wrap"><table class="sheet" style="width:'+_tw+'px">'+_cg+'<thead><tr><th class="sheet-corner"></th>';
+  var h='<div class="sheet-wrap"><table class="sheet" style="width:'+_tw+'px">'+_cg+'<thead><tr><th class="sheet-corner" title="Fit column widths to content"><span class="sheet-fit">↔</span></th>';
   for(var c2=0;c2<nC;c2++)h+='<th class="sheet-colh">'+_colName(c2)+'<span class="sheet-resize" data-c="'+c2+'" title="Drag to resize"></span></th>';
   h+='</tr></thead><tbody>';
   for(var r2=0;r2<nR;r2++){
@@ -7942,6 +7944,9 @@ function renderSheetDoc(content,editable,body){
 function _wireSheetResize(body,docId){
   var table=body.querySelector('table.sheet');if(!table)return;
   var cols=table.querySelectorAll('colgroup col'),ths=table.querySelectorAll('thead th');
+  // Corner cell = a one-click "fit every column to its content", so you never have to drag.
+  var corner=table.querySelector('.sheet-corner');
+  if(corner)corner.addEventListener('click',function(){_autofitSheet(body,docId);});
   Array.prototype.forEach.call(body.querySelectorAll('.sheet-resize'),function(h){
     h.addEventListener('mousedown',function(e){
       e.preventDefault();e.stopPropagation();
@@ -7959,6 +7964,38 @@ function _wireSheetResize(body,docId){
       document.addEventListener('mousemove',mv);document.addEventListener('mouseup',up);document.body.classList.add('sheet-resizing');
     });
   });
+}
+// Fit every column to the widest value in it (header letter + all cells), measured with a
+// canvas in the cells' own font — no reflow thrash, no re-render. Widths land in _sheetColW so
+// they survive re-renders exactly like a manual drag, and the fixed-layout table is resized to
+// match. Clamped so a stray huge cell can't blow the column out (it just keeps ellipsizing).
+var _AUTOFIT_PAD=16,_AUTOFIT_MIN=48,_AUTOFIT_MAX=420;
+function _autofitSheet(body,docId){
+  var table=body.querySelector('table.sheet');if(!table)return;
+  var cols=table.querySelectorAll('colgroup col');
+  var heads=table.querySelectorAll('thead th.sheet-colh');
+  var rows=table.querySelectorAll('tbody tr');
+  var sample=table.querySelector('td.sheet-cell')||heads[0];if(!sample)return;
+  var cs=getComputedStyle(sample);
+  var cv=_autofitSheet._cv||(_autofitSheet._cv=document.createElement('canvas'));
+  var ctx=cv.getContext('2d');
+  ctx.font=(cs.fontWeight||'400')+' '+(cs.fontSize||'13px')+' '+(cs.fontFamily||'monospace');
+  var map=_sheetColW[docId]||(_sheetColW[docId]={});
+  var nC=cols.length-1;   // col 0 is the row-header, left as-is
+  for(var c=0;c<nC;c++){
+    var w=heads[c]?ctx.measureText(heads[c].textContent||'').width:0;
+    for(var r=0;r<rows.length;r++){
+      var cell=rows[r].children[c+1];if(!cell)continue;   // +1: skip the row-header cell
+      var inp=cell.querySelector('input.sheet-in');
+      var t=inp?(inp.getAttribute('data-disp')||inp.value||''):cell.textContent;
+      var cw=ctx.measureText(t).width;if(cw>w)w=cw;
+    }
+    var fw=Math.round(Math.min(_AUTOFIT_MAX,Math.max(_AUTOFIT_MIN,w+_AUTOFIT_PAD)));
+    map[c]=fw;
+    if(cols[c+1])cols[c+1].style.width=fw+'px';
+  }
+  var tw=0;Array.prototype.forEach.call(cols,function(cc){tw+=parseInt(cc.style.width,10)||0;});
+  table.style.width=tw+'px';
 }
 // User edited a cell in the panel: write it back, recompute, snapshot, re-render.
 function _commitSheetCell(inp){
