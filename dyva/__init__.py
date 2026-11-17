@@ -4025,6 +4025,23 @@ def mark_batch_limit(host, model, n_batch):
         log.debug(f"mark_batch_limit failed: {e}")
 
 
+def _decision_is_request_reject(code, text):
+    """True when a non-200 from a decision host is the host rejecting THIS request for being
+    too big for its fixed limit — NOT the host failing. Covers 413 (payload/schema over the
+    endpoint's cap, e.g. "text and schema must not exceed 64 KiB") and the 500 "Context size
+    has been exceeded". Such a rejection is OUR oversized payload and comes back identically
+    on every host, so penalising it walks one request across the whole pool marking every
+    decision host bad (the pathology the 400 handler guards against, generalised). A genuine
+    host failure — a crashed/terminated runner 500, OOM, 502, 404, timeout — must NOT match,
+    so it still penalises and sinks out of the race."""
+    if code == 413:
+        return True
+    if code == 500:
+        t = (text or "").lower()
+        return "context size" in t and "exceed" in t
+    return False
+
+
 def clear_batch_limit(host, model, ingested):
     """A decision host just SUCCEEDED on an `ingested`-token input; if that meets or beats a
     recorded ubatch ceiling, the ceiling was stale (the host was relaunched with a bigger -ub)
@@ -13046,6 +13063,15 @@ async def handle_systemone(request):
             _blim = _parse_batch_limit(text)
             if _blim:
                 mark_batch_limit(host, full, _blim)
+            if _decision_is_request_reject(code, text):
+                # The host REJECTED this request for being too big (413 payload/schema over its
+                # cap, or a 500 "context size exceeded") — it's up and has the model, and every
+                # host rejects the same oversized body identically. Penalising it walked one
+                # public request across the whole pool marking every decision host bad (same as
+                # the 400 case). Surface the limit message to the client and SKIP — record
+                # nothing, no reputation hit.
+                client_err.append(" ".join(text.split())[:300])
+                return skip(f"request too large (HTTP {code})")
             detail = f"HTTP {code}: {' '.join(text.split())[:160]}"
             await broadcast_activity(host, model, "failed",
                 f"failure: {host}@{model} - {detail}", duration=time.time() - t0, wid=wid)
