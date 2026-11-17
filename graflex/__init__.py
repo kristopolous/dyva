@@ -180,6 +180,24 @@ def closed_catalog_score_from_payload(payload):
     return closed_catalog_score_from_models(models or [])
 
 
+_RUN_TS_RE = re.compile(r"^\d{14}$")   # a session dir name: %Y%m%d%H%M%S
+
+
+def _latest_session(base="/tmp/graflex"):
+    """The run_ts of the most recent session under `base`, or None if there are none.
+
+    A session is a /tmp/graflex/{run_ts} directory; run_ts is %Y%m%d%H%M%S, so the lexical
+    max IS the chronological latest. This backs `-i latest` — resume shorthand so you don't
+    have to copy the run_ts out of the log. Only real 14-digit directories count (stray files
+    or other scratch are ignored)."""
+    try:
+        sessions = [e for e in os.listdir(base)
+                    if _RUN_TS_RE.match(e) and os.path.isdir(os.path.join(base, e))]
+    except OSError:
+        return None
+    return max(sessions) if sessions else None
+
+
 def _latest_check_dir(session=None):
     base = "/tmp/graflex"
     if session:
@@ -4695,6 +4713,16 @@ The other actions find hosts, reshape the stores, or mine the snapshots:
                              "to backfill city/lat/lon over a country-only pass). Without a file, "
                              "-a enrich runs over the per-service working files (use -s all).")
     args = parser.parse_args()
+
+    # `-i latest` shorthand: resolve to the most recent session's run_ts before anything reads
+    # args.session, so every downstream consumer (check/fetch/survey/reconstruct/...) sees the
+    # real timestamp. Case-insensitive; errors out plainly if there are no sessions yet.
+    if args.session and args.session.strip().lower() == "latest":
+        _resolved = _latest_session()
+        if not _resolved:
+            parser.error("-i latest: no sessions found under /tmp/graflex")
+        log.info(f"-i latest -> session {_resolved}")
+        args.session = _resolved
 
     # survey mines the saved probe logs into survey.json — no service/name needed.
     # -i <session> folds in just that sweep's snapshots; no -i rescans everything.
