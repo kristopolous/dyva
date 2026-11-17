@@ -558,14 +558,18 @@ a.host-name:hover{color:var(--accent);text-decoration:underline}
 .hd-badge-bad{background:var(--err-bg,rgba(220,80,80,.14));border-color:var(--err,#d05050);color:var(--err,#d05050)}
 .hd-badge.hd-prov{background:var(--accent-bg);border-color:transparent;color:var(--accent);text-transform:capitalize}
 /* admin-only manual flag control on the host card */
-.hd-adminrow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:.5em 0}
-.hd-flag-btn{font-size:.72rem;padding:3px 10px;border-radius:6px;cursor:pointer;background:transparent;
-  border:1px solid var(--err,#d05050);color:var(--err,#d05050)}
-.hd-flag-btn:hover{background:var(--err-bg,rgba(220,80,80,.14))}
-.hd-flag-btn.flagged{border-color:var(--border);color:var(--text-2)}
-.hd-flag-btn.flagged:hover{background:var(--accent-bg);color:var(--text)}
+/* admin action, pulled to the right end of the badges row (same row) — an actual flag glyph on a
+   slight-red button, filled solid red once flagged. Deliberately not a pill badge, so it reads as
+   a control, not a status. margin-left:auto does the right-pull inside the flex badges row. */
+.hd-flag-btn{display:inline-flex;align-items:center;gap:4px;margin-left:auto;font-size:.64rem;
+  padding:2px 8px;border-radius:5px;cursor:pointer;white-space:nowrap;
+  background:var(--err-bg,rgba(220,80,80,.1));border:1px solid rgba(220,80,80,.4);color:var(--err,#d05050);
+  opacity:.9;transition:background .12s,opacity .12s,border-color .12s,filter .12s}
+.hd-flag-btn:hover{background:rgba(220,80,80,.2);border-color:var(--err,#d05050);opacity:1}
+.hd-flag-ico{font-size:.9em;line-height:1}
+.hd-flag-btn.flagged{background:var(--err,#d05050);border-color:var(--err,#d05050);color:#fff;opacity:1}
+.hd-flag-btn.flagged:hover{filter:brightness(1.1)}
 .hd-flag-btn:disabled{opacity:.5;cursor:default}
-.hd-flag-why{font-size:.68rem;color:var(--text-faint);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:60%}
 .hd-row{display:flex;justify-content:space-between;gap:12px;padding:4px 0;border-bottom:1px solid var(--border);font-size:.84rem}
 .hd-row .hd-k{color:var(--text-dim);flex:0 0 auto}
 .hd-row .hd-v{color:var(--text-2);text-align:right;overflow-wrap:anywhere;font-family:var(--font-mono);font-size:.8rem}
@@ -2824,19 +2828,21 @@ function hostDetailHtml(host,j){
   // (fail_smoke=1 is the older per-model recording of the same "this host is a honeypot" verdict).
   var _anyCanned=(j.reputation||[]).some(function(r){return r.fail_smoke});
   if((j.host_flags&&j.host_flags.honeypot)||_anyCanned)b.push('<span class="hd-badge hd-badge-bad" title="Honeypot — canned / fake responses (host-wide)">honeypot</span>');
-  if(b.length)h.push('<div class="hd-badges">'+b.join('')+'</div>');
-  // ADMIN-ONLY manual flag. Shown only to an unlocked admin (adminKey present); the
-  // server re-checks X-Admin-Key on /host-flag regardless, so this is UI gating, not the
-  // real gate. Toggle: "Flag as honeypot" when clean, "Clear honeypot flag" when flagged.
-  // Clicks are handled by the delegated listener in _wireHostVotes (survives redraws).
+  // ADMIN-ONLY manual flag — a small flag BUTTON pulled to the right of the badges row (not a
+  // status pill): an actual flag glyph, filled red once flagged, with the reason (if any) in the
+  // tooltip so it stays on one line. Shown only to an unlocked admin (adminKey present); the server
+  // re-checks X-Admin-Key on /host-flag regardless, so this is UI gating, not the real gate. Clicks
+  // are handled by the delegated listener in _wireHostVotes (survives redraws).
+  var _flagBtn='';
   if(typeof adminKey==='function'&&adminKey()){
     var _flagged=!!(j.host_flags&&j.host_flags.honeypot);
     var _why=(_flagged&&j.host_flags.honeypot.reason)?String(j.host_flags.honeypot.reason):'';
-    h.push('<div class="hd-adminrow"><button type="button" class="hd-flag-btn'+(_flagged?' flagged':'')+
-      '" data-flagaction="'+(_flagged?'unflag':'flag')+'">'+
-      (_flagged?'Clear honeypot flag':'Flag as honeypot')+'</button>'+
-      (_why?'<span class="hd-flag-why" title="'+escHtml(_why)+'">'+escHtml(_why)+'</span>':'')+'</div>');
+    var _tt=_flagged?('Clear honeypot flag'+(_why?' — '+_why:'')):'Flag as honeypot (host-wide, reversible)';
+    _flagBtn='<button type="button" class="hd-flag-btn'+(_flagged?' flagged':'')+
+      '" data-flagaction="'+(_flagged?'unflag':'flag')+'" title="'+escHtml(_tt)+'">'+
+      '<span class="hd-flag-ico">⚑</span>'+(_flagged?'Flagged':'Flag')+'</button>';
   }
+  if(b.length||_flagBtn)h.push('<div class="hd-badges">'+b.join('')+_flagBtn+'</div>');
   function row(k,v){return v?('<div class="hd-row"><span class="hd-k">'+k+'</span><span class="hd-v">'+v+'</span></div>'):''}
   h.push(row('host','<a href="'+escHtml(href)+'" target="_blank" rel="noopener noreferrer">'+escHtml(url)+' ↗</a>'));
   if(j.asn)h.push(row('network','AS'+j.asn+(j.as_org?' · '+escHtml(j.as_org):'')));
