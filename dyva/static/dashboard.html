@@ -1945,6 +1945,12 @@ body.dragging-image .hist-item{cursor:grabbing}
 <div class="settings-actions"><span class="settings-status"></span><button type="button" class="settings-save">Save</button></div>
 </div>
 <div class="settings-card">
+<div class="settings-card-title">Aliases<span class="dirty-flag">needs save</span></div>
+<label class="setting"><span class="setting-text"><span class="setting-name">Aliases</span><small class="setting-help">Named routing shortcuts you type in chat as <code>!name</code>. One per block &mdash; <code>!name</code> on a line, the query it expands to on the next; <code>#comments</code> and blank lines ignored. The <code>!name</code> is substituted before routing, bash-style, so a suffix rides along: <code>!qwen&gt;10gb</code>, <code>!qwen*abliterated</code>. Names are case-insensitive. Same grammar as everywhere else (<code>,</code> fallbacks, globs, <code>;</code>facets); <code>*</code> = any model. An undefined alias matches nothing, so a <code>,*</code> tail guarantees a hit.</small></span></label>
+<textarea id="setAliases" class="src-textarea" spellcheck="false" placeholder="!image-edit&#10;*&#10;&#10;!video&#10;*"></textarea>
+<div class="settings-actions"><span class="settings-status"></span><button type="button" class="settings-save">Save</button></div>
+</div>
+<div class="settings-card">
 <div class="settings-card-title">Congeniality<span class="dirty-flag">needs save</span></div>
 <label class="setting"><span class="setting-text"><span class="setting-name">Admin password</span><small class="setting-help">Protect this Settings tab and its sources. When set, opening Settings requires this password — everything else (chat, models, the dashboard) stays public. Type a new value to set or change it; leave blank to keep the current one. Forgot it? Clear <code>admin_pw</code> in <code>settings.json</code> and restart.</small></span><span class="admin-pw-field"><template id="setAdminPwTpl"><input type="text" id="adminPwUserDecoy" name="username" class="admin-pw-decoy" placeholder="username" autocomplete="username" autocorrect="off" autocapitalize="none" spellcheck="false" tabindex="-1" aria-hidden="true"><input type="password" id="setAdminPw" placeholder="none" spellcheck="false" autocomplete="new-password"></template></span></label>
 <label class="setting"><span class="setting-text"><span class="setting-name">Localhost only</span><small class="setting-help">Restrict inference endpoints to localhost only (a remote host that reaches this port can't chat or generate). Equivalent to the <code>./dyva -l</code> flag; saved here it persists across restarts.</small></span><input type="checkbox" id="setLocal"></label>
@@ -10876,6 +10882,7 @@ function populateSettings(s){
   document.getElementById('setRerankUp').value=('rerank_up_secs' in s)?s.rerank_up_secs:43200;
   document.getElementById('setRerankDown').value=('rerank_down_secs' in s)?s.rerank_down_secs:43200;
   setModelList(s.model_list||[],s.model_list_on);
+  var _al=document.getElementById('setAliases');if(_al&&s.aliases!==undefined)_al.value=s.aliases||'';
   document.getElementById('setLocal').checked=!!s.local;
   document.getElementById('setExplore').checked=!!s.explore;
   document.getElementById('setHideDyva').checked=!!s.hide_dyva;
@@ -11004,6 +11011,7 @@ function saveSettings(){
     gossiper_url:document.getElementById('setGossiperUrl').value,
     model_list:parseModelList(document.getElementById('setModelList').value),
     model_list_on:document.getElementById('setModelListOn').checked,
+    aliases:document.getElementById('setAliases').value,
     local:document.getElementById('setLocal').checked,
     explore:document.getElementById('setExplore').checked,
     hide_dyva:document.getElementById('setHideDyva').checked,
@@ -11067,6 +11075,7 @@ function saveSettings(){
       document.getElementById('setGossiperEnabled').checked=s.gossiper_enabled!==false;   // default ON
       document.getElementById('setGossiperUrl').value=s.gossiper_url||'';
       setModelList(s.model_list||[],s.model_list_on);
+  var _al=document.getElementById('setAliases');if(_al&&s.aliases!==undefined)_al.value=s.aliases||'';
       document.getElementById('setLocal').checked=!!s.local;
       document.getElementById('setExplore').checked=!!s.explore;
       document.getElementById('setHideDyva').checked=!!s.hide_dyva;

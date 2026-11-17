@@ -23,9 +23,38 @@ match. A query with no `;` facet never touches the reputation DB.
 | `;live` `;dead` | Liveness meta (map) | `qwen;live` |
 | `;cloud` `;nocloud` | Cloud/non-cloud meta (map) | `;nocloud` |
 | `;<service>` `;<provider>` | Service/provider meta (map) | `;ollama`, `;comfyui` |
+| `!name` | **Alias** — a saved shortcut, expanded as a pre-pass (bash-style, suffix rides along) | `!image-edit`, `!qwen>10gb` |
 
 Everything is **order-free and composable** — `qwen;tps>40`, `;tps>40;qwen` and
 `tps>40;qwen` all mean the same thing.
+
+## Aliases
+
+An **alias** is a named shortcut for any query on this page. Define aliases in the
+dashboard under **Settings → Aliases** — a plain config file, one per block:
+
+```
+!image-edit
+qwen-image-edit,flux-kontext;state=good
+
+!fast
+qwen3,gemma3;state=good
+```
+
+(`#comments` and blank lines are ignored; a later definition of the same name wins.)
+Then type `!name` anywhere a model goes. Resolution is a **pre-pass, before the grammar
+above**: the `!name` is substituted in place, bash-style, so a trailing suffix rides along.
+
+| You type | Becomes |
+|---|---|
+| `!fast` | `qwen3,gemma3;state=good` |
+| `!qwen>10gb` | `qwen3.8>10gb`  (if `!qwen` → `qwen3.8`) |
+| `!qwen*abliterated` | `qwen3.8*abliterated` |
+
+Names are **case-insensitive**. The `!` sigil fires only at a **segment start** (string
+start or right after a `,`), so a `!` inside a `;size!=0` facet is untouched. An
+**undefined** alias is left as-is and matches nothing, so end a chain with `,*` to
+guarantee a hit (`!experimental,*`).
 
 ## How it all composes
 

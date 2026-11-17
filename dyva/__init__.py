@@ -555,6 +555,9 @@ def _normalize_base(s):
 MODEL_LIST = []  # when non-empty AND MODEL_LIST_ON, the exact model ids /api/tags and /v1/models advertise
 MODEL_LIST_ON = False  # the UI "Enabled" checkbox — the override applies ONLY when on, so the
                        # list stays stored (and editable) while it's toggled off
+ALIASES_TEXT = ""  # raw alias config file (what the settings textarea holds; persisted verbatim
+                   # so #comments and formatting survive). ALIASES is the parsed view of it.
+ALIASES = {}       # parse_aliases(ALIASES_TEXT): {name_lower: body}, used by find_servers' pre-pass
 ADMIN_PW = ""   # sha256 hex of the admin password; when set, viewing/changing
                 # settings & sources requires it (localhost always exempt).
 def _resolve_version():
@@ -767,7 +770,7 @@ def model_modalities(model):
 def load_settings():
     """Apply persisted runtime settings (workers/timeout/min_count/local) over
     the CLI defaults, so changes made in the dashboard survive restarts."""
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION, RERANK_BUSY_SECS, RERANK_UP_SECS, RERANK_DOWN_SECS, AFFINITY_PREFIX_MSGS, AFFINITY_MIN_TOKENS, AFFINITY_TTL_SECS, AFFINITY_MAX_ENTRIES, AFFINITY_FLOOR_HOSTS, EMBED_MODEL
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION, RERANK_BUSY_SECS, RERANK_UP_SECS, RERANK_DOWN_SECS, AFFINITY_PREFIX_MSGS, AFFINITY_MIN_TOKENS, AFFINITY_TTL_SECS, AFFINITY_MAX_ENTRIES, AFFINITY_FLOOR_HOSTS, EMBED_MODEL, ALIASES, ALIASES_TEXT
     if not os.path.exists(SETTINGS_FILE):
         return
     try:
@@ -816,6 +819,9 @@ def load_settings():
         MODEL_LIST = parse_model_list(s["model_list"])
     if "model_list_on" in s:
         MODEL_LIST_ON = bool(s["model_list_on"])
+    if isinstance(s.get("aliases"), str):
+        ALIASES_TEXT = s["aliases"]
+        ALIASES = parse_aliases(ALIASES_TEXT)
     if isinstance(s.get("cloudskip"), list):
         CLOUD_SKIP = {x.lower() for x in s["cloudskip"] if isinstance(x, str) and x.strip()}
     if isinstance(s.get("base_path"), str):
@@ -860,6 +866,7 @@ def save_settings(extra=None):
                  "worker_max": WORKER_MAX, "worker_max_failover": WORKER_MAX_FAILOVER, "tool_resume": TOOL_RESUME, "race_watchdog": RACE_WATCHDOG,
                  "min_count": MIN_COUNT, "local": _LOCAL, "explore": EXPLORE_MODE, "hide_dyva": HIDE_DYVA,
                  "admin_pw": ADMIN_PW, "model_list": MODEL_LIST, "model_list_on": MODEL_LIST_ON,
+                 "aliases": ALIASES_TEXT,
                  "cloudskip": sorted(CLOUD_SKIP), "base_path": BASE_PATH,
                  "embed_model": EMBED_MODEL,
                  "gossiper_url": GOSSIPER_URL, "gossiper_enabled": GOSSIPER_ENABLED,
@@ -5651,7 +5658,67 @@ def _favorability(model, servers):
     return out
 
 
+# ----- aliases: bash-style, redefinable routing shortcuts -----------------
+# A `!name` typed at the START of a query segment (string start, or right after a ',')
+# is substituted in place before find_servers parses anything. Like a bash alias, a
+# suffix after the name rides along: !qwen>10gb -> <body>>10gb. Names are
+# case-insensitive. An undefined !name is left literal (it matches nothing, so a ,*
+# fallback saves it — the comma chain is the safety net, not validation). The sigil is
+# '!': a model name never starts with it, and the '!' inside a ';x!=y' negation facet
+# is mid-segment, so it is never mistaken for a sigil.
+_ALIAS_NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
+
+
+def parse_aliases(text):
+    """Parse the alias config file into an ordered {name_lower: body} map. Format: a
+    `!name` line, then its query on the next content line; blank lines and `#comments`
+    are ignored; names are case-insensitive; a later definition of the same name wins;
+    a `!name` with no body is skipped."""
+    toks = [ln.strip() for ln in (text or "").splitlines()]
+    toks = [t for t in toks if t and not t.startswith("#")]
+    out = {}
+    i = 0
+    while i < len(toks):
+        t = toks[i]
+        if t.startswith("!"):
+            name = t[1:].strip().lower()
+            body = ""
+            if i + 1 < len(toks) and not toks[i + 1].startswith("!"):
+                body = toks[i + 1]
+                i += 1
+            if name and body:
+                out[name] = body
+        i += 1
+    return out
+
+
+def expand_aliases(sub, aliases, _seen=frozenset()):
+    """Substitute a leading `!name` in each comma segment of `sub` with its alias body,
+    bash-style (a suffix after the name rides along). Resolves nested aliases; a cycle
+    terminates (the offending `!name` is left literal). Returns `sub` unchanged when it
+    has no `!` or there are no aliases."""
+    if not aliases or not sub or "!" not in sub:
+        return sub
+    out = []
+    for seg in sub.split(","):
+        s = seg.strip()
+        if s.startswith("!"):
+            m = _ALIAS_NAME_RE.match(s, 1)
+            if m:
+                key = m.group().lower()
+                if key in aliases and key not in _seen:
+                    body = expand_aliases(aliases[key], aliases, _seen | {key})
+                    out.append(body + s[m.end():])
+                    continue
+        out.append(s)
+    return ",".join(out)
+
+
 def find_servers(sub, caps=None):
+    # Alias pre-pass: a leading `!name` segment is expanded to its configured query before any
+    # parsing below. Every call site funnels through here, so they all get aliases for free; the
+    # expansion is a no-op (fast path) when the query has no `!` or no aliases are configured.
+    sub = expand_aliases(sub, ALIASES)
     # Defensive: a ';caps=...' override may still be attached to the model string on some paths.
     # The caps belong to req_caps (passed in as `caps`), not the NAME we match on, so strip the
     # directive here so routing never tries to match it. (See _strip_caps_directive / caps_for.)
@@ -11626,6 +11693,7 @@ async def handle_settings_get(request):
                               "base_path": BASE_PATH,
                               "admin_pw_set": bool(ADMIN_PW),
                               "model_list": MODEL_LIST, "model_list_on": MODEL_LIST_ON,
+                              "aliases": ALIASES_TEXT,
                               "gossiper_url": GOSSIPER_URL, "gossiper_enabled": GOSSIPER_ENABLED,
                               "affinity_prefix_msgs": AFFINITY_PREFIX_MSGS, "affinity_min_tokens": AFFINITY_MIN_TOKENS,
                               "affinity_ttl_secs": AFFINITY_TTL_SECS, "affinity_max_entries": AFFINITY_MAX_ENTRIES,
@@ -11645,7 +11713,7 @@ async def handle_settings_post(request):
       '200':
         description: Updated settings
     """
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION, RERANK_BUSY_SECS, RERANK_UP_SECS, RERANK_DOWN_SECS, AFFINITY_PREFIX_MSGS, AFFINITY_MIN_TOKENS, AFFINITY_TTL_SECS, AFFINITY_MAX_ENTRIES, AFFINITY_FLOOR_HOSTS, EMBED_MODEL
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION, RERANK_BUSY_SECS, RERANK_UP_SECS, RERANK_DOWN_SECS, AFFINITY_PREFIX_MSGS, AFFINITY_MIN_TOKENS, AFFINITY_TTL_SECS, AFFINITY_MAX_ENTRIES, AFFINITY_FLOOR_HOSTS, EMBED_MODEL, ALIASES, ALIASES_TEXT
     resp = await _check_local(request) or _check_admin(request)
     if resp:
         return resp
@@ -11707,6 +11775,9 @@ async def handle_settings_post(request):
         MODEL_LIST = parse_model_list(body["model_list"])
     if "model_list_on" in body:
         MODEL_LIST_ON = bool(body["model_list_on"])
+    if isinstance(body.get("aliases"), str):
+        ALIASES_TEXT = body["aliases"]
+        ALIASES = parse_aliases(ALIASES_TEXT)
     if isinstance(body.get("gossiper_url"), str):
         GOSSIPER_URL = body["gossiper_url"].strip()
     if isinstance(body.get("gossiper_enabled"), bool):
@@ -11765,6 +11836,7 @@ async def handle_settings_post(request):
                               "base_path": BASE_PATH,
                               "admin_pw_set": bool(ADMIN_PW),
                               "model_list": MODEL_LIST, "model_list_on": MODEL_LIST_ON,
+                              "aliases": ALIASES_TEXT,
                               "gossiper_url": GOSSIPER_URL, "gossiper_enabled": GOSSIPER_ENABLED,
                               "affinity_prefix_msgs": AFFINITY_PREFIX_MSGS, "affinity_min_tokens": AFFINITY_MIN_TOKENS,
                               "affinity_ttl_secs": AFFINITY_TTL_SECS, "affinity_max_entries": AFFINITY_MAX_ENTRIES,

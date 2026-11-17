@@ -450,6 +450,17 @@ option, see [`docs/syntax-query.md`](../docs/syntax-query.md); the full prose fo
   the *model* must be able to do. It's universal: every endpoint routes on the model
   string, so the directive works through `/v1/chat/completions`, `/api/chat`,
   `/api/generate` and the info/hosts previews alike.
+- **Aliases** — a named shortcut for any query above. Define them in **Settings →
+  Aliases** (a plain config file: `!name` on one line, its expansion on the next;
+  `#comments` and blank lines ignored), then type `!name` wherever a model goes.
+  Resolution is a **pre-pass before everything else**: the `!name` is substituted in
+  place, bash-style, so a suffix rides along — if `!qwen` → `qwen3.8`, then
+  `!qwen>10gb` → `qwen3.8>10gb` and `!qwen*abliterated` → `qwen3.8*abliterated`. Names
+  are case-insensitive. The `!` sigil only fires at a **segment start** (string start
+  or right after a `,`), so a `!` inside a `;size!=0` facet is never touched. An
+  undefined alias is left as-is and matches nothing, so end a chain with `,*` to
+  guarantee a hit (`!experimental,*`). Because the expansion is just text, one alias
+  can hold a whole fallback-plus-facet query: `!fast` → `qwen3,gemma3;state=good`.
 
 ### Context window
 
