@@ -590,7 +590,7 @@ SERVICE_CONFIG = {
         "ports": "8004,8081,80,443,8000",
         "check_path": "/api/model-info",
     },
-    "fish-speech": {
+    "fish": {
         # fishaudio / fish-speech TTS/ASR servers, fronted by the "OpenAPI power by Kuí"
         # Swagger UI ("Kuí" is fishaudio's ASGI framework). The OpenAPI spec lives at /json
         # (info.title "Fish Speech API"); _check_host reads it and records each host's real
@@ -1519,7 +1519,7 @@ async def _check_host(session, host, port, service, timeout=TIMEOUT):
                         "voices": voices,
                         "checked": datetime.now(timezone.utc).isoformat(),
                     }
-                elif service == "fish-speech":
+                elif service == "fish":
                     # fishaudio / fish-speech. /json is the OpenAPI spec behind the "OpenAPI
                     # power by Kuí" Swagger page. The same badge fronts builds with different
                     # route sets, so record each host's actual capability set (the distinct
@@ -1535,7 +1535,7 @@ async def _check_host(session, host, port, service, timeout=TIMEOUT):
                     result = {
                         "service": service,
                         "url": base_url,
-                        "models": ["fish-speech"],
+                        "models": ["fish"],
                         "capabilities": fish["capabilities"],
                         "checked": datetime.now(timezone.utc).isoformat(),
                     }

@@ -32,7 +32,7 @@ esac
 
 case "$SERVICE" in
   all)
-    for i in fish-speech chatterbox ds4 strata vllm lmstudio fooocus llama.cpp colibri ollama shodan comfyui a1111 gradio; do
+    for i in fish chatterbox ds4 strata vllm lmstudio fooocus llama.cpp colibri ollama shodan comfyui a1111 gradio; do
       $CMD $i "${SUB_ARGS[@]}"
       last_res="$?"
       echo ">>   $i -- "$last_res
@@ -210,13 +210,12 @@ ENDL
     NOTIMERANGE=1   # small catalog (~88) — sweep it all, don't cull to the fresh window
     ;;
 
-  fish-speech)
+  fish)
     # fishaudio / fish-speech TTS/ASR, fronted by the "OpenAPI power by Kuí" Swagger page
     # (spec at /json, info.title "Fish Speech API"). Open/keyless in the wild (~150). Ports
     # vary (8090/8080/8083); FOFA carries each host's real port, sweep the common ones.
     QUERY='title="OpenAPI power by Kuí"'
-    PORTS="8080,8090,8083,8081,80,443,8000"
-    COUNTRIES="US,CN,HK,SG,JP,DE,KR,RU,FR,NL,IN,GB,TW,BR,CA"
+    COUNTRIES="CN,US"
     NOTIMERANGE=1   # catalog ~150 — sweep it all, don't cull to the fresh window
     ;;
 
