@@ -449,6 +449,56 @@ AFFINITY_FLOOR_HOSTS = 5      # good hosts affinity may NEVER reserve away (cold
 # stuck at checked=1) surfaces instead of hanging silently. Quiet for healthy races: they
 # resolve well under this. 0 disables.
 RACE_WATCHDOG = 30
+# Runaway-context clamp: once a request has searched hard and still can't place a host,
+# strip the OUTPUT of older tool-call results from the payload — keeping each message and
+# its tool_call_id, so no tool_call/tool_result pair desyncs and no upstream 400 — and keep
+# racing the lighter prompt. The trip is search FAILURE (hosts tried OR seconds spent), never
+# context-window size. A lever, not a cap: it transforms the payload and the race goes on;
+# STRIP_ENABLED=False restores exactly today's behavior.
+# See brainstorm/strip-tool-output-on-search-failure.md.
+STRIP_ENABLED = True
+STRIP_AFTER_HOSTS = 100       # hosts tried before a strip trips (0 = don't trip on host count)
+STRIP_AFTER_SECS = 1200       # seconds searched before a strip trips (0 = don't trip on time)
+STRIP_KEEP_LAST = 3           # most-recent tool results left whole
+STRIP_TOOL_STUB = "[output stripped]"
+
+
+def _strip_tool_output(messages, keep_last):
+    """Shrink older tool-call OUTPUT in place, keeping message structure and ids.
+
+    Walk `messages` and replace the `content` of each role:"tool" result — EXCEPT the last
+    `keep_last` — with STRIP_TOOL_STUB. The message dict, its role and its tool_call_id stay,
+    and assistant tool_calls are never touched, so no tool_call/tool_result pair desyncs (a
+    dangling call-id 400s upstream). Idempotent: an already-stubbed body is left as-is and not
+    recounted. Returns (n_stripped, chars_saved)."""
+    if not isinstance(messages, list) or keep_last < 0:
+        return (0, 0)
+    tool_idxs = [i for i, m in enumerate(messages)
+                 if isinstance(m, dict) and m.get("role") == "tool"]
+    cut = tool_idxs[:-keep_last] if keep_last > 0 else tool_idxs
+    n = saved = 0
+    for i in cut:
+        m = messages[i]
+        c = m.get("content")
+        if c == STRIP_TOOL_STUB:
+            continue
+        clen = len(c) if isinstance(c, str) else len(json.dumps(c, default=str))
+        saved += max(clen - len(STRIP_TOOL_STUB), 0)
+        m["content"] = STRIP_TOOL_STUB
+        n += 1
+    return (n, saved)
+
+
+def _strip_should_trip(tried, elapsed):
+    """True once a still-unplaced request has crossed either configured strip threshold.
+    Each threshold is independent; 0 disables that one. Never trips when STRIP_ENABLED is off."""
+    if not STRIP_ENABLED:
+        return False
+    if STRIP_AFTER_HOSTS > 0 and tried >= STRIP_AFTER_HOSTS:
+        return True
+    if STRIP_AFTER_SECS > 0 and elapsed >= STRIP_AFTER_SECS:
+        return True
+    return False
 # How often, in seconds, to emit an SSE keepalive comment to a streaming OpenAI client
 # while dyva is still finding a host (race + hedge + warming + the winner's prefill) and
 # has no token to send yet. dyva adds pre-first-token latency raw ollama doesn't, so a
@@ -770,7 +820,7 @@ def model_modalities(model):
 def load_settings():
     """Apply persisted runtime settings (workers/timeout/min_count/local) over
     the CLI defaults, so changes made in the dashboard survive restarts."""
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION, RERANK_BUSY_SECS, RERANK_UP_SECS, RERANK_DOWN_SECS, AFFINITY_PREFIX_MSGS, AFFINITY_MIN_TOKENS, AFFINITY_TTL_SECS, AFFINITY_MAX_ENTRIES, AFFINITY_FLOOR_HOSTS, EMBED_MODEL, ALIASES, ALIASES_TEXT
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION, RERANK_BUSY_SECS, RERANK_UP_SECS, RERANK_DOWN_SECS, AFFINITY_PREFIX_MSGS, AFFINITY_MIN_TOKENS, AFFINITY_TTL_SECS, AFFINITY_MAX_ENTRIES, AFFINITY_FLOOR_HOSTS, EMBED_MODEL, ALIASES, ALIASES_TEXT, STRIP_ENABLED, STRIP_AFTER_HOSTS, STRIP_AFTER_SECS, STRIP_KEEP_LAST
     if not os.path.exists(SETTINGS_FILE):
         return
     try:
@@ -803,6 +853,14 @@ def load_settings():
         TOOL_RESUME = s["tool_resume"]
     if isinstance(s.get("race_watchdog"), (int, float)) and s["race_watchdog"] >= 0:
         RACE_WATCHDOG = s["race_watchdog"]
+    if isinstance(s.get("strip_enabled"), bool):
+        STRIP_ENABLED = s["strip_enabled"]
+    if isinstance(s.get("strip_after_hosts"), (int, float)) and s["strip_after_hosts"] >= 0:
+        STRIP_AFTER_HOSTS = int(s["strip_after_hosts"])
+    if isinstance(s.get("strip_after_secs"), (int, float)) and s["strip_after_secs"] >= 0:
+        STRIP_AFTER_SECS = int(s["strip_after_secs"])
+    if isinstance(s.get("strip_keep_last"), (int, float)) and s["strip_keep_last"] >= 0:
+        STRIP_KEEP_LAST = int(s["strip_keep_last"])
     if isinstance(s.get("fanout"), (int, float)) and s["fanout"] > 0:
         FANOUT = s["fanout"]
     if isinstance(s.get("min_count"), int) and s["min_count"] >= 1:
@@ -864,6 +922,7 @@ def save_settings(extra=None):
     data.update({"workers": WORKER_COUNT, "timeout": TIMEOUT,
                  "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS, "ctx_confident_fraction": CTX_CONFIDENT_FRACTION,
                  "worker_max": WORKER_MAX, "worker_max_failover": WORKER_MAX_FAILOVER, "tool_resume": TOOL_RESUME, "race_watchdog": RACE_WATCHDOG,
+                 "strip_enabled": STRIP_ENABLED, "strip_after_hosts": STRIP_AFTER_HOSTS, "strip_after_secs": STRIP_AFTER_SECS, "strip_keep_last": STRIP_KEEP_LAST,
                  "min_count": MIN_COUNT, "local": _LOCAL, "explore": EXPLORE_MODE, "hide_dyva": HIDE_DYVA,
                  "admin_pw": ADMIN_PW, "model_list": MODEL_LIST, "model_list_on": MODEL_LIST_ON,
                  "aliases": ALIASES_TEXT,
@@ -7942,6 +8001,11 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
             _fav[_h]["rank"] = _i
     errors = []
     errors_lock = asyncio.Lock()
+    # Runaway-context clamp state (see _strip_should_trip): wall clock from race start, a
+    # one-shot "already stripped" latch, and a count of hosts this race has touched.
+    _race_start = time.time()
+    _strip_done = [False]
+    _strip_n = [0]
 
     async def _collect_err(msg):
         async with errors_lock:
@@ -7951,6 +8015,20 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
         prio, host, ms = item
         resp = None
         full = ms[0]
+        # Runaway-context clamp: count every host this race touches, and once the search has
+        # gone long enough without placing (hosts tried OR seconds spent), strip older tool
+        # output from the SHARED payload in place — once. Every later _send_chat reads this
+        # same messages list, so the rest of the race carries the lighter prompt. Not a cap:
+        # the race continues, just smaller.
+        _strip_n[0] += 1
+        if (not _strip_done[0] and payload
+                and _strip_should_trip(_strip_n[0], time.time() - _race_start)):
+            _strip_done[0] = True
+            _sn, _sv = _strip_tool_output(payload.get("messages") or [], STRIP_KEEP_LAST)
+            if _sn:
+                log.info("strip: %s searched %d hosts / %.0fs without placing — stripped %d "
+                         "tool outputs (~%d chars), racing lighter",
+                         model or "?", _strip_n[0], time.time() - _race_start, _sn, _sv)
         await broadcast_activity(host, model, "trying",
             f"trying: {host}@{model}", wid=wid)
 
@@ -11692,6 +11770,7 @@ async def handle_settings_get(request):
     return web.json_response({"workers": WORKER_COUNT, "timeout": TIMEOUT,
                               "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS, "ctx_confident_fraction": CTX_CONFIDENT_FRACTION,
                               "worker_max": WORKER_MAX, "worker_max_failover": WORKER_MAX_FAILOVER, "tool_resume": TOOL_RESUME, "race_watchdog": RACE_WATCHDOG,
+                              "strip_enabled": STRIP_ENABLED, "strip_after_hosts": STRIP_AFTER_HOSTS, "strip_after_secs": STRIP_AFTER_SECS, "strip_keep_last": STRIP_KEEP_LAST,
                               "min_count": MIN_COUNT, "local": _LOCAL,
                               "explore": EXPLORE_MODE, "hide_dyva": HIDE_DYVA,
                               "cloudskip": sorted(CLOUD_SKIP),
@@ -11718,7 +11797,7 @@ async def handle_settings_post(request):
       '200':
         description: Updated settings
     """
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION, RERANK_BUSY_SECS, RERANK_UP_SECS, RERANK_DOWN_SECS, AFFINITY_PREFIX_MSGS, AFFINITY_MIN_TOKENS, AFFINITY_TTL_SECS, AFFINITY_MAX_ENTRIES, AFFINITY_FLOOR_HOSTS, EMBED_MODEL, ALIASES, ALIASES_TEXT
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION, RERANK_BUSY_SECS, RERANK_UP_SECS, RERANK_DOWN_SECS, AFFINITY_PREFIX_MSGS, AFFINITY_MIN_TOKENS, AFFINITY_TTL_SECS, AFFINITY_MAX_ENTRIES, AFFINITY_FLOOR_HOSTS, EMBED_MODEL, ALIASES, ALIASES_TEXT, STRIP_ENABLED, STRIP_AFTER_HOSTS, STRIP_AFTER_SECS, STRIP_KEEP_LAST
     resp = await _check_local(request) or _check_admin(request)
     if resp:
         return resp
@@ -11760,6 +11839,14 @@ async def handle_settings_post(request):
         TOOL_RESUME = body["tool_resume"]
     if isinstance(body.get("race_watchdog"), (int, float)) and body["race_watchdog"] >= 0:
         RACE_WATCHDOG = min(int(body["race_watchdog"]), 3600)   # 0 = off; seconds between logs
+    if isinstance(body.get("strip_enabled"), bool):
+        STRIP_ENABLED = body["strip_enabled"]
+    if isinstance(body.get("strip_after_hosts"), (int, float)) and body["strip_after_hosts"] >= 0:
+        STRIP_AFTER_HOSTS = min(int(body["strip_after_hosts"]), 100000)   # 0 = off (host trigger)
+    if isinstance(body.get("strip_after_secs"), (int, float)) and body["strip_after_secs"] >= 0:
+        STRIP_AFTER_SECS = min(int(body["strip_after_secs"]), 86400)      # 0 = off (time trigger)
+    if isinstance(body.get("strip_keep_last"), (int, float)) and body["strip_keep_last"] >= 0:
+        STRIP_KEEP_LAST = min(int(body["strip_keep_last"]), 1000)
     if isinstance(body.get("fanout"), (int, float)) and body["fanout"] > 0:
         FANOUT = body["fanout"]
     if isinstance(body.get("min_count"), int) and body["min_count"] >= 1:
@@ -11835,6 +11922,7 @@ async def handle_settings_post(request):
     return web.json_response({"workers": WORKER_COUNT, "timeout": TIMEOUT,
                               "hedge_delay": HEDGE_DELAY, "warm_connect_wait": WARM_CONNECT_WAIT, "input_rate": INPUT_RATE, "timeout_max": TIMEOUT_MAX, "fanout": FANOUT, "reasoning_keys": REASONING_KEYS, "ctx_confident_fraction": CTX_CONFIDENT_FRACTION,
                               "worker_max": WORKER_MAX, "worker_max_failover": WORKER_MAX_FAILOVER, "tool_resume": TOOL_RESUME, "race_watchdog": RACE_WATCHDOG,
+                              "strip_enabled": STRIP_ENABLED, "strip_after_hosts": STRIP_AFTER_HOSTS, "strip_after_secs": STRIP_AFTER_SECS, "strip_keep_last": STRIP_KEEP_LAST,
                               "min_count": MIN_COUNT, "local": _LOCAL,
                               "explore": EXPLORE_MODE, "hide_dyva": HIDE_DYVA,
                               "cloudskip": sorted(CLOUD_SKIP),

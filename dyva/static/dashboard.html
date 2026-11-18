@@ -1937,6 +1937,15 @@ body.dragging-image .hist-item{cursor:grabbing}
 <div class="settings-actions"><span class="settings-status"></span><button type="button" class="settings-save">Save</button></div>
 </div>
 <div class="settings-card">
+<div class="settings-card-title">Runaway context<span class="dirty-flag">needs save</span></div>
+<div class="rc-hint">When a request has searched hard and still can't place a host, strip the OUTPUT of older tool-call results from the payload &mdash; keeping each message and its id, so nothing desyncs &mdash; and keep racing the lighter prompt. A lever on runaway agentic context, tripped by search <b>failure</b> (hosts tried or time spent), never by context-window size. Turn it off to race exactly as before.</div>
+<label class="setting"><span class="setting-text"><span class="setting-name">Strip tool output on failure</span><small class="setting-help">Master switch. <b>Off:</b> the race never edits the payload &mdash; exactly today's behavior. <b>On (default):</b> once a request trips a threshold below without placing, the OUTPUT of its older tool calls is replaced in place with a short <code>[output stripped]</code> stub and the search continues on the lighter prompt. The tool call and its id always survive, so no tool-call/result pair desyncs.</small></span><input type="checkbox" id="setStripEnabled"></label>
+<label class="setting"><span class="setting-text"><span class="setting-name">Strip after hosts tried</span><small class="setting-help">Trip the strip once this many hosts have been tried without placing the request. <b>0 = off</b> (don't trip on host count). Default 100.</small></span><input type="number" id="setStripAfterHosts" min="0" max="100000" step="1"></label>
+<label class="setting"><span class="setting-text"><span class="setting-name">Strip after search time (s)</span><small class="setting-help">Trip the strip once the host search has run this many seconds without placing. <b>0 = off</b> (don't trip on time). Whichever trigger fires first wins. Default 1200 (20&nbsp;min).</small></span><input type="number" id="setStripAfterSecs" min="0" max="86400" step="1"></label>
+<label class="setting"><span class="setting-text"><span class="setting-name">Keep last tool results</span><small class="setting-help">How many of the most-recent tool results stay whole when stripping &mdash; the model keeps its latest context; only older outputs become the stub. Default 3.</small></span><input type="number" id="setStripKeepLast" min="0" max="1000" step="1"></label>
+<div class="settings-actions"><span class="settings-status"></span><button type="button" class="settings-save">Save</button></div>
+</div>
+<div class="settings-card">
 <div class="settings-card-title">Behavior<span class="dirty-flag">needs save</span></div>
 <label class="setting"><span class="setting-text"><span class="setting-name">Explore mode</span><small class="setting-help">Discover more of the unknown network: route hosts we haven't visited (unknown state) to the front of the line, ahead of known-good ones. Deliberately slower — a request may probe cold hosts first — but it maps out the pool. Off by default. <b>Caution:</b> the unvisited frontier is where the canary honeypots live, and poking a burst of fresh IPs is exactly what trips Cloudflare/WAF reputation — so this raises the chance of a soft IP ban on your egress. Use it for deliberate survey passes, not routine routing.</small></span><input type="checkbox" id="setExplore" onchange="updateExploreLogo()"></label>
 <div class="setting"><span class="setting-text"><span class="setting-name">Thinking token key</span><small class="setting-help">For OpenAI <code>/v1</code> requests, which key(s) carry the model's reasoning. Every ticked key is emitted with the same text. OpenAI never standardized this field, so clones diverged — tick what <b>your</b> client reads. Emitting more than one can break a strict client that rejects unknown fields, so the default is the single OpenAI key. (The ollama <code>/api/chat</code> path always uses <code>thinking</code> and is unaffected.)</small>
@@ -10904,6 +10913,10 @@ function populateSettings(s){
   document.getElementById('setWorkerMaxFailover').checked=!!s.worker_max_failover;
   document.getElementById('setToolResume').checked=!!s.tool_resume;
   document.getElementById('setRaceWatchdog').value=('race_watchdog' in s)?s.race_watchdog:30;
+  document.getElementById('setStripEnabled').checked=('strip_enabled' in s)?!!s.strip_enabled:true;
+  document.getElementById('setStripAfterHosts').value=('strip_after_hosts' in s)?s.strip_after_hosts:100;
+  document.getElementById('setStripAfterSecs').value=('strip_after_secs' in s)?s.strip_after_secs:1200;
+  document.getElementById('setStripKeepLast').value=('strip_keep_last' in s)?s.strip_keep_last:3;
   document.getElementById('setFanout').value=s.fanout;
   document.getElementById('setHedge').value=('hedge_delay' in s)?s.hedge_delay:30;
   // connect-wait: null/absent = OFF, shown as the full lead (== hedge) so its grip rests at the
@@ -11057,6 +11070,10 @@ function saveSettings(){
     worker_max_failover:document.getElementById('setWorkerMaxFailover').checked,
     tool_resume:document.getElementById('setToolResume').checked,
     race_watchdog:parseInt(document.getElementById('setRaceWatchdog').value,10),
+    strip_enabled:document.getElementById('setStripEnabled').checked,
+    strip_after_hosts:parseInt(document.getElementById('setStripAfterHosts').value,10),
+    strip_after_secs:parseInt(document.getElementById('setStripAfterSecs').value,10),
+    strip_keep_last:parseInt(document.getElementById('setStripKeepLast').value,10),
     fanout:parseInt(document.getElementById('setFanout').value,10),
     hedge_delay:parseInt(document.getElementById('setHedge').value,10),
     // connect-wait >= hedge means OFF -> send null; otherwise the connect sub-phase in seconds.
@@ -11095,6 +11112,9 @@ function saveSettings(){
   if(isNaN(body.hedge_delay)||body.hedge_delay<0)delete body.hedge_delay;
   if(isNaN(body.worker_max)||body.worker_max<0)delete body.worker_max;   // 0 is valid (disables)
   if(isNaN(body.race_watchdog)||body.race_watchdog<0)delete body.race_watchdog;   // 0 is valid (off)
+  if(isNaN(body.strip_after_hosts)||body.strip_after_hosts<0)delete body.strip_after_hosts;   // 0 = off
+  if(isNaN(body.strip_after_secs)||body.strip_after_secs<0)delete body.strip_after_secs;       // 0 = off
+  if(isNaN(body.strip_keep_last)||body.strip_keep_last<0)delete body.strip_keep_last;
   if(isNaN(body.min_count)||body.min_count<1)delete body.min_count;   // at-least-N-hosts: 1 = show all, 0 is meaningless
   // Only send admin_pw when the operator typed a new one (blank = keep current).
   var newPw=document.getElementById('setAdminPw').value;
@@ -11122,6 +11142,10 @@ function saveSettings(){
   document.getElementById('setWorkerMaxFailover').checked=!!s.worker_max_failover;
   document.getElementById('setToolResume').checked=!!s.tool_resume;
   document.getElementById('setRaceWatchdog').value=('race_watchdog' in s)?s.race_watchdog:30;
+  document.getElementById('setStripEnabled').checked=('strip_enabled' in s)?!!s.strip_enabled:true;
+  document.getElementById('setStripAfterHosts').value=('strip_after_hosts' in s)?s.strip_after_hosts:100;
+  document.getElementById('setStripAfterSecs').value=('strip_after_secs' in s)?s.strip_after_secs:1200;
+  document.getElementById('setStripKeepLast').value=('strip_keep_last' in s)?s.strip_keep_last:3;
   document.getElementById('setFanout').value=s.fanout;
       document.getElementById('setHedge').value=('hedge_delay' in s)?s.hedge_delay:30;
       document.getElementById('setConnectWait').value=('warm_connect_wait' in s)&&s.warm_connect_wait!=null?s.warm_connect_wait:(('hedge_delay' in s)?s.hedge_delay:30);
