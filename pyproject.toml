@@ -19,8 +19,12 @@ dependencies = [
     "rjsmin>=1.2.0",
     "rcssmin>=1.1.0",
     "aiohttp-socks>=0.12.0",
-    "sqlite-vec>=0.1.9",
 ]
+
+[project.optional-dependencies]
+# Semantic chat/doc history search. No wheel on some platforms (e.g. armv7l);
+# absent, the code falls back to keyword search — so it's optional, not required.
+search = ["sqlite-vec>=0.1.9"]
 
 [tool.setuptools]
 include-package-data = true
