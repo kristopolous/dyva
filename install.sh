@@ -4,22 +4,22 @@
 # Needs only `git` and Python 3.10+. It clones the repo, builds a virtualenv, installs
 # dyva into it, and starts it up.
 #
-#   curl -fsSL https://raw.githubusercontent.com/kristopolous/free-ollama/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/kristopolous/dyva/main/install.sh | bash
 #
 # Pass dyva flags through the pipe with `-s --`:
 #   curl -fsSL .../install.sh | bash -s -- -p 8080
 #
 # Env knobs:
-#   DYVA_DIR=/path      where to clone/install        (default: ~/free-ollama)
+#   DYVA_DIR=/path      where to clone/install        (default: ~/dyva)
 #   DYVA_NO_START=1     install only, don't launch dyva
 #   DYVA_REPO=url       clone source                  (default: the GitHub repo)
 #   DYVA_BRANCH=name    branch to clone               (default: main)
 #
 set -eu
 
-REPO_URL="${DYVA_REPO:-https://github.com/kristopolous/free-ollama.git}"
+REPO_URL="${DYVA_REPO:-https://github.com/kristopolous/dyva.git}"
 BRANCH="${DYVA_BRANCH:-main}"
-DIR="${DYVA_DIR:-$HOME/free-ollama}"
+DIR="${DYVA_DIR:-$HOME/dyva}"
 
 say()  { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m!!\033[0m  %s\n' "$*" >&2; }
