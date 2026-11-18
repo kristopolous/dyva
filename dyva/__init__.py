@@ -361,7 +361,7 @@ _CURLIFY = False
 ACTIVITY_LOG = False   # --log: mirror the activity feed to a date-stamped JSONL on disk
 
 PORT = 11434
-TIMEOUT = 30
+TIMEOUT = 20
 # TCP connect budget, separate from the overall TIMEOUT. A live host completes the
 # handshake fast even when its inference is slow, so a failure to connect within
 # this is "no connection" (unreachable), while running out the full TIMEOUT after
@@ -393,7 +393,7 @@ INPUT_RATE = 1000
 # timeout to give a cold host a real chance would make the search slower to widen.
 # Separated, a slow host keeps its full TIMEOUT while we widen every FANOUT seconds.
 # Concurrency then rides at ceil(TIMEOUT/FANOUT) * workers (shown in settings).
-FANOUT = 20
+FANOUT = 10
 # MAXIMUM per-attempt budget (seconds). TIMEOUT is the MINIMUM (a small prompt keeps
 # today's behaviour); the budget scales with prompt size up to this ceiling — the longest
 # first-token wait we'll ever allow for a monster prompt. The budget is the expected
@@ -402,7 +402,7 @@ FANOUT = 20
 # (FANOUT) and the retry deadline. Adding the same delta to both keeps the worker/socket
 # cap ceil(TIMEOUT/FANOUT)*workers from inflating for a big prompt — it just waits longer
 # on the same number of hosts, it doesn't widen the fan-out. Settable at runtime (timeout_max).
-TIMEOUT_MAX = 180
+TIMEOUT_MAX = 40
 # Absolute ceiling on ONE streamed response, anchored to when the worker started.
 # The per-read watchdog (TIMEOUT) resets on every line, so a host that trickles a
 # token (or a keep-alive) more often than TIMEOUT can stream for hours — this is
