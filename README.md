@@ -32,7 +32,7 @@ uvx dyva
 curl -fsSL https://9ol.es/dyvash | bash
 ```
 
-It installs to `~/free-ollama`; start it again anytime with `~/free-ollama/start.sh` (any dyva flags pass straight through). macOS note: the built-in `python3` is 3.9, which is too old install a newer one first with `brew install python`, pyenv, or from [python.org](https://www.python.org/downloads/).
+It installs to `~/dyva`; start it again anytime with `~/dyva/start.sh` (any dyva flags pass straight through). macOS note: the built-in `python3` is 3.9, which is too old install a newer one first with `brew install python`, pyenv, or from [python.org](https://www.python.org/downloads/).
 
 Along with being so ollama-compatible the ollama client doesn't know the difference, dyva has a feature-rich front-end with chat that includes image generation, web search, sub-agents, documents, host drilldown and exploration, video generation, tts, stats, geomaps, and even graphically tweaking the routing algorithm.
 
@@ -56,7 +56,7 @@ The details:
 * By size like `qwen >10gb`
 * By release date like `qwen>2026`.
 
-They can be stacked so `qwen>2026>5gb` means the newer large qwens. [You can also slice by many other fields](https://github.com/kristopolous/free-ollama/tree/main/dyva#model-names-are-routing-patterns).
+They can be stacked so `qwen>2026>5gb` means the newer large qwens. [You can also slice by many other fields](https://github.com/kristopolous/dyva/tree/main/dyva#model-names-are-routing-patterns).
 
 ## Finding new hosts
 You can multi-source host lists or bring your own. There's a separate survey tool called [graflex](graflex).
