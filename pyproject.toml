@@ -10,6 +10,7 @@ dependencies = [
     "aiosqlite>=0.20.0",
     "python-dotenv>=1.0.0",
     "requests>=2.31.0",
+    "curl_cffi>=0.7.0",
     "curlify>=3.0.0",
     "aiohttp-swagger3>=0.10.0",
     "Pillow>=10.0.0",

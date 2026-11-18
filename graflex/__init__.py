@@ -2223,24 +2223,49 @@ _CENSYS_CHALLENGE_MARKERS = ("just a moment", "challenge-platform", "cf_chl",
                              "enable javascript and cookies")
 
 
+def _censys_http_get(url, headers):
+    """GET platform.censys.io through a Chrome-TLS-impersonating client.
+
+    Censys fronts the search endpoint with Fastly bot management that fingerprints
+    the TLS/HTTP2 handshake (JA3/JA4) and returns an empty-body 403 to ANY plain HTTP
+    client — requests, curl, a non-Chromium headless browser — no matter how right the
+    cookie and User-Agent are. curl_cffi replays Chrome's own handshake, so the request
+    is let through and the endpoint returns its normal turbo-stream. The User-Agent is
+    deliberately NOT overridden: impersonate='chrome' sends a UA that matches the
+    fingerprint, and a mismatched one is itself a detection signal.
+
+    Imported lazily so only Censys fetches require curl_cffi."""
+    try:
+        from curl_cffi import requests as cffi_requests
+    except ImportError:
+        log.error("Censys fetch needs curl_cffi — platform.censys.io blocks plain HTTP "
+                  "clients at the TLS-fingerprint layer. It is in pyproject.toml; install "
+                  "it (e.g. `uv pip install curl_cffi`).")
+        raise SystemExit(3)
+    return cffi_requests.get(url, headers=headers, impersonate="chrome", timeout=30)
+
+
 def _fetch_censys(dry, svc, query, run_ts=None, curlify=False, label="", pname="any"):
     """Replay one platform.censys.io search.data request with the operator's cookie
     and hand the response to _parse_censys_json. Returns the host list, [] for
     dry/curlify, or None on a transient soft failure (rate limit / network).
 
-    Censys fronts the endpoint with Cloudflare. A stale cookie — or one generated on
-    a DIFFERENT egress IP than this machine — gets the CF 'Just a moment...' HTML
-    interstitial instead of JSON; that is credential death, so we capture it and stop
-    HARD with exit code 3 (the same signal graflex.sh catches for the FOFA/Shodan
-    logged-out stops), telling the operator to regenerate CENSYS_COOKIE here."""
+    The fetch goes through _censys_http_get, which impersonates Chrome's TLS handshake
+    (see there) — platform.censys.io's Fastly edge 403s any non-browser handshake. A
+    stale cookie, or one minted on a DIFFERENT egress IP than this machine, still comes
+    back as an HTML block instead of the turbo-stream; that is credential death, so we
+    capture it and stop HARD with exit code 3 (the same signal graflex.sh catches for
+    the FOFA/Shodan logged-out stops), telling the operator to regenerate CENSYS_COOKIE
+    here."""
     import requests
     import curlify as curlify_mod
     from urllib.parse import urlencode
     global _last_result_file
 
     url = f"{CENSYS_API}?" + urlencode({"q": query, "_routes": "routes/api.search"})
+    # No User-Agent: _censys_http_get impersonates Chrome and sets a UA that matches
+    # its TLS fingerprint; a hand-set one risks a UA/fingerprint mismatch (a tell).
     headers = {
-        "User-Agent": _censys_ua(),
         "Accept": "application/json",
         "Accept-Language": "en-US,en;q=0.9",
         "Referer": "https://platform.censys.io/search",
@@ -2257,7 +2282,7 @@ def _fetch_censys(dry, svc, query, run_ts=None, curlify=False, label="", pname="
         return []
 
     try:
-        resp = requests.get(url, headers=headers, timeout=30)
+        resp = _censys_http_get(url, headers)
     except Exception as e:
         log.error(f"Censys request failed: {e}")
         return None
@@ -2285,25 +2310,28 @@ def _fetch_censys(dry, svc, query, run_ts=None, curlify=False, label="", pname="
 
     ctype = resp.headers.get("Content-Type", "").lower()
     head = resp.text[:4096].lower()
-    if resp.status_code == 403 or "application/json" not in ctype \
+    # The search endpoint answers with react-router's turbo-stream (text/x-script);
+    # older captures came back as application/json. Accept either as data. A block or
+    # challenge is an HTML body or a non-200 — reject those and stop HARD.
+    is_data = ("application/json" in ctype) or ("x-script" in ctype)
+    if resp.status_code != 200 or not is_data \
             or any(m in head for m in _CENSYS_CHALLENGE_MARKERS):
         cap = out_path
         log.error(
-            f"Censys: Cloudflare challenge / non-JSON response (HTTP {resp.status_code}, "
-            f"Content-Type {resp.headers.get('Content-Type', '?')}). The cf_clearance "
-            f"triple didn't line up — the cookie must be generated on THIS machine's "
-            f"egress IP AND with the same browser whose UA is in CENSYS_UA. Captured: {cap}"
+            f"Censys: non-data response (HTTP {resp.status_code}, Content-Type "
+            f"{resp.headers.get('Content-Type', '?')}). We fetch with a Chrome TLS "
+            f"impersonation (curl_cffi), so this is almost always an expired or "
+            f"wrong-egress-IP session cookie — regenerate CENSYS_COOKIE from a logged-in "
+            f"browser on THIS machine. (If the body is a bot-challenge, Fastly's check "
+            f"tightened past the impersonation.) Captured: {cap}"
         )
         # The EXACT bytes we sent, verbatim between <<< >>> (no summarizing, no
-        # truncation) — a failure here is almost always a single byte off (a trailing
-        # space, a smart quote, a stray newline from a bad paste), so show the whole
-        # string and let the operator diff it against the browser. The query is shown
-        # decoded, exactly as the server receives it after URL-decoding.
+        # truncation) — show the whole string so the operator can diff it against the
+        # browser. The query is shown decoded, exactly as the server receives it.
         log.error(f"  query  (decoded, as the server sees it): <<<{query}>>>")
-        log.error(f"  User-Agent sent:                         <<<{headers['User-Agent']}>>>")
         log.error(f"  Cookie sent:                             <<<{headers['Cookie']}>>>")
-        # The exact curl equivalent of what we sent, so it can be replayed / diffed
-        # against the working browser request byte-for-byte.
+        # The exact curl equivalent (minus the TLS impersonation, which plain curl can't
+        # replay) so the request can be diffed against the working browser request.
         log.error("  exact curl equivalent:\n" + curlify_mod.to_curl(requests.Request("GET", url, headers=headers).prepare()))
         raise SystemExit(3)
 
