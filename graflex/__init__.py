@@ -590,6 +590,19 @@ SERVICE_CONFIG = {
         "ports": "8004,8081,80,443,8000",
         "check_path": "/api/model-info",
     },
+    "fish-speech": {
+        # fishaudio / fish-speech TTS/ASR servers, fronted by the "OpenAPI power by Kuí"
+        # Swagger UI ("Kuí" is fishaudio's ASGI framework). The OpenAPI spec lives at /json
+        # (info.title "Fish Speech API"); _check_host reads it and records each host's real
+        # capability set — which VARIES under the same badge (tts+references+vqgan vs
+        # tts+asr+chat+vqgan), so the survey is per-host, not per-service. Open/keyless in the
+        # wild (~150). Ports vary (8080/8090/8083); FOFA carries each host's real port, sweep
+        # the common ones. Job endpoint is native POST /v1/tts (JSON or msgpack) -> audio.
+        "port": 8080,
+        "fofa_query": 'title="OpenAPI power by Kuí"',
+        "ports": "8080,8090,8083,8081,80,443,8000",
+        "check_path": "/json",
+    },
     "strata": {
         # Strata: an OpenAI-dialect inference server (web UI page title "Strata").
         # /v1/models returns the standard {"object":"list","data":[...]} shape, landing
@@ -1150,6 +1163,27 @@ async def _comfyui_model_tree(session, base_url, timeout=TIMEOUT, workers=8):
     return models or None
 
 
+def _fish_capabilities(spec):
+    """From a Fish Speech (fishaudio) /json OpenAPI dict, return
+    {"version": str|None, "capabilities": [sorted distinct /v1/<seg> names]} — or None if it
+    isn't a Fish Speech API. The "OpenAPI power by Kuí" Swagger badge fronts builds with
+    DIFFERENT route sets (tts+references+vqgan vs tts+asr+chat+vqgan), so the capability set is
+    per-host survey data, not a service constant."""
+    if not isinstance(spec, dict):
+        return None
+    info = spec.get("info") or {}
+    if info.get("title") != "Fish Speech API":
+        return None
+    caps = set()
+    for p in (spec.get("paths") or {}):
+        if not isinstance(p, str):
+            continue
+        parts = p.strip("/").split("/")
+        if len(parts) >= 2 and parts[0] == "v1":
+            caps.add(parts[1])
+    return {"version": info.get("version"), "capabilities": sorted(caps)}
+
+
 async def _check_host(session, host, port, service, timeout=TIMEOUT):
     from datetime import datetime, timezone
     import urllib.parse
@@ -1485,6 +1519,29 @@ async def _check_host(session, host, port, service, timeout=TIMEOUT):
                         "voices": voices,
                         "checked": datetime.now(timezone.utc).isoformat(),
                     }
+                elif service == "fish-speech":
+                    # fishaudio / fish-speech. /json is the OpenAPI spec behind the "OpenAPI
+                    # power by Kuí" Swagger page. The same badge fronts builds with different
+                    # route sets, so record each host's actual capability set (the distinct
+                    # /v1/<seg> endpoints: tts, asr, chat, references, vqgan). `models` holds
+                    # the engine identity so the host isn't model-matched into text routing;
+                    # the usable job is native POST /v1/tts.
+                    data = await resp.json()
+                    await resp.release()
+                    fish = _fish_capabilities(data)
+                    if not fish or not fish["capabilities"]:
+                        last_error = {"error": f"not a Fish Speech API ({current_scheme})"}
+                        break
+                    result = {
+                        "service": service,
+                        "url": base_url,
+                        "models": ["fish-speech"],
+                        "capabilities": fish["capabilities"],
+                        "checked": datetime.now(timezone.utc).isoformat(),
+                    }
+                    if fish.get("version"):
+                        result["version"] = fish["version"]
+                    return result
                 elif service == "vllm":
                     data = await resp.json()
                     await resp.release()
