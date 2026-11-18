@@ -16690,7 +16690,7 @@ def _apply_param_hints(inputs, required, hints):
             inputs[field] = prefs[0]
 
 
-_OPENAI_TTS_SERVICES = {"chatterbox", "localai"}
+_OPENAI_TTS_SERVICES = {"chatterbox", "localai", "fish"}
 
 
 def _is_openai_tts_service(service):
@@ -16726,6 +16726,12 @@ def _openai_tts_body(service, model, input_text, voice, voices):
         if v:
             body["voice"] = v
         return "/v1/audio/speech", body
+    if service == "fish":
+        # fishaudio ("OpenAPI power by Kuí") speaks its own dialect: POST /v1/tts
+        # with a bare {text} body returning audio bytes. The OpenAI `voice` id has
+        # no meaning here (voice cloning is a separate /v1/references capability on
+        # only some hosts), so don't pass it through.
+        return "/v1/tts", {"text": input_text}
     body = {"model": model, "input": input_text}
     if voice:
         body["voice"] = voice
@@ -16973,6 +16979,8 @@ def _openai_tts_model(server):
     if server.get("service") == "chatterbox":
         models = server.get("models") or []
         return models[0] if models else "chatterbox"
+    if server.get("service") == "fish":
+        return "fish"   # fishaudio hosts are always TTS (bare /v1/tts)
     for m in server.get("models") or []:
         if isinstance(m, str) and _OPENAI_TTS_MODEL_RE.search(m):
             return m

@@ -65,8 +65,35 @@ def test_openai_tts_service_detection():
     # chatterbox is always a TTS source; localai only when it has a tts model
     assert dyva._is_openai_tts_service("chatterbox") is True
     assert dyva._is_openai_tts_service("localai") is True
+    assert dyva._is_openai_tts_service("fish") is True
     assert dyva._is_openai_tts_service("comfyui") is False
     assert dyva._is_openai_tts_service("ollama") is False
+
+
+# --- fish-speech (fishaudio) ------------------------------------------------
+# Discovered by graflex as service "fish"; every host speaks POST /v1/tts with a
+# bare {text} body returning audio bytes (its own dialect, NOT /v1/audio/speech).
+# It rides the same passthrough race; only path + body differ.
+
+def test_fish_body_is_v1_tts_with_bare_text():
+    path, body = dyva._openai_tts_body("fish", "fish", "hello there", None, None)
+    assert path == "/v1/tts"
+    assert body == {"text": "hello there"}
+
+
+def test_fish_body_ignores_openai_voice():
+    # Fish's bare /v1/tts doesn't take an OpenAI voice id (voice cloning is a
+    # separate /v1/references capability only some hosts have) — don't smuggle
+    # a foreign voice name into the body and confuse the host.
+    _, body = dyva._openai_tts_body("fish", "fish", "hello", "alloy", None)
+    assert body == {"text": "hello"}
+
+
+def test_fish_is_always_a_tts_model():
+    # Like chatterbox, a fish host is always a TTS source (models=["fish"]);
+    # it qualifies even if the host advertised no model list.
+    assert dyva._openai_tts_model({"service": "fish", "models": ["fish"]}) == "fish"
+    assert dyva._openai_tts_model({"service": "fish"}) == "fish"
 
 
 if __name__ == "__main__":
