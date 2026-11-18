@@ -10329,6 +10329,11 @@ async def _proxy_generate(request, session):
         if result:
             _, host, full, data = result
             mark_worker_found(job_wid, host, full)
+            # Token-account before returning, exactly as _proxy_chat's non-stream branch
+            # does — else every stream:false /api/generate request is served but never
+            # lands in Stats (no row, no tps, no max_ok). The buffered `data` carries the
+            # upstream's own usage; account_tokens falls back to our prompt_est otherwise.
+            await account_tokens(job_wid, host, full, data, _effective_num_ctx(body))
             # Chat-shaped internally -> /api/generate shape for the client (no-op if the
             # upstream was native ollama and already returned `response`).
             return web.json_response(_ollama_chat_to_generate(data))
