@@ -970,6 +970,10 @@ body.col-resizing,body.col-resizing *{cursor:col-resize!important;user-select:no
    surface/shadow/padding so they sit on the page instead of a card-in-a-card. */
 .settings-inner{background:transparent;box-shadow:none;padding:0}
 .setting{display:flex;align-items:center;justify-content:space-between;gap:var(--sp-5);margin-bottom:var(--sp-6)}
+.settings-filter{box-sizing:border-box;width:100%;margin:0 0 var(--sp-5);font:inherit;font-size:var(--fs-sm);padding:6px 10px;border-radius:var(--r-md);background:var(--bg-inset);color:var(--text);border:1px solid var(--border)}
+.settings-filter:focus{outline:none;border-color:var(--border-focus)}
+.settings-filter::placeholder{color:var(--text-faint)}
+.set-hide{display:none !important}
 .setting-text{display:flex;flex-direction:column;min-width:0}
 .setting-name{font-size:var(--fs-lg);color:var(--text)}
 .setting input[type=number]{width:120px;flex-shrink:0}
@@ -997,6 +1001,16 @@ body.col-resizing,body.col-resizing *{cursor:col-resize!important;user-select:no
 .login-row input[type=password]{flex:1;max-width:280px;background:var(--bg-inset);border:1px solid var(--border-strong);border-radius:var(--r-md);color:var(--text);padding:var(--sp-3);font-size:var(--fs-lg)}
 .setting-help{color:var(--text-dim);font-size:var(--fs-xs);margin-top:var(--sp-1);line-height:var(--line-body)}
 .setting-help code{background:var(--bg-inset);padding:.05em .3em;border-radius:var(--r-sm);font-size:var(--fs-2xs)}
+/* Mobile: a setting's description starts collapsed and the name becomes a tap target
+   (caret rotates on open). Scoped to .setting rows, so standalone help text — the
+   sources block, the login notice — stays visible. */
+@media(max-width:640px){
+  .setting .setting-help{display:none}
+  .setting.help-open .setting-help{display:block}
+  .setting .setting-name{cursor:pointer;display:inline-flex;align-items:center;gap:4px;align-self:flex-start}
+  .setting .setting-name::after{content:"\203A";color:var(--text-faint);transition:transform .12s ease}
+  .setting.help-open .setting-name::after{transform:rotate(90deg)}
+}
 .rk-opts{display:flex;flex-direction:column;gap:var(--sp-2);margin-top:var(--sp-3)}
 .rk-opt{display:flex;align-items:center;gap:.4em;font-size:var(--fs-md);color:var(--text);cursor:pointer}
 .rk-opt code{font-size:.85em;background:var(--card);padding:.05em .4em;border-radius:4px}
@@ -1888,6 +1902,7 @@ body.dragging-image .hist-item{cursor:grabbing}
 </div>
 </div>
 <div id="settingsBody">
+<input id="settingsFilter" class="settings-filter" type="search" placeholder="Filter settings&hellip;" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" oninput="filterSettings()" onkeydown="if(event.key==='Escape'){this.value='';filterSettings();}" aria-label="Filter settings">
 <div class="settings-card">
 <div class="settings-card-title">Routing configuration<span class="dirty-flag">needs save</span></div>
 <div class="rc-hint">The fine-tunable hyperparameters for how a request finds a host — the diagram tracks them live as you adjust.</div>
@@ -10765,6 +10780,34 @@ function showSettingsLocked(locked){
   document.getElementById('settingsLogin').style.display=locked?'':'none';
   document.getElementById('settingsBody').style.display=locked?'none':'';
 }
+// Live settings filter, same idea as a browser's settings search box: type to narrow
+// the cards and rows to what matches; Escape (wired on the input) clears it. The input
+// sits outside every .settings-card, so its own input events never trip _markDirty.
+function filterSettings(){
+  var inp=document.getElementById('settingsFilter'); if(!inp)return;
+  var q=inp.value.trim().toLowerCase();
+  var cards=document.querySelectorAll('#settingsBody .settings-card'),i,r;
+  for(i=0;i<cards.length;i++){
+    var card=cards[i],rows=card.querySelectorAll('.setting');
+    if(!q){
+      card.classList.remove('set-hide');
+      for(r=0;r<rows.length;r++)rows[r].classList.remove('set-hide');
+      continue;
+    }
+    // Searchable text = title + rows + intro hints + the sources block, minus the
+    // "needs save" dirty-flag text that rides along in every card title.
+    var parts=card.querySelectorAll('.settings-card-title,.setting,.rc-hint,.setting-sources'),txt='',p;
+    for(p=0;p<parts.length;p++)txt+=' '+(parts[p].textContent||'');
+    txt=txt.toLowerCase().replace(/needs save/g,'');
+    if(txt.indexOf(q)===-1){card.classList.add('set-hide');continue;}
+    card.classList.remove('set-hide');
+    // If specific rows match, show only those; if the card matched on its title or
+    // descriptive text alone, keep every row visible.
+    var anyRow=false,rowMatch=[];
+    for(r=0;r<rows.length;r++){rowMatch[r]=(rows[r].textContent||'').toLowerCase().indexOf(q)!==-1;if(rowMatch[r])anyRow=true;}
+    for(r=0;r<rows.length;r++)rows[r].classList.toggle('set-hide',anyRow&&!rowMatch[r]);
+  }
+}
 function setPwState(isSet){
   var pw=document.getElementById('setAdminPw');pw.value='';
   pw.placeholder=isSet?'•••••• set — blank keeps it':'none';
@@ -10952,6 +10995,19 @@ function _wireDirty(){
     var c=fl.closest('.settings-card'); if(!c)return;
     _saveStatus=c.querySelector('.settings-status');
     saveSettings();
+  });
+  // Mobile: descriptions start collapsed; tapping a setting's name reveals its help.
+  // The name sits inside a <label>, so preventDefault stops the same tap from also
+  // toggling the row's checkbox or focusing its field. Only intercept while the
+  // mobile collapse is actually in effect — desktop keeps normal label behavior.
+  var _mobileHelp=window.matchMedia('(max-width:640px)');
+  body.addEventListener('click',function(e){
+    if(!_mobileHelp.matches)return;
+    var name=e.target.closest('.setting-name');
+    if(!name)return;
+    var row=name.closest('.setting'); if(!row)return;
+    e.preventDefault();
+    row.classList.toggle('help-open');
   });
 }
 // The override list lives in a textarea now (one name per line, like Additional
