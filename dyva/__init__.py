@@ -36,6 +36,10 @@ try:
     import sqlite_vec           # loadable SQLite KNN extension (vec0); optional at runtime
 except ImportError:             # pragma: no cover - semantic search falls back to keyword
     sqlite_vec = None
+try:
+    import msgpack as _msgpack  # fish reference-audio cloning (raw bytes); optional at runtime
+except ImportError:             # pragma: no cover - cloning falls back to the host default voice
+    _msgpack = None
 from aiohttp import web, web_log
 from aiohttp_swagger3 import SwaggerDocs, SwaggerInfo, SwaggerUiSettings
 
@@ -16758,6 +16762,70 @@ def _resolve_voice(text, catalog):
     return None
 
 
+VOICES_PKG_DIR = os.path.join(os.path.dirname(__file__), "voices")
+
+
+def voices_dirs():
+    """Directories the voice catalog is assembled from, lowest precedence first: the
+    shipped package seeds, then the writable runtime drop-in (CACHE_DIR/voices) that
+    operators and the add-voices tool append to. A later dir extends the catalog and
+    overrides an earlier entry of the same id."""
+    return [VOICES_PKG_DIR, os.path.join(CACHE_DIR, "voices")]
+
+
+def load_voice_catalog():
+    """Every voices dir's catalog.json merged into one list, each entry carrying an
+    absolute `path` to its wav (resolved against the dir that declared it). An entry
+    whose wav is missing is dropped — never offer a voice we can't read. Best-effort:
+    a missing or garbled catalog.json is skipped, so a bad drop-in can't break TTS."""
+    by_id, order = {}, []
+    for d in voices_dirs():
+        try:
+            with open(os.path.join(d, "catalog.json")) as fh:
+                entries = json.load(fh)
+        except Exception:
+            continue
+        if not isinstance(entries, list):
+            continue
+        for e in entries:
+            if not isinstance(e, dict) or not e.get("id") or not e.get("file"):
+                continue
+            path = os.path.join(d, str(e["file"]))
+            if not os.path.exists(path):
+                continue
+            eid = str(e["id"])
+            if eid not in by_id:
+                order.append(eid)
+            by_id[eid] = {**e, "path": path}
+    return [by_id[i] for i in order]
+
+
+def _voice_reference_audio(voice):
+    """The wav bytes of the catalog voice a request resolves to, or None to leave the
+    host on its default voice. `voice` is an id ("en-US_f_jodi") or a plain-words
+    query ("female american accent")."""
+    if not voice:
+        return None
+    entry = _resolve_voice(voice, load_voice_catalog())
+    if not entry:
+        return None
+    try:
+        with open(entry["path"], "rb") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def _fish_reference_body(input_text, ref_audio):
+    """Fish /v1/tts body that clones a curated catalog voice: the reference wav rides
+    inline as RAW BYTES under `references` (empty reference text — fish clones cleanly
+    without a transcript). Raw bytes don't survive JSON, so this body must be
+    msgpack-encoded; the bare-{text} JSON body is the default-voice path."""
+    return {"text": input_text,
+            "references": [{"audio": ref_audio, "text": ""}],
+            "format": "wav"}
+
+
 _OPENAI_TTS_SERVICES = {"chatterbox", "localai", "fish"}
 
 
@@ -17099,7 +17167,16 @@ async def _openai_tts_speak(session, host, service, model, voices, input_text, v
     url = host.rstrip("/") + path
     budget = _tts_render_budget(input_text)
     timeout = aiohttp.ClientTimeout(total=budget, sock_connect=CONNECT_TIMEOUT)
-    async with session.post(url, json=body, timeout=timeout) as resp:
+    post_kw = {"json": body}
+    # Fish clones a curated catalog voice when the requested voice resolves to one:
+    # its wav rides inline as a msgpack reference (raw bytes don't survive JSON). No
+    # msgpack, or no catalog match -> the bare-{text} JSON body = the host default voice.
+    if service == "fish" and voice and _msgpack is not None:
+        ref = _voice_reference_audio(voice)
+        if ref:
+            packed = _msgpack.packb(_fish_reference_body(input_text, ref))
+            post_kw = {"data": packed, "headers": {"Content-Type": "application/msgpack"}}
+    async with session.post(url, timeout=timeout, **post_kw) as resp:
         raw = await resp.read()
         ctype = resp.headers.get("Content-Type", "")
         if resp.status != 200:

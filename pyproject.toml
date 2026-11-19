@@ -25,6 +25,9 @@ dependencies = [
 # Semantic chat/doc history search. No wheel on some platforms (e.g. armv7l);
 # absent, the code falls back to keyword search — so it's optional, not required.
 search = ["sqlite-vec>=0.1.9"]
+# Voice-catalog cloning: fish reference audio is passed as raw bytes via msgpack.
+# Absent, catalog voices fall back to the host default voice — so it's optional too.
+voice = ["msgpack>=1.0.0"]
 
 [tool.setuptools]
 include-package-data = true
