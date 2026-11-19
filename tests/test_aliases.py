@@ -121,6 +121,36 @@ def test_expand_cycle_terminates():
     assert out.startswith("!")
 
 
+# ------------------------- alias model-list rows --------------------------
+# Aliases live in the password-locked settings panel, so a password-less user never
+# sees them. _alias_model_rows surfaces each as a synthetic row in the normal model
+# list: id = the `!name` you type (find_servers expands it on use), count = how many
+# hosts the body currently reaches, alias+body let the client badge + explain the row.
+
+def test_alias_rows_shape_and_count():
+    aliases = {"qwen": "qwen3.8", "fast": "gemma4"}
+    counts = {"qwen3.8": 7, "gemma4": 0}
+    rows = dyva._alias_model_rows(aliases, lambda body: counts[body])
+    assert rows == [
+        {"id": "!qwen", "count": 7, "alias": True, "body": "qwen3.8"},
+        {"id": "!fast", "count": 0, "alias": True, "body": "gemma4"},
+    ]
+
+
+def test_alias_rows_empty_when_no_aliases():
+    assert dyva._alias_model_rows({}, lambda b: 1) == []
+
+
+def test_alias_rows_default_count_swallows_errors(monkeypatch):
+    # a malformed body must never 500 the listing — it lists at count 0, still pickable
+    def boom(_body):
+        raise RuntimeError("bad query")
+    monkeypatch.setattr(dyva, "find_servers", boom)
+    assert dyva._alias_model_rows({"a": "??"}) == [
+        {"id": "!a", "count": 0, "alias": True, "body": "??"},
+    ]
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))

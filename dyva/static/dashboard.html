@@ -310,6 +310,7 @@ body.chat{height:100vh;height:100dvh}
 .model-item{padding:var(--sp-2) 0;font-size:var(--fs-md);display:flex;justify-content:space-between}
 .nsfw-badge{display:inline-block;font-size:var(--fs-2xs);text-transform:uppercase;letter-spacing:.04em;color:var(--text-muted);border:1px solid var(--border);border-radius:var(--r-sm);padding:0 .3em;vertical-align:middle}
 .aka-badge{display:inline-block;font-size:var(--fs-2xs);color:var(--text-dim);border:1px solid var(--border);border-radius:var(--r-sm);padding:0 .3em;vertical-align:middle;font-family:var(--font-mono)}
+.alias-badge{display:inline-block;font-size:var(--fs-2xs);text-transform:uppercase;letter-spacing:.04em;color:var(--accent);border:1px solid var(--accent);border-radius:var(--r-sm);padding:0 .3em;vertical-align:middle}
 .model-name{font-family:var(--font-mono);font-size:var(--fs-sm);max-width:85%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .model-count{color:var(--text-dim);flex-shrink:0;padding-left:var(--sp-3);white-space:nowrap}
 /* Model coverage bar: working/failing/untested, muted pastels (not a christmas tree) */
@@ -2566,6 +2567,10 @@ function makeModelRow(mid){var d=document.createElement('div');d.className='mode
   // model's GGUF and were folded into this one row. The ×N badge says how many.
   var _ak=(modelAgg[mid]||{}).aka;
   if(_ak>1){var ab=document.createElement('span');ab.className='aka-badge';ab.textContent='×'+_ak;ab.title=_ak+' aliases share this GGUF — collapsed into one row';n.appendChild(document.createTextNode(' '));n.appendChild(ab);}
+  // Operator alias (a `!name` routing shortcut): badge it and show what it expands to, so a
+  // password-less user can tell it apart from a real model and knows what picking it routes.
+  var _al=modelAgg[mid]||{};
+  if(_al.alias){var al=document.createElement('span');al.className='alias-badge';al.textContent='alias';var _b=_al.body||'';al.title=_b?(mid+' → '+_b):'operator routing alias';d.title=_b?(mid+' → '+_b):mid;n.appendChild(document.createTextNode(' '));n.appendChild(al);}
   d.appendChild(n);d.appendChild(makeModelBar(mid));return d}
 // Sort cardinality: good + maybe_good + unknown, EXCLUDING failed/bad hosts — a model
 // served only by dead hosts shouldn't rank above a live one on raw host count.
@@ -2714,8 +2719,11 @@ function renderModels(models){
   modelAgg={};imageModels={};
   models.forEach(function(m){
     var id=m.id||'';if(!id)return;
-    modelAgg[id]={count:m.count||0,good:m.good||0,bad:m.bad||0,nsfw:!!m.nsfw,aka:m.aka||0,label:m.label||''};
-    if(m.image||_isImageModelName(id)){imageModels[id]=1;var t=id.indexOf(' [');if(t>=0)imageModels[id.slice(0,t)]=1}
+    modelAgg[id]={count:m.count||0,good:m.good||0,bad:m.bad||0,nsfw:!!m.nsfw,aka:m.aka||0,label:m.label||'',alias:!!m.alias,body:m.body||''};
+    // An alias is placed by what its BODY routes to (an image alias lands in the image
+    // pane), not by its `!name` id; everything else by its own name.
+    var imgKey=m.alias?(m.body||''):id;
+    if(m.image||_isImageModelName(imgKey)){imageModels[id]=1;var t=id.indexOf(' [');if(t>=0)imageModels[id.slice(0,t)]=1}
   });
   var ids=Object.keys(modelAgg).filter(function(id){return id.length&&!/[:-]cloud/.test(id)});
   ids.sort(function(a,b){return modelRank(b)-modelRank(a)||(a<b?-1:a>b?1:0)});

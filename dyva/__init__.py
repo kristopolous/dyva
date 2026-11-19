@@ -5777,6 +5777,25 @@ def expand_aliases(sub, aliases, _seen=frozenset()):
     return ",".join(out)
 
 
+def _alias_model_rows(aliases=None, count_fn=None):
+    """Synthetic model rows for the configured aliases, so a user WITHOUT the settings
+    password can still see and pick them from the normal model list. `id` is the `!name`
+    the user types (find_servers expands it on use); `count` is how many hosts the body
+    currently reaches; `alias`+`body` let the client badge the row and show what it
+    resolves to. An alias whose body reaches no host is still listed (the comma-chain is
+    its safety net, not validation). Ordered as the aliases are defined."""
+    if aliases is None:
+        aliases = ALIASES
+    if count_fn is None:
+        def count_fn(body):
+            try:
+                return len(find_servers(body))
+            except Exception:
+                return 0
+    return [{"id": "!" + name, "count": count_fn(body), "alias": True, "body": body}
+            for name, body in aliases.items()]
+
+
 def find_servers(sub, caps=None):
     # Alias pre-pass: a leading `!name` segment is expanded to its configured query before any
     # parsing below. Every call site funnels through here, so they all get aliases for free; the
@@ -11440,6 +11459,11 @@ async def handle_dashboard_models(request):
     # (host UNION). 1 = show all; 2+ hides one-offs. Same rule as listed_models().
     if MIN_COUNT > 1:
         out = [r for r in out if r.get("count", 0) >= MIN_COUNT]
+    # Surface the operator's aliases in the normal list: they otherwise live only in the
+    # password-locked settings panel, invisible to a password-less user. Prepended (they're
+    # deliberate shortcuts), computed live from ALIASES so an edit shows up without a
+    # re-source, and exempt from the MIN_COUNT floor like any hand-picked entry.
+    out = _alias_model_rows() + out
     # Trim the companion maps to the models we actually ship: `sizes`/`kind` are built over
     # the whole surveyed name universe (~2x the shown rows — folded members, hidden junk),
     # but the client only looks them up by a displayed row id. Pruning roughly halves the
@@ -11653,6 +11677,10 @@ async def handle_model_hosts(request):
     q = (request.query.get("q", "") or "").strip()
     if not q:
         return web.json_response({"model": q, "hosts": [], "stats": {}})
+    # A `!alias` row (or a user typing one) expands to its body before matching, the same
+    # pre-pass find_servers runs — so clicking an alias in the model list drills into the
+    # hosts it actually routes to. A no-op when q has no `!` or no aliases are configured.
+    q = expand_aliases(q, ALIASES)
     qpat = canon_pattern(q)
     # Match by QUERY (glob/substring — the same match_model the router uses), NOT an exact model
     # name: "qwen3.8" must sweep every qwen3.8 variant across the pool (qwen3.8:27b, qwen3.8-9b-...,
