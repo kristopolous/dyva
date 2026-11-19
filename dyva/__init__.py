@@ -609,9 +609,24 @@ def _normalize_base(s):
 MODEL_LIST = []  # when non-empty AND MODEL_LIST_ON, the exact model ids /api/tags and /v1/models advertise
 MODEL_LIST_ON = False  # the UI "Enabled" checkbox — the override applies ONLY when on, so the
                        # list stays stored (and editable) while it's toggled off
-ALIASES_TEXT = ""  # raw alias config file (what the settings textarea holds; persisted verbatim
-                   # so #comments and formatting survive). ALIASES is the parsed view of it.
-ALIASES = {}       # parse_aliases(ALIASES_TEXT): {name_lower: body}, used by find_servers' pre-pass
+# Two routing shortcuts the chat's image/video tools lean on by default. The bodies are
+# `*` (= any model) ON PURPOSE: class routing already restricts generation to image/video-
+# kind models, so `*` is evergreen — it never needs revisiting the way a named family chain
+# ("flux,qwen-image,...") would every couple of months. The operator can retarget or delete
+# them from the settings panel; the chat calls them as `!image,*` / `!video,*`, so even a
+# deleted alias degrades to the whole pool.
+DEFAULT_ALIASES_TEXT = (
+    "# Default chat image/video routing shortcuts. `*` = any model of that kind (class\n"
+    "# routing already restricts to image/video); evergreen, so no upkeep. Retarget them\n"
+    "# (e.g. `flux,qwen-image`) or delete them — the chat appends `,*`, so they always\n"
+    "# fall back to the whole pool.\n"
+    "!image\n*\n\n!video\n*\n"
+)
+ALIASES_TEXT = DEFAULT_ALIASES_TEXT  # raw alias config (what the settings textarea holds;
+                   # persisted verbatim so #comments and formatting survive). Seeded with the
+                   # defaults above; the settings file's own 'aliases' (even "") overrides.
+ALIASES = {}       # parse_aliases(ALIASES_TEXT), seeded just after parse_aliases is defined;
+                   # used by find_servers' pre-pass. load_settings() overrides from disk.
 ADMIN_PW = ""   # sha256 hex of the admin password; when set, viewing/changing
                 # settings & sources requires it (localhost always exempt).
 def _resolve_version():
@@ -5755,6 +5770,12 @@ def parse_aliases(text):
     return out
 
 
+# Seed the live alias map from the shipped defaults now that parse_aliases exists, so the
+# chat's image/video shortcuts work with no settings file. load_settings() overrides this
+# from disk when the settings file carries its own 'aliases' (even an empty string).
+ALIASES = parse_aliases(ALIASES_TEXT)
+
+
 def expand_aliases(sub, aliases, _seen=frozenset()):
     """Substitute a leading `!name` in each comma segment of `sub` with its alias body,
     bash-style (a suffix after the name rides along). Resolves nested aliases; a cycle
@@ -5794,6 +5815,21 @@ def _alias_model_rows(aliases=None, count_fn=None):
                 return 0
     return [{"id": "!" + name, "count": count_fn(body), "alias": True, "body": body}
             for name, body in aliases.items()]
+
+
+_alias_rows_cache = None   # ((_servers_loaded_at, ALIASES_TEXT), rows)
+
+
+def _dashboard_alias_rows():
+    """_alias_model_rows() memoized for the hot /dashboard-models endpoint. Each row's
+    count is a find_servers() scan over the whole pool, so computing them per poll is
+    pure waste — they only change when the pool reloads (_servers_loaded_at) or the alias
+    config changes (ALIASES_TEXT). Recompute only then."""
+    global _alias_rows_cache
+    key = (_servers_loaded_at, ALIASES_TEXT)
+    if _alias_rows_cache is None or _alias_rows_cache[0] != key:
+        _alias_rows_cache = (key, _alias_model_rows())
+    return _alias_rows_cache[1]
 
 
 def find_servers(sub, caps=None):
@@ -11463,7 +11499,7 @@ async def handle_dashboard_models(request):
     # password-locked settings panel, invisible to a password-less user. Prepended (they're
     # deliberate shortcuts), computed live from ALIASES so an edit shows up without a
     # re-source, and exempt from the MIN_COUNT floor like any hand-picked entry.
-    out = _alias_model_rows() + out
+    out = _dashboard_alias_rows() + out
     # Trim the companion maps to the models we actually ship: `sizes`/`kind` are built over
     # the whole surveyed name universe (~2x the shown rows — folded members, hidden junk),
     # but the client only looks them up by a displayed row id. Pruning roughly halves the
@@ -15241,6 +15277,9 @@ async def handle_txt2img(request):
         return web.json_response({"error": "invalid JSON"}, status=400)
 
     model_filter = body.pop("model", None)
+    # Expand a `!image`-style routing alias to its body (e.g. the evergreen `*`), the same
+    # pre-pass find_servers runs, so the chat can steer image gen through an operator alias.
+    model_filter = expand_aliases(model_filter, ALIASES)
     requested_model = model_filter or ""
     activity_label = (model_filter or body.get("prompt", "txt2img"))[:60]
 
@@ -19365,6 +19404,8 @@ async def handle_videos_post(request):
             {"error": "no ComfyUI hosts with a video-capable model available"}, status=503)
 
     model_filter = body.get("model") or ""
+    # A `!video`-style alias expands to its body (e.g. the evergreen `*`) before matching.
+    model_filter = expand_aliases(model_filter, ALIASES)
     # kept as a hint; the actual model is resolved per host against its loaders
     # pick the best host that actually has a matching video model
     chosen_host = None
@@ -21086,7 +21127,10 @@ async def _edit_read_request(request):
               "aspect", "size"):
         if k in body:
             params[k] = body[k]
-    return prompt, images, str(body.get("model") or "").strip() or None, params
+    # A `!image`-style alias expands to its body before matching, so chat image edits can
+    # route through the same operator alias as generation.
+    _mf = expand_aliases(str(body.get("model") or "").strip(), ALIASES) or None
+    return prompt, images, _mf, params
 
 
 async def handle_edit_models(request):

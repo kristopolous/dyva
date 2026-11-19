@@ -151,6 +151,48 @@ def test_alias_rows_default_count_swallows_errors(monkeypatch):
     ]
 
 
+# ------------------------- shipped default aliases ------------------------
+# Two evergreen routing shortcuts the chat's image/video tools lean on. The bodies
+# are `*` ON PURPOSE: class routing already restricts to image/video-kind models, so
+# `*` never goes stale the way a named family chain would. The operator can retarget
+# or delete them; the chat appends `,*` so even a deleted alias degrades to the pool.
+
+def test_default_aliases_are_evergreen_wildcards():
+    assert dyva.parse_aliases(dyva.DEFAULT_ALIASES_TEXT) == {"image": "*", "video": "*"}
+
+
+def test_aliases_seeded_at_import():
+    # absent a settings file, the module seeds these so the chat works out of the box
+    assert dyva.ALIASES.get("image") == "*"
+    assert dyva.ALIASES.get("video") == "*"
+
+
+def test_dashboard_alias_rows_memoized_and_invalidates(monkeypatch):
+    # Each row's count is a whole-pool find_servers scan, so /dashboard-models must not
+    # recompute them every poll — only when the pool reloads or the alias config changes.
+    calls = {"n": 0}
+
+    def counting_find_servers(_body):
+        calls["n"] += 1
+        return []
+
+    monkeypatch.setattr(dyva, "find_servers", counting_find_servers)
+    monkeypatch.setattr(dyva, "_alias_rows_cache", None)
+    monkeypatch.setattr(dyva, "_servers_loaded_at", 1000.0)
+    monkeypatch.setattr(dyva, "ALIASES", {"qwen": "qwen3.8"})
+    monkeypatch.setattr(dyva, "ALIASES_TEXT", "!qwen\nqwen3.8\n")
+
+    r1 = dyva._dashboard_alias_rows()
+    r2 = dyva._dashboard_alias_rows()
+    assert r1 == r2 == [{"id": "!qwen", "count": 0, "alias": True, "body": "qwen3.8"}]
+    assert calls["n"] == 1                      # second poll served from cache
+
+    monkeypatch.setattr(dyva, "ALIASES_TEXT", "!qwen\ngemma4\n")  # alias edit
+    monkeypatch.setattr(dyva, "ALIASES", {"qwen": "gemma4"})
+    dyva._dashboard_alias_rows()
+    assert calls["n"] == 2                      # config change invalidates
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))

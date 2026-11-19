@@ -5683,10 +5683,11 @@ async function runStream(chatId,chatCreated,chatTitle,model,msgs,bubble,depth,ex
         try{
           var ib={prompt:String(args.prompt||'').trim().slice(0,2000)};
           if(args.negative_prompt)ib.negative_prompt=String(args.negative_prompt).trim().slice(0,1000);
-          // only forward a model the user actually asked for; models like to
-          // fill optional fields with plausible-looking nonsense
-          var gm=String(args.model||'').trim();
-          if(gm&&gm.length<80)ib.model=gm;
+          // Default to the operator's evergreen image alias, a moving target the server
+          // expands (!image -> its body); the trailing ,* means a deleted alias still
+          // falls back to the whole pool. An explicit model from the LLM wins.
+          var gm=String(args.model||'').trim()||'!image,*';
+          if(gm.length<80)ib.model=gm;
           // Output shape, same buckets as edit_image; the server maps it to width/height.
           var gasp=String(args.aspect||'').trim().toLowerCase();
           if(gasp==='long'||gasp==='square'||gasp==='tall')ib.aspect=gasp;
@@ -5880,8 +5881,10 @@ async function runStream(chatId,chatCreated,chatTitle,model,msgs,bubble,depth,ex
           if(!isNaN(secs)&&secs>0)vb.seconds=Math.min(secs,20);
           if(['long','square','tall'].indexOf(args.aspect)>=0)vb.aspect=args.aspect;
           if(['small','medium','large'].indexOf(args.size)>=0)vb.size=args.size;
-          var vm=String(args.model||'').trim();
-          if(vm&&vm.length<80)vb.model=vm;
+          // Default to the operator's evergreen video alias (server expands !video); the
+          // trailing ,* keeps it working even if the alias was deleted. Explicit model wins.
+          var vm=String(args.model||'').trim()||'!video,*';
+          if(vm.length<80)vb.model=vm;
           // a named image becomes the start frame (image-to-video)
           var vchat=liveChat(chatId)||currentChat;
           var vwant=String(args.image||'').trim();
