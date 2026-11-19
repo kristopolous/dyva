@@ -1,0 +1,6 @@
+[
+  {"id": "en-US_f_jodi", "file": "en-US_f_jodi.wav", "lang": "en", "region": "US", "gender": "f",
+   "source": "voice-zero / LibriVox (Jodi Krangle)", "license": "CC0"},
+  {"id": "en-US_m_dan", "file": "en-US_m_dan.wav", "lang": "en", "region": "US", "gender": "m",
+   "source": "voice-zero / LibriVox (Dan Mason)", "license": "CC0"}
+]
