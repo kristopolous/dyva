@@ -16690,6 +16690,74 @@ def _apply_param_hints(inputs, required, hints):
             inputs[field] = prefs[0]
 
 
+# --- voice catalog ----------------------------------------------------------
+# dyva owns a small curated set of CC0 reference voices (dyva/voices/catalog.json plus
+# a runtime drop-in dir), tagged {lang, region, gender} and named Piper-style
+# (`en-US_f_jodi`), so a user can ask for "female american accent" instead of a private
+# per-host clone. The fish pool clones zero-shot from an inline reference but carries no
+# coherent, consented voice catalog of its own — this is that catalog.
+_VOICE_GENDER_SYNONYMS = {
+    "f": ("female", "woman", "women", "girl", "lady", "feminine"),
+    "m": ("male", "man", "men", "boy", "guy", "masculine"),
+}
+# Insertion order matters: the first region whose synonyms hit wins, so "american
+# english" resolves to US, not GB.
+_VOICE_REGION_SYNONYMS = {
+    "US": ("american", "america", "us", "usa", "yank"),
+    "GB": ("british", "britain", "uk", "england", "english", "brit"),
+    "SCT": ("scottish", "scotland", "scots"),
+    "IE": ("irish", "ireland"),
+    "AU": ("australian", "australia", "aussie"),
+    "CA": ("canadian", "canada"),
+    # Named but (so far) uncatalogued accents are still recognized as constraints,
+    # so "french man" fails to match rather than falling back to a wrong-accent voice.
+    "FR": ("french", "france"),
+    "DE": ("german", "germany"),
+    "ES": ("spanish", "spain"),
+    "IT": ("italian", "italy"),
+    "IN": ("indian", "india"),
+    "NL": ("dutch", "netherlands"),
+}
+
+
+def _voice_query_constraints(text):
+    """Parse a plain-words voice request ("female american accent") into tag
+    constraints ({"gender": "f", "region": "US"}). Unrecognized words are ignored;
+    an empty or unrecognized query yields {} so the caller uses the host default."""
+    if not text or not isinstance(text, str):
+        return {}
+    words = set(re.findall(r"[a-z]+", text.lower()))
+    out = {}
+    for g, syns in _VOICE_GENDER_SYNONYMS.items():
+        if words & set(syns):
+            out["gender"] = g
+            break
+    for region, syns in _VOICE_REGION_SYNONYMS.items():
+        if words & set(syns):
+            out["region"] = region
+            break
+    return out
+
+
+def _resolve_voice(text, catalog):
+    """The catalog entry best matching a plain-words request, or None. An exact id
+    wins; otherwise the first entry satisfying every parsed constraint. None (no text,
+    or nothing matches) means the caller falls back to the host's default voice."""
+    if not text or not isinstance(text, str):
+        return None
+    q = text.strip()
+    for e in catalog:
+        if str(e.get("id", "")).lower() == q.lower():
+            return e
+    cons = _voice_query_constraints(q)
+    if not cons:
+        return None
+    for e in catalog:
+        if all(str(e.get(k, "")).lower() == str(v).lower() for k, v in cons.items()):
+            return e
+    return None
+
+
 _OPENAI_TTS_SERVICES = {"chatterbox", "localai", "fish"}
 
 

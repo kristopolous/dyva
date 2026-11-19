@@ -31,7 +31,7 @@ include-package-data = true
 packages = ["dyva", "dyva.static", "graflex"]
 
 [tool.setuptools.package-data]
-dyva = ["static/*", "*.json"]
+dyva = ["static/*", "*.json", "voices/*"]
 graflex = ["*.json"]
 
 [project.scripts]

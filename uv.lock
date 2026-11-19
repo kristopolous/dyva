@@ -598,8 +598,12 @@ dependencies = [
     { name = "rcssmin" },
     { name = "requests" },
     { name = "rjsmin" },
-    { name = "sqlite-vec" },
     { name = "tiktoken" },
+]
+
+[package.optional-dependencies]
+search = [
+    { name = "sqlite-vec" },
 ]
 
 [package.dev-dependencies]
@@ -622,9 +626,10 @@ requires-dist = [
     { name = "rcssmin", specifier = ">=1.1.0" },
     { name = "requests", specifier = ">=2.31.0" },
     { name = "rjsmin", specifier = ">=1.2.0" },
-    { name = "sqlite-vec", specifier = ">=0.1.9" },
+    { name = "sqlite-vec", marker = "extra == 'search'", specifier = ">=0.1.9" },
     { name = "tiktoken", specifier = ">=0.7.0" },
 ]
+provides-extras = ["search"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "pytest", specifier = ">=9.1.1" }]
