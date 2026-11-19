@@ -91,6 +91,41 @@ def test_shipped_catalog_is_valid_and_files_exist():
         assert os.path.exists(os.path.join(base, e["file"])), f"missing wav for {e['id']}"
 
 
+# --- fish catalog-voice cloning ---------------------------------------------
+# A resolved catalog voice drives fish /v1/tts by riding inline as a reference
+# wav. The bytes must stay raw (msgpack), which is why cloning can't use the
+# bare-{text} JSON body.
+
+def test_load_voice_catalog_resolves_shipped_wavs():
+    cat = dyva.load_voice_catalog()
+    assert isinstance(cat, list) and len(cat) >= 2
+    assert {"en-US_f_jodi", "en-US_m_dan"} <= {e["id"] for e in cat}
+    for e in cat:
+        assert os.path.isabs(e["path"]) and os.path.exists(e["path"])
+
+
+def test_voice_reference_audio_reads_bytes_for_a_match():
+    jodi = next(e for e in dyva.load_voice_catalog() if e["id"] == "en-US_f_jodi")
+    want = open(jodi["path"], "rb").read()
+    assert dyva._voice_reference_audio("en-US_f_jodi") == want       # by id
+    assert dyva._voice_reference_audio("female american accent") == want  # by words
+
+
+def test_voice_reference_audio_none_when_no_match_or_empty():
+    assert dyva._voice_reference_audio("french man") is None   # recognized, uncatalogued
+    assert dyva._voice_reference_audio("") is None
+    assert dyva._voice_reference_audio(None) is None
+
+
+def test_fish_reference_body_carries_raw_bytes_inline():
+    body = dyva._fish_reference_body("hello there", b"RIFFxxxx")
+    assert body["text"] == "hello there"
+    assert body["references"] == [{"audio": b"RIFFxxxx", "text": ""}]
+    # raw bytes (not a base64 str) is the point: only msgpack preserves them, so the
+    # clone path steps up from the bare-{text} JSON body to msgpack.
+    assert isinstance(body["references"][0]["audio"], bytes)
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))
