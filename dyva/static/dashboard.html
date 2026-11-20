@@ -9176,9 +9176,11 @@ function loadTtsVoices(){
   }).then(function(j){
     // voices are {voice, hosts}, popularity-sorted by the server
     var vs=(j.voices||[]),inp=document.getElementById('ttsVoice');
-    var hosts=(j.hosts||[]).length;
+    // Just the voice count — the per-voice host numbers in the list below carry the
+    // "how many hosts can produce this" signal; a single pool total mixes ComfyUI node
+    // hosts with fish cloning hosts and reads as "0 hosts" on a fish-only pool.
     inp.placeholder=vs.length
-      ? (vs.length+' voices from '+hosts+' host'+(hosts===1?'':'s'))
+      ? (vs.length+' voice'+(vs.length===1?'':'s')+' available')
       : 'host default';
     // Feed the typeahead picker (attachPicker reads this datalist) so typing in the
     // Voice field surfaces matching voices — same widget the image/video model fields use.
@@ -9205,7 +9207,7 @@ function loadTtsVoices(){
         var row=document.createElement('div');row.className='tts-voice-row';row.title='Use '+v.voice;
         var nm=document.createElement('span');nm.className='tts-voice-name';nm.textContent=v.voice;
         var ct=document.createElement('span');ct.className='tts-voice-count';
-        ct.textContent=v.hosts;ct.title=v.hosts+' host'+(v.hosts===1?'':'s')+' offer this voice';
+        ct.textContent=v.hosts;ct.title='about '+v.hosts+' host'+(v.hosts===1?'':'s')+' can produce this voice';
         row.appendChild(nm);row.appendChild(ct);
         row.addEventListener('click',function(){
           inp.value=v.voice;inp.focus();

@@ -16337,6 +16337,40 @@ def _aggregate_voices(survey):
     return out
 
 
+def _fish_host_count():
+    """How many fish (zero-shot cloning) hosts are in the pool. Every fish host can
+    clone any curated catalog voice, so this is the confidence number a catalog voice
+    carries in the voices list — "about this many hosts have a plausible plan of
+    execution for this voice."""
+    return sum(1 for s in load_servers()
+               if s.get("service") == "fish" and s.get("server"))
+
+
+def _catalog_voice_rows(fish_count):
+    """The shipped curated catalog as voices-list rows. Each is a voice a fish host
+    clones, so its host count is the live fish-host count (the confidence signal), and
+    it's tagged source:'catalog' so the UI — and routing — can tell a cloneable catalog
+    voice from a host-advertised one."""
+    return [{"voice": e["id"], "hosts": fish_count, "source": "catalog"}
+            for e in load_voice_catalog() if e.get("id")]
+
+
+def _merge_voice_rows(host_voices, catalog_rows):
+    """Merge host-advertised voice rows with curated catalog rows into one voices list,
+    re-sorted by host count (desc) then name — so the catalog voices sit among the host
+    voices by the same confidence number the UI reads. A catalog voice some host already
+    advertises (same normalized name) is dropped: the host row's live count already
+    represents it, no double listing."""
+    seen = {_voice_norm(v["voice"]) for v in host_voices}
+    out = list(host_voices)
+    for row in catalog_rows:
+        if _voice_norm(row["voice"]) in seen:
+            continue
+        out.append(row)
+    out.sort(key=lambda d: (-d["hosts"], d["voice"].lower()))
+    return out
+
+
 def _voice_norm(s):
     """Voice name -> lowercase-alphanumeric identity: drop path, a known audio/model
     extension, and every separator, so Adam_US / us-adam / adamus collapse. The voice
@@ -17271,6 +17305,13 @@ def _find_openai_tts_hosts(voice=None):
         if not model:
             continue
         entries.append((host, svc, model, s.get("voices") or []))
+
+    # A curated catalog voice is produced by CLONING a reference wav, which only fish
+    # hosts do. Restrict to them so the race can't land on a chatterbox host that would
+    # silently substitute its own first voice (the wrong-voice bug). A host-advertised
+    # or blank voice leaves every OpenAI-TTS host in play.
+    if voice and _resolve_voice(voice, load_voice_catalog()):
+        entries = [e for e in entries if e[1] == "fish"]
 
     def rank(e):
         h = e[0]
@@ -19993,12 +20034,21 @@ async def handle_tts_speech(request):
     # for one TTS node isn't written off for all of them.
     tkey = tts_key(str(body.get("model") or "").strip() or None)
     target = request.query.get("host")
-    hosts = _find_tts_hosts(target,
-                            str(body.get("model") or "").strip() or None,
-                            voice=voice)
-    # OpenAI-compatible TTS hosts (LocalAI, Chatterbox): clean voiced speech by
+    # A curated catalog voice is produced by cloning a reference wav — only a fish host
+    # can do that. So it routes to fish exclusively (via _find_openai_tts_hosts below);
+    # the ComfyUI nodes carry their own voices and would silently substitute one, so
+    # they're not a fallback here. Fail clean if no fish host is up rather than deliver
+    # the wrong voice — "the user shouldn't have to care" means we pick right or say so.
+    is_catalog = bool(voice and not target and _resolve_voice(voice, load_voice_catalog()))
+    hosts = [] if is_catalog else _find_tts_hosts(
+        target, str(body.get("model") or "").strip() or None, voice=voice)
+    # OpenAI-compatible TTS hosts (LocalAI, Chatterbox, Fish): clean voiced speech by
     # `/v1/audio/speech` passthrough, no ComfyUI node graph — the preferred source.
     oai_hosts = [] if target else _find_openai_tts_hosts(voice)
+    if is_catalog and not oai_hosts:
+        return web.json_response(
+            {"error": f"'{voice}' is a cloned voice that needs a fish host, and none "
+                      f"are available right now"}, status=503)
     if not hosts and not oai_hosts:
         return web.json_response({"error": "no hosts available for tts"}, status=503)
 
@@ -20195,11 +20245,15 @@ async def handle_audio_voices(request):
         return resp
 
     session = request.app["session"]
-    hosts = _find_tts_hosts(request.query.get("host"))
-    if not hosts:
-        return web.json_response({"error": "no ComfyUI hosts available"}, status=503)
-
+    host_param = request.query.get("host")
+    hosts = _find_tts_hosts(host_param)
     force = request.query.get("refresh") in ("1", "true", "yes")
+
+    # The shipped curated catalog is fish-cloneable, so those voices belong in the list
+    # even when the pool is fish-only (no ComfyUI node hosts) — each carrying the live
+    # fish-host count as its confidence number. Skipped when a specific host was targeted
+    # (that's a per-host node query, not the whole-pool picker).
+    catalog_rows = [] if host_param else _catalog_voice_rows(_fish_host_count())
 
     async def probe(host):
         """Survey one host. _tts_node_for writes the result through to
@@ -20216,7 +20270,7 @@ async def handle_audio_voices(request):
              if force or h not in survey
              or time.time() - (survey[h].get("checked") or 0) > NODE_SURVEY_TTL]
 
-    if force or (stale and not survey):
+    if hosts and (force or (stale and not survey)):
         # Nothing useful to show yet (or an explicit refresh) — wait for it.
         await asyncio.gather(*(probe(h) for h in stale), return_exceptions=True)
         survey = load_node_survey(TTS_KEY)
@@ -20232,10 +20286,12 @@ async def handle_audio_voices(request):
         asyncio.create_task(_fill())
 
     # Only the surveyed candidate hosts that actually have a node, so the voice
-    # counts and the host list agree. `voices` is [{voice, hosts}] — every voice and
-    # how many hosts offer it, popularity-sorted — so the UI can list them like models.
+    # counts and the host list agree. Host-advertised voices then merge with the curated
+    # catalog into one list, sorted by host count — the UI lists them like models.
     sub = {h: survey[h] for h in hosts if h in survey and survey[h].get("node")}
-    voices = _aggregate_voices(sub)
+    voices = _merge_voice_rows(_aggregate_voices(sub), catalog_rows)
+    if not voices:
+        return web.json_response({"error": "no TTS hosts available"}, status=503)
     details = [{"host": h,
                 "nodes": [{"node": sub[h]["node"], "voices": sub[h].get("voices") or []}],
                 "checked": sub[h].get("checked")} for h in hosts if h in sub]

@@ -57,6 +57,51 @@ def test_empty_survey_is_empty_list():
     assert dyva._aggregate_voices({}) == []
 
 
+# --- curated catalog voices merged into the list ----------------------------
+# The shipped curated catalog is fish-cloneable, so those voices must appear in
+# /v1/audio/voices even when the pool is fish-only (no ComfyUI node hosts). Each
+# carries the LIVE fish-host count as its confidence number — "about this many hosts
+# have a plausible plan of execution for this voice" — the signal the UI shows.
+
+def test_fish_host_count_counts_only_fish_with_a_host(monkeypatch):
+    servers = [{"server": "f1", "service": "fish"},
+               {"server": "f2", "service": "fish"},
+               {"server": "c1", "service": "comfyui"},      # not fish
+               {"server": None, "service": "fish"}]          # no host -> not counted
+    monkeypatch.setattr(dyva, "load_servers", lambda: servers)
+    assert dyva._fish_host_count() == 2
+
+
+def test_catalog_voice_rows_carry_fish_count_and_source(monkeypatch):
+    monkeypatch.setattr(dyva, "load_voice_catalog",
+                        lambda: [{"id": "en-US_f_jodi"}, {"id": "en-US_m_dan"}])
+    assert dyva._catalog_voice_rows(7) == [
+        {"voice": "en-US_f_jodi", "hosts": 7, "source": "catalog"},
+        {"voice": "en-US_m_dan", "hosts": 7, "source": "catalog"}]
+
+
+def test_merge_sorts_catalog_in_by_count():
+    host_voices = [{"voice": "Dylan", "hosts": 3}, {"voice": "Aiden", "hosts": 1}]
+    catalog = [{"voice": "en-US_f_jodi", "hosts": 2, "source": "catalog"}]
+    assert dyva._merge_voice_rows(host_voices, catalog) == [
+        {"voice": "Dylan", "hosts": 3},
+        {"voice": "en-US_f_jodi", "hosts": 2, "source": "catalog"},
+        {"voice": "Aiden", "hosts": 1}]
+
+
+def test_merge_drops_a_catalog_voice_a_host_already_advertises():
+    # a host advertising the same voice -> its live row wins, no double listing
+    host_voices = [{"voice": "en-US_f_jodi", "hosts": 5}]
+    catalog = [{"voice": "en-US_f_jodi", "hosts": 2, "source": "catalog"}]
+    assert dyva._merge_voice_rows(host_voices, catalog) == [
+        {"voice": "en-US_f_jodi", "hosts": 5}]
+
+
+def test_merge_with_no_host_voices_is_just_the_catalog():
+    catalog = [{"voice": "en-US_f_jodi", "hosts": 4, "source": "catalog"}]
+    assert dyva._merge_voice_rows([], catalog) == catalog
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))

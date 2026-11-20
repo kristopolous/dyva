@@ -56,6 +56,49 @@ def test_ordering_voiced_before_unknown_before_voiceless():
     assert order == ["voiced", "unknown", "voiceless"]
 
 
+# --- a curated catalog voice is fish-clone-only -----------------------------
+# Catalog voices (en-US_f_jodi) are produced by CLONING a reference wav, which only
+# fish hosts do. If the OpenAI-TTS race is allowed to land on a chatterbox host it
+# silently substitutes its own first voice (the wrong-voice bug). So when the named
+# voice resolves to the catalog, _find_openai_tts_hosts restricts to fish hosts.
+
+def _neutral(monkeypatch):
+    monkeypatch.setattr(dyva, "load_marks", lambda: {})
+    monkeypatch.setattr(dyva, "get_last", lambda k: None)
+    monkeypatch.setattr(dyva, "rerank_scores", lambda: {})
+    monkeypatch.setattr(dyva, "capability_tier", lambda *a, **k: 0)
+    monkeypatch.setattr(dyva, "_idle_first", lambda hs: hs)
+
+
+OAI_SERVERS = [{"server": "fish1", "service": "fish", "models": ["fish"]},
+               {"server": "cb1", "service": "chatterbox", "models": ["chatterbox"]}]
+
+
+def test_catalog_voice_restricts_to_fish_hosts(monkeypatch):
+    _neutral(monkeypatch)
+    monkeypatch.setattr(dyva, "load_servers", lambda: OAI_SERVERS)
+    monkeypatch.setattr(dyva, "load_voice_catalog", lambda: [{"id": "en-US_f_jodi"}])
+    hosts = dyva._find_openai_tts_hosts("en-US_f_jodi")
+    assert [h[0] for h in hosts] == ["fish1"]         # chatterbox can't clone it
+
+
+def test_non_catalog_voice_keeps_all_openai_hosts(monkeypatch):
+    _neutral(monkeypatch)
+    monkeypatch.setattr(dyva, "load_servers", lambda: OAI_SERVERS)
+    monkeypatch.setattr(dyva, "load_voice_catalog", lambda: [{"id": "en-US_f_jodi"}])
+    # "Abigail" is a chatterbox voice, not in the catalog -> no fish restriction
+    hosts = dyva._find_openai_tts_hosts("Abigail")
+    assert set(h[0] for h in hosts) == {"fish1", "cb1"}
+
+
+def test_no_voice_named_keeps_all_openai_hosts(monkeypatch):
+    _neutral(monkeypatch)
+    monkeypatch.setattr(dyva, "load_servers", lambda: OAI_SERVERS)
+    monkeypatch.setattr(dyva, "load_voice_catalog", lambda: [{"id": "en-US_f_jodi"}])
+    hosts = dyva._find_openai_tts_hosts(None)
+    assert set(h[0] for h in hosts) == {"fish1", "cb1"}
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))
