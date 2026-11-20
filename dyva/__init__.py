@@ -22597,6 +22597,14 @@ def make_app():
             app.router.add_get("/demos/", _serve_demos_index)
         app.router.add_static("/demos", demos_dir, show_index=True)
 
+    # Serve the repo's docs/ (reference docs, the query-syntax cheat sheet, …) at /docs/.
+    # Registered BEFORE the "/" catch-all so /docs/* resolves here; show_index lists the
+    # directory for browsing. Guarded so a package install without an adjacent docs/ dir
+    # doesn't fail startup.
+    docs_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "docs")
+    if os.path.isdir(docs_dir):
+        app.router.add_static("/docs", docs_dir, show_index=True)
+
     static_dir = os.path.join(os.path.dirname(__file__), "static")
     app.router.add_static("/", static_dir, show_index=False)
 
