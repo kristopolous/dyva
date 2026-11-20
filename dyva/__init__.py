@@ -4077,6 +4077,17 @@ def _race_sort_key(prio, vote, size_band, warm0, toobig, fav):
     return (prio, -vote, size_band, warm0, toobig, fav)
 
 
+def _race_key_with_segment(host, race_key, seg_map):
+    """Lead the race sort key with the comma-fallback SEGMENT index, so a chain exhausts one
+    target before the next ('qwen3.8*ablit,gemma4*ablit' = every qwen host first, then gemma).
+    The segment is the hard outer key — it dominates tier, so a proven/sticky gemma in segment
+    1 still sorts behind a cold qwen in segment 0 (that was the bug: reputation re-sorting the
+    whole set let the second target leapfrog the first). Within a segment the normal race_key
+    orders as always. seg_map empty/None (the single-target common case) gives every host the
+    same leading 0, so the ordering is identical to the bare race_key — a strict no-op."""
+    return ((seg_map or {}).get(host, 0),) + tuple(race_key)
+
+
 def _load_ctx_limits():
     """{(host, model): ctx_limit} for the hosts that have rejected an oversized prompt.
     Only non-NULL rows (few — most hosts never hit it), so cheap to load per race."""
@@ -4269,6 +4280,12 @@ _affinity = {}                                      # crc:int -> (host_norm, exp
 # (crc, size) for THIS request, or None. Annotated so the type-checker knows .get() is optional.
 _affinity_ctx: "contextvars.ContextVar[tuple[int | None, int] | None]" = \
     contextvars.ContextVar("affinity_ctx", default=None)
+# {host: segment_index} for THIS request's comma fallback chain, or None. Set by the chat
+# handler (find_servers_fallback), read by the race sort so segment leads. Rides a contextvar
+# for the same reason affinity does — no race-primitive signature changes, and child race
+# tasks inherit the copy. None/empty == no chain == the race orders by reputation as before.
+_fallback_seg_ctx: "contextvars.ContextVar[dict | None]" = \
+    contextvars.ContextVar("fallback_seg_ctx", default=None)
 
 
 def _affinity_key(messages, n=None):
@@ -5878,6 +5895,34 @@ def find_servers(sub, caps=None):
         if hosts is not None:
             result = [t for t in result if t[1] in hosts]   # cheap set reduction
     return result
+
+
+def find_servers_fallback(sub, caps=None):
+    """find_servers, plus a {host: segment_index} map describing the comma fallback chain —
+    so the racer can exhaust one target before the next instead of pooling them.
+
+    The comma is STRICT ORDERED EXHAUSTION, not a pool: 'qwen3.8*ablit,gemma4*ablit' races
+    every reachable qwen host first, and only once that segment is spent does gemma get a
+    turn. (A plain find_servers concatenates the segments in order, but the racer then
+    re-sorts the whole set by reputation — which let a proven/sticky gemma leapfrog the cold
+    qwen pool. The segment map, led into the race sort, is what keeps the order the user asked
+    for.) A host matching several segments is attributed to its EARLIEST (deduped, listed once).
+
+    Returns (servers, segment_of). segment_of is {} for a single target (no chain) — an empty
+    map is the no-op signal the race honours as 'order by reputation as before'. Alias expansion
+    happens BEFORE the split, so a chain alias ('!uncensored' -> 'a,b') fans into real segments."""
+    chain = _split_fallback(expand_aliases(sub, ALIASES))
+    if len(chain) <= 1:
+        return find_servers(sub, caps), {}
+    servers, seg_of, seen = [], {}, set()
+    for i, seg in enumerate(chain):
+        for prio, host, ms in find_servers(seg, caps):
+            if host in seen:
+                continue
+            seen.add(host)
+            seg_of[host] = i
+            servers.append((prio, host, ms))
+    return servers, seg_of
 
 
 _FALLBACK_RE = re.compile(r"\s*,\s*")
@@ -8040,20 +8085,23 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
     def _vote(host, ms):
         vs = [_votes[(host, m)] for m in ms if (host, m) in _votes]
         return max(vs) if vs else 0   # +1 (favored); sorted via -vote so it lands first
-    # Order: TIER first (mechanical), then the vote within it, then PROVEN size band, then
-    # warm/sticky, then too-big to the back of its tier, then WITHIN good/maybe by favorability.
-    # _fav is a per-job frozen snapshot so this race's own record_race writes can't churn the
-    # order mid-race. Unknown/explore hosts get favk=0 and keep their find_servers order (stable sort).
+    # Order: SEGMENT first (a comma fallback chain exhausts one target before the next — see
+    # _race_key_with_segment; empty for the single-target common case, a no-op), then TIER
+    # (mechanical), then the vote within it, then PROVEN size band, then warm/sticky, then
+    # too-big to the back of its tier, then WITHIN good/maybe by favorability. _fav is a per-job
+    # frozen snapshot so this race's own record_race writes can't churn the order mid-race.
+    # Unknown/explore hosts get favk=0 and keep their find_servers order (stable sort).
     _fav = _favorability(model, servers)
+    _seg = _fallback_seg_ctx.get()      # {host: segment_idx} or None — leads the sort below
     def _order(it):
         prio, host, ms = it
         warm0 = 0 if (host in _warm and prio < TIER_BAD) else 1
         favk = -_fav[host]["fav"] if (host in _fav and prio in (TIER_GOOD, TIER_MAYBE)) else 0.0
         # Proven-size band sits ABOVE warmth: a host already shown to handle this prompt size
         # beats a warm-but-unproven one for a big request (the fall-off-the-saddle fix).
-        return _race_sort_key(prio, _vote(host, ms),
+        return _race_key_with_segment(host, _race_sort_key(prio, _vote(host, ms),
                               _sizeband(_need, _maxok, CTX_CONFIDENT_FRACTION, host, ms),
-                              warm0, _toobig(host, ms), favk)
+                              warm0, _toobig(host, ms), favk), _seg)
     servers = sorted(servers, key=_order)
     for _i, (_p, _h, _m) in enumerate(servers):     # stamp final try-order rank for the log
         if _h in _fav:
@@ -10171,7 +10219,12 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
     # the event loop on exactly the 100k-token prompts this feature targets.
     _acrc = _affinity_key(_amsgs)
     _affinity_ctx.set((_acrc, len(json.dumps(_amsgs, ensure_ascii=False)) // 4 if _amsgs else 0))
-    _servers = find_servers(model_in, req_caps)
+    # A comma fallback chain ('qwen,gemma', or an alias expanding to one) is STRICT ordered
+    # exhaustion, not a pool: segment 0's hosts are raced out entirely before segment 1 gets a
+    # turn. find_servers_fallback tags each host with its segment; the map rides a contextvar the
+    # race sort leads with. Single target -> empty map -> no-op (every race below orders as before).
+    _servers, _seg_of = find_servers_fallback(model_in, req_caps)
+    _fallback_seg_ctx.set(_seg_of or None)
     total = len(_servers)
     cancel = asyncio.Event()   # manual-stop signal; armed onto the worker for the stream
     skip = asyncio.Event()     # manual-skip signal; re-armed onto the worker per streaming leg
@@ -17831,7 +17884,11 @@ async def _run_chat_job(session, jid):
 
     await _job_set(jid, status=JOB_PROCESSING, phase="dispatching", error=None)
     model_list = _split_fallback(model_in)
-    servers = find_servers(model_in, req_caps)
+    # Comma fallback is strict ordered exhaustion (segment 0 fully before segment 1); the
+    # segment map rides a contextvar the race sort leads with. Set once here — the per-round
+    # re-find below reorders through the same map, keyed by host. Empty map == no chain == no-op.
+    servers, _seg_of = find_servers_fallback(model_in, req_caps)
+    _fallback_seg_ctx.set(_seg_of or None)
     if not servers:
         await _job_set(jid, status=JOB_FAILED, phase=None,
                        error=f"no available servers for '{model_in}'")
