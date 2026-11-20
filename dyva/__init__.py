@@ -16371,6 +16371,64 @@ def _merge_voice_rows(host_voices, catalog_rows):
     return out
 
 
+def _voice_display_name(v):
+    """A stored voice filename -> clean display name: drop path and a known audio
+    extension, keep the human casing ("Michael.wav" -> "Michael")."""
+    s = str(v or "").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    return re.sub(r"\.(wav|mp3|flac|ogg|opus|m4a)$", "", s, flags=re.I).strip()
+
+
+def _openai_host_voice_rows():
+    """Named voices advertised by OpenAI-passthrough TTS hosts (chatterbox/localai),
+    rolled up into {voice, hosts} rows — the voices those FAST backends can produce,
+    keyed by how many hosts carry each. graflex already surveys each host's voice list
+    into the record's `voices` (filenames); shown here as clean display names (which still
+    route — voice_query_match is extension-blind). Fish carries no named voices (it clones
+    the catalog) so it contributes nothing."""
+    agg = {}   # ident -> {"casings": {display: host_count}, "hosts": set}
+    for s in load_servers():
+        host = s.get("server")
+        if not host or not _is_openai_tts_service(s.get("service")):
+            continue
+        if not _openai_tts_model(s):
+            continue
+        for v in s.get("voices") or []:
+            if not isinstance(v, str) or not v.strip():
+                continue
+            name = _voice_display_name(v)
+            ident = _voice_norm(name)
+            if not ident:
+                continue
+            slot = agg.setdefault(ident, {"casings": {}, "hosts": set()})
+            slot["casings"][name] = slot["casings"].get(name, 0) + 1
+            slot["hosts"].add(host)
+    return [{"voice": max(slot["casings"].items(), key=lambda kv: kv[1])[0],
+             "hosts": len(slot["hosts"])} for slot in agg.values()]
+
+
+def _combine_voice_rows(*rowlists):
+    """Merge several {voice, hosts} lists into one, summing host counts for the same voice
+    (normalized identity: extension/case/separator-blind), keeping the dominant display
+    casing, sorted by host count desc then name. Used to fold the comfy-node voices and the
+    passthrough-host voices into one candidate set before the catalog is merged on top."""
+    agg = {}   # ident -> {"casings": {display: host_sum}, "hosts": int}
+    for rows in rowlists:
+        for r in rows or []:
+            name, n = r.get("voice"), r.get("hosts") or 0
+            if not isinstance(name, str) or not name.strip():
+                continue
+            ident = _voice_norm(name)
+            if not ident:
+                continue
+            slot = agg.setdefault(ident, {"casings": {}, "hosts": 0})
+            slot["casings"][name] = slot["casings"].get(name, 0) + n
+            slot["hosts"] += n
+    out = [{"voice": max(slot["casings"].items(), key=lambda kv: kv[1])[0],
+            "hosts": slot["hosts"]} for slot in agg.values()]
+    out.sort(key=lambda d: (-d["hosts"], d["voice"].lower()))
+    return out
+
+
 def _voice_norm(s):
     """Voice name -> lowercase-alphanumeric identity: drop path, a known audio/model
     extension, and every separator, so Adam_US / us-adam / adamus collapse. The voice
@@ -20301,7 +20359,11 @@ async def handle_audio_voices(request):
     # counts and the host list agree. Host-advertised voices then merge with the curated
     # catalog into one list, sorted by host count — the UI lists them like models.
     sub = {h: survey[h] for h in hosts if h in survey and survey[h].get("node")}
-    voices = _merge_voice_rows(_aggregate_voices(sub), catalog_rows)
+    # Fold the comfy-node voices together with the passthrough-host voices (chatterbox/
+    # localai, surveyed by graflex into each record's `voices`), then merge the catalog on
+    # top — so the picker lists the fast backends' voices too, not only the comfy ones.
+    host_voices = _combine_voice_rows(_aggregate_voices(sub), _openai_host_voice_rows())
+    voices = _merge_voice_rows(host_voices, catalog_rows)
     if not voices:
         return web.json_response({"error": "no TTS hosts available"}, status=503)
     details = [{"host": h,

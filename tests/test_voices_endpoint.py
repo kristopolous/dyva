@@ -23,7 +23,7 @@ def _req():
     return r
 
 
-def _setup(monkeypatch, comfy_hosts, survey, fish_count, catalog):
+def _setup(monkeypatch, comfy_hosts, survey, fish_count, catalog, oai_servers=()):
     async def _ok(_r):
         return None
     monkeypatch.setattr(dyva, "_check_local", _ok)
@@ -31,6 +31,7 @@ def _setup(monkeypatch, comfy_hosts, survey, fish_count, catalog):
     monkeypatch.setattr(dyva, "load_node_survey", lambda key: dict(survey))
     monkeypatch.setattr(dyva, "_fish_host_count", lambda: fish_count)
     monkeypatch.setattr(dyva, "load_voice_catalog", lambda: list(catalog))
+    monkeypatch.setattr(dyva, "load_servers", lambda: list(oai_servers))
 
 
 def _body(resp):
@@ -66,6 +67,20 @@ def test_empty_pool_still_503s(monkeypatch):
     _setup(monkeypatch, comfy_hosts=[], survey={}, fish_count=0, catalog=[])
     resp = asyncio.run(dyva.handle_audio_voices(_req()))
     assert resp.status == 503
+
+
+def test_chatterbox_host_voices_show_in_the_picker(monkeypatch):
+    # the bug: fast chatterbox voices (surveyed by graflex into `voices`) were never listed,
+    # so only the slow comfy voices were pickable. They must appear now, as clean names.
+    oai = [{"server": "cb1", "service": "chatterbox", "models": ["ChatterboxTTS"],
+            "voices": ["Michael.wav", "Olivia.wav"]},
+           {"server": "cb2", "service": "chatterbox", "models": ["ChatterboxTTS"],
+            "voices": ["Michael.wav"]}]
+    _setup(monkeypatch, comfy_hosts=[], survey={}, fish_count=0, catalog=[], oai_servers=oai)
+    resp = asyncio.run(dyva.handle_audio_voices(_req()))
+    assert resp.status == 200
+    by = {v["voice"]: v["hosts"] for v in _body(resp)["voices"]}
+    assert by == {"Michael": 2, "Olivia": 1}       # fast voices, clean names, host counts
 
 
 if __name__ == "__main__":

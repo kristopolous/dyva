@@ -102,6 +102,38 @@ def test_merge_with_no_host_voices_is_just_the_catalog():
     assert dyva._merge_voice_rows([], catalog) == catalog
 
 
+# --- OpenAI-passthrough (chatterbox/localai) host voices in the list ---------
+# graflex already surveys each chatterbox host's /get_predefined_voices into the record's
+# `voices` (filenames like "Michael.wav"). Those fast backends' voices must appear in the
+# picker too — shown as clean display names, counted by how many hosts carry each — or the
+# user can only pick the slow comfy voices and never the fast ones.
+
+def test_openai_host_voice_rows_counts_chatterbox_voices(monkeypatch):
+    servers = [
+        {"server": "cb1", "service": "chatterbox", "models": ["ChatterboxTTS"],
+         "voices": ["Michael.wav", "Olivia.wav"]},
+        {"server": "cb2", "service": "chatterbox", "models": ["ChatterboxTTS"],
+         "voices": ["Michael.wav"]},
+        {"server": "f1", "service": "fish", "models": ["fish"], "voices": []},  # clone-only
+    ]
+    monkeypatch.setattr(dyva, "load_servers", lambda: servers)
+    by = {r["voice"]: r["hosts"] for r in dyva._openai_host_voice_rows()}
+    assert by == {"Michael": 2, "Olivia": 1}       # clean names (no .wav), host counts
+
+
+def test_combine_voice_rows_concats_disjoint_and_sorts_by_count():
+    comfy = [{"voice": "Dylan", "hosts": 1}]
+    oai = [{"voice": "Michael", "hosts": 20}]
+    assert dyva._combine_voice_rows(comfy, oai) == [
+        {"voice": "Michael", "hosts": 20}, {"voice": "Dylan", "hosts": 1}]
+
+
+def test_combine_voice_rows_sums_same_voice_across_lists():
+    r = dyva._combine_voice_rows([{"voice": "Abigail", "hosts": 1}],
+                                 [{"voice": "abigail", "hosts": 2}])
+    assert len(r) == 1 and r[0]["hosts"] == 3      # case-insensitive identity, summed
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))
