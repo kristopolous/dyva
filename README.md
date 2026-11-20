@@ -45,6 +45,9 @@ Memory footprint is under 200MB. Has both light and dark mode. Out of whim and m
 </div>
 
 ## Querying for models
+<a href="https://example.com">
+  <img  align="left"  src="https://github.com/user-attachments/assets/d3cd9d65-b373-494d-a58d-25ed3de848bb"  alt="Thumbnail" width="25%">
+</a>
 The varieties of models and heterogeneity of installations are unified through a model query syntax which allows any tool to leverage any subslice of the pool by specifying the query *as* the model to use. 
 
 This is designed so you can slice and dice the pool in any application.
