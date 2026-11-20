@@ -11930,12 +11930,8 @@ async def handle_settings_post(request):
         new_workers = min(body["workers"], 200)
         if new_workers != WORKER_COUNT:
             WORKER_COUNT = new_workers
-            # Resize the global concurrency semaphore live so the new cap takes
-            # effect without a restart. In-flight requests keep their original
-            # semaphore; new ones use the resized value.
-            app = request.app
-            if isinstance(app.get("semaphore"), asyncio.Semaphore):
-                app["semaphore"] = asyncio.Semaphore(WORKER_COUNT)
+            # WORKER_COUNT is the per-request fan-out width only; there is no global
+            # admission cap to resize (the gate is unbounded — see _UnboundedGate).
             log.info(f"worker count changed to {WORKER_COUNT}")
     if isinstance(body.get("timeout"), int) and body["timeout"] > 0:
         TIMEOUT = min(body["timeout"], 600)
@@ -22379,6 +22375,25 @@ async def _hide_dyva_mw(request, handler):
     return await handler(request)
 
 
+class _UnboundedGate:
+    """No-op stand-in for the old app['semaphore'].
+
+    dyva is a ROUTER: it should serve as many concurrent clients as arrive. Each
+    request independently fans out to at most WORKER_COUNT hosts (see _race_hosts,
+    `n = min(workers or WORKER_COUNT, len(entries))`). The old
+    asyncio.Semaphore(WORKER_COUNT) conflated those two axes — it gated *admitted
+    clients* down to the fan-out width, so 20 concurrent requests only ever had
+    WORKER_COUNT in flight and the rest blocked before starting. The handlers still
+    write `async with request.app['semaphore']:`; this keeps that shape while letting
+    every request straight through. Real load is bounded by the per-request fan-out
+    and the connector (limit=0), not by a global admission cap."""
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+
 def make_app():
     app = web.Application(client_max_size=128 * 1024 * 1024,
                           middlewares=[_hide_dyva_mw])
@@ -22394,8 +22409,9 @@ def make_app():
             # connections linger (keepalive) to hosts that are never reused, hoard
             # the 100 slots, and every further connection then WAITS for a free slot
             # and times out (mass "TimeoutError" while the hosts are reachable by
-            # hand). App-level concurrency (the semaphore + hedged race) bounds the
-            # real fan-out, so the connector must not be the bottleneck.
+            # hand). Each request's own fan-out (min(WORKER_COUNT, hosts) in the hedged
+            # race) bounds the real outbound load, so the connector must not be the
+            # bottleneck — and there is no global admission cap (see _UnboundedGate).
             # DNS: ~2k of the pool's hosts are hostnames (not IPs), many on slow or
             # dead authoritative nameservers (150-670ms, NXDOMAINs the worst). The
             # default ThreadedResolver does getaddrinfo on the small (~cpu+4) executor
@@ -22409,7 +22425,7 @@ def make_app():
             connector=_make_connector(),
             timeout=aiohttp.ClientTimeout(total=None),
         )
-        app["semaphore"] = asyncio.Semaphore(WORKER_COUNT)
+        app["semaphore"] = _UnboundedGate()   # no admission cap; fan-out is per-request (see _UnboundedGate)
         # Name whatever freezes the loop (the "dyva is laggy / 42s page load" hunt):
         # logs a stack when a sleep overshoots, i.e. the loop was blocked. on_shutdown
         # cancels all tasks, so this is torn down with everything else.
