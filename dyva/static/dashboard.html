@@ -1379,13 +1379,18 @@ body.dragging-image .hist-item{cursor:grabbing}
 .tts-item .tts-prov{font-family:var(--font-mono);font-size:var(--fs-2xs);color:var(--text-dim);margin-top:3px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #ttsResult .tts-prov{font-family:var(--font-mono);font-size:var(--fs-xs);color:var(--text-dim);margin-top:var(--sp-2)}
 /* voices list: every voice + how many hosts offer it, popularity-sorted, click to pick */
-.tts-voice-list{display:flex;flex-direction:column;gap:2px;max-height:260px;overflow:auto;margin-bottom:var(--sp-3)}
-.tts-voice-row{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:4px 8px;border-radius:var(--r-sm);cursor:pointer;font-size:.82rem}
-.tts-voice-row:hover{background:var(--accent-bg)}
-.tts-voice-row.active{background:var(--accent-bg-active);color:var(--text)}
-.tts-voice-name{font-family:var(--font-mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .tts-voice-count{color:var(--text-faint);font-variant-numeric:tabular-nums;flex-shrink:0}
 .tts-voice-empty{color:var(--text-faint);font-size:.8rem;padding:4px 8px}
+/* The Voice picker is the MODELS list, in the Speech control column: the field input
+   filters it live, the full set shows always, scrollable. Reuses .modellist/.model-item. */
+.tts-voicelist{max-height:min(52vh,460px);overflow:auto;margin-top:var(--sp-2);border:1px solid var(--border);border-radius:var(--r-sm);padding:0 var(--sp-2)}
+.tts-voicelist .model-item{padding:var(--sp-2) var(--sp-2)}
+.tts-voicelist .model-item.active{background:var(--accent-bg-active);color:var(--text)}
+.tts-voicelist .tts-voice-count{color:var(--text-faint);font-variant-numeric:tabular-nums;flex-shrink:0;padding-left:10px}
+/* The picked voice, shown next to the "Voice" label (the field itself is only a filter). */
+.tts-pick{font-family:var(--font-mono);font-size:var(--fs-sm);color:var(--accent);font-weight:600}
+.tts-pick .tts-pick-x{color:var(--text-faint);cursor:pointer;font-weight:400}
+.tts-pick .tts-pick-x:hover{color:var(--err)}
 .hist-item{position:relative;display:flex;gap:10px;align-items:center;cursor:zoom-in;border:1px solid var(--border);border-radius:var(--r-lg);padding:var(--sp-2);background:var(--bg-sunken-alt)}
 .hist-item:hover{border-color:var(--border-accent)}
 .hist-del{position:absolute;top:2px;right:var(--sp-1);color:var(--border-hover);cursor:pointer;font-size:var(--fs-xs);line-height:1;padding:2px 5px;border-radius:var(--r-sm);z-index:2}
@@ -1755,9 +1760,9 @@ body.dragging-image .hist-item{cursor:grabbing}
 </div>
 <div class="studio-sep"></div>
 <div class="field">
-<label for="ttsVoice">Voice</label>
-<input id="ttsVoice" type="text" list="ttsVoices" placeholder="host default" autocomplete="off">
-<datalist id="ttsVoices"></datalist>
+<label for="ttsVoice">Voice <span id="ttsVoicePick" class="tts-pick"></span></label>
+<input id="ttsVoice" type="text" placeholder="host default" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" oninput="renderTtsVoiceList(this.value)">
+<div id="ttsVoiceList" class="modellist tts-voicelist"></div>
 </div>
 <button id="ttsGenerate" class="studio-go">Speak</button>
 </div>
@@ -1765,8 +1770,6 @@ body.dragging-image .hist-item{cursor:grabbing}
 <div id="ttsResult" class="media-result"></div>
 <div class="img-side-title">Recent</div>
 <div id="ttsGallery" class="media-gallery"></div>
-<div class="img-side-title">Voices</div>
-<div id="ttsVoiceList" class="tts-voice-list"></div>
 </div>
 </div>
 </div>
@@ -8828,7 +8831,10 @@ function attachPicker(inputId,listId){
     }else if(e.key==='Escape'){close()}
   });
 }
-['sdModel:sdModels','editModel:editModels','vidModel:vidModels','ttsVoice:ttsVoices']
+// ttsVoice is NOT here on purpose: the capped "9 and many more" dropdown doesn't scale to
+// thousands of voices. The Voice field filters the full ttsVoiceList live instead, the same
+// way #modelFilter filters #modelList (see renderTtsVoiceList).
+['sdModel:sdModels','editModel:editModels','vidModel:vidModels']
   .forEach(function(pair){var p=pair.split(':');attachPicker(p[0],p[1])});
 
 var _editModelsLoaded=false;
@@ -9123,7 +9129,7 @@ var _imgHistoryLoaded=false;
 //   speech POST /v1/audio/speech           (OpenAI shape, returns audio bytes)
 //   video  POST /v1/videos -> poll GET /v1/videos/{id} -> GET .../content
 //   music  no endpoint yet — see the note in that pane
-var _mediaPane='image',_ttsVoicesLoaded=false;
+var _mediaPane='image',_ttsVoicesLoaded=false,_ttsVoicesData=[],_ttsVoicesSurveying=false,_ttsSelectedVoice='';
 var _ttsVoicesRetried=false;
 function showMediaPane(name){
   _mediaPane=name;
@@ -9174,57 +9180,81 @@ function loadTtsVoices(){
     if(!r.ok)throw new Error('no hosts');
     return r.json();
   }).then(function(j){
-    // voices are {voice, hosts}, popularity-sorted by the server
-    var vs=(j.voices||[]),inp=document.getElementById('ttsVoice');
-    // Just the voice count — the per-voice host numbers in the list below carry the
-    // "how many hosts can produce this" signal; a single pool total mixes ComfyUI node
-    // hosts with fish cloning hosts and reads as "0 hosts" on a fish-only pool.
-    inp.placeholder=vs.length
-      ? (vs.length+' voice'+(vs.length===1?'':'s')+' available')
+    // Keep the WHOLE voice set (could be thousands across all backends) and render it like
+    // the models window — a full, scrollable, type-to-filter list. No cap, no "9 and many
+    // more": the filter narrows it, not a slice. voices are {voice, hosts}, server-sorted.
+    _ttsVoicesData=j.voices||[];
+    _ttsVoicesSurveying=!!j.surveying;
+    var inp=document.getElementById('ttsVoice');
+    if(inp)inp.placeholder=_ttsVoicesData.length
+      ? ('filter '+_ttsVoicesData.length+' voice'+(_ttsVoicesData.length===1?'':'s')+'…')
       : 'host default';
-    // Feed the typeahead picker (attachPicker reads this datalist) so typing in the
-    // Voice field surfaces matching voices — same widget the image/video model fields use.
-    var dl=document.getElementById('ttsVoices');
-    if(dl){
-      dl.innerHTML='';
-      vs.forEach(function(v){
-        var o=document.createElement('option');
-        o.value=v.voice;o.label=v.hosts+' host'+(v.hosts===1?'':'s');
-        dl.appendChild(o);
-      });
-    }
-    // the scannable, popularity-sorted list — voice + host count, click to pick,
-    // same idea as the models panel
-    var list=document.getElementById('ttsVoiceList');
-    if(list){
-      list.innerHTML='';
-      if(!vs.length){
-        var e=document.createElement('div');e.className='tts-voice-empty';
-        e.textContent=j.surveying?'surveying hosts for voices…':'no voices advertised yet';
-        list.appendChild(e);
-      }
-      vs.forEach(function(v){
-        var row=document.createElement('div');row.className='tts-voice-row';row.title='Use '+v.voice;
-        var nm=document.createElement('span');nm.className='tts-voice-name';nm.textContent=v.voice;
-        var ct=document.createElement('span');ct.className='tts-voice-count';
-        ct.textContent=v.hosts;ct.title='about '+v.hosts+' host'+(v.hosts===1?'':'s')+' can produce this voice';
-        row.appendChild(nm);row.appendChild(ct);
-        row.addEventListener('click',function(){
-          inp.value=v.voice;inp.focus();
-          Array.prototype.forEach.call(list.children,function(c){c.classList.remove('active')});
-          row.classList.add('active');
-        });
-        list.appendChild(row);
-      });
-    }
+    renderTtsVoiceList(inp?inp.value:'');
   }).catch(function(){_ttsVoicesLoaded=false});
+}
+// Render the full voice list filtered by the query, the same partial/glob matcher the
+// models window uses (globSearch -> matchModel). ALL matches, never a slice — a
+// DocumentFragment keeps it fast even at thousands of rows. Empty query shows everything.
+function renderTtsVoiceList(q){
+  var list=document.getElementById('ttsVoiceList');
+  if(!list)return;
+  q=(q||'').trim();
+  var hits=q?globSearch(q,_ttsVoicesData,function(v){return v.voice}):_ttsVoicesData;
+  list.innerHTML='';
+  if(!hits.length){
+    var e=document.createElement('div');e.className='tts-voice-empty';
+    e.textContent=_ttsVoicesData.length
+      ? ('no voice matches “'+q+'”')
+      : (_ttsVoicesSurveying?'surveying hosts for voices…':'no voices advertised yet');
+    list.appendChild(e);return;
+  }
+  var frag=document.createDocumentFragment();
+  hits.forEach(function(v){
+    // Same row shape/classes as a model row (makeModelRow) so the Voice list reads exactly
+    // like the MODELS list: name on the left, host count on the right. CLICK selects — the
+    // field above is only a filter, so a typed fragment like "tom" is never sent as a voice.
+    var row=document.createElement('div');
+    row.className='model-item'+(v.voice===_ttsSelectedVoice?' active':'');
+    row.setAttribute('data-name',v.voice);
+    row.title='Use '+v.voice;
+    var nm=document.createElement('span');nm.className='model-name';nm.textContent=v.voice;
+    var ct=document.createElement('span');ct.className='tts-voice-count';
+    ct.textContent=v.hosts;
+    ct.title='about '+v.hosts+' host'+(v.hosts===1?'':'s')+' can produce this voice';
+    row.appendChild(nm);row.appendChild(ct);
+    row.addEventListener('click',function(){
+      _setTtsVoice(_ttsSelectedVoice===v.voice?'':v.voice);   // click the picked one again to clear
+    });
+    frag.appendChild(row);
+  });
+  list.appendChild(frag);
+}
+// The voice actually sent is the one you CLICK, not the filter text — it persists through
+// filtering and is shown next to the "Voice" label. Empty -> host default.
+function _setTtsVoice(voice){
+  _ttsSelectedVoice=voice||'';
+  var pick=document.getElementById('ttsVoicePick');
+  if(pick){
+    pick.textContent='';
+    if(_ttsSelectedVoice){
+      pick.appendChild(document.createTextNode('— '+_ttsSelectedVoice+' '));
+      var x=document.createElement('span');x.className='tts-pick-x';x.textContent='✕';
+      x.title='clear — use the host default voice';
+      x.addEventListener('click',function(){_setTtsVoice('');});
+      pick.appendChild(x);
+    }
+  }
+  var list=document.getElementById('ttsVoiceList');
+  if(list)Array.prototype.forEach.call(list.querySelectorAll('.model-item'),function(r){
+    r.classList.toggle('active',r.getAttribute('data-name')===_ttsSelectedVoice);
+  });
 }
 async function generateSpeech(){
   var btn=document.getElementById('ttsGenerate'),out=document.getElementById('ttsResult');
   var text=document.getElementById('ttsText').value.trim();
   if(!text){_mediaError(out,"there's nothing to say — type some text");return}
   var body={input:text};
-  var v=document.getElementById('ttsVoice').value.trim();if(v)body.voice=v;
+  if(_ttsSelectedVoice)body.voice=_ttsSelectedVoice;   // the CLICKED voice, never the filter text
   btn.disabled=true;
   out.innerHTML='';
   showSnack('finding a TTS host\u2026');
