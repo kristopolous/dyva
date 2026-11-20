@@ -17289,8 +17289,10 @@ def _find_openai_tts_hosts(voice=None):
     a thumbs-down on one of these sinks it like any other host.
 
     Returns entries (host, service, model, voices) for the race; `host_of` is
-    entry[0]. A requested voice doesn't reorder here — these hosts each carry
-    their own voice catalog, resolved per-host at request time."""
+    entry[0]. A named voice is honored here, not silently dropped: the entry set is
+    narrowed to hosts that can actually produce that voice (see the filter below), so
+    the race can't land on a passthrough host that would substitute a default/cloned
+    voice. An unnamed voice leaves every passthrough host in play."""
     marks = load_marks()
     tkey = tts_key(None)
     last = get_last(tkey)
@@ -17306,12 +17308,22 @@ def _find_openai_tts_hosts(voice=None):
             continue
         entries.append((host, svc, model, s.get("voices") or []))
 
-    # A curated catalog voice is produced by CLONING a reference wav, which only fish
-    # hosts do. Restrict to them so the race can't land on a chatterbox host that would
-    # silently substitute its own first voice (the wrong-voice bug). A host-advertised
-    # or blank voice leaves every OpenAI-TTS host in play.
-    if voice and _resolve_voice(voice, load_voice_catalog()):
-        entries = [e for e in entries if e[1] == "fish"]
+    # Route the named voice to a passthrough host that can actually produce it, and NEVER
+    # force the slow ComfyUI graph for it:
+    #   - a curated catalog voice is a fish CLONE -> fish hosts only;
+    #   - any other named voice -> prefer passthrough hosts that advertise it (a chatterbox/
+    #     localai voice table that has it); if none is known, any non-fish passthrough host
+    #     (chatterbox/localai carry named voices; fish only clones). Chatterbox stays the
+    #     fast path for its own named voices (Dylan, etc.).
+    # A blank voice leaves every passthrough host in play.
+    if voice:
+        if _resolve_voice(voice, load_voice_catalog()):
+            entries = [e for e in entries if e[1] == "fish"]
+        else:
+            advertisers = [e for e in entries
+                           if any(isinstance(v, str) and voice_query_match(voice, v)
+                                  for v in e[3])]
+            entries = advertisers or [e for e in entries if e[1] != "fish"]
 
     def rank(e):
         h = e[0]

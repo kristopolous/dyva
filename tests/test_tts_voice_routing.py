@@ -56,11 +56,15 @@ def test_ordering_voiced_before_unknown_before_voiceless():
     assert order == ["voiced", "unknown", "voiceless"]
 
 
-# --- a curated catalog voice is fish-clone-only -----------------------------
-# Catalog voices (en-US_f_jodi) are produced by CLONING a reference wav, which only
-# fish hosts do. If the OpenAI-TTS race is allowed to land on a chatterbox host it
-# silently substitutes its own first voice (the wrong-voice bug). So when the named
-# voice resolves to the catalog, _find_openai_tts_hosts restricts to fish hosts.
+# --- _find_openai_tts_hosts routes the OpenAI-passthrough race by voice -----
+# A named voice goes to a PASSTHROUGH host that can produce it (fast), never forced onto
+# the slow ComfyUI graph:
+#   - a curated catalog voice (en-US_f_jodi) is a fish CLONE -> fish hosts only;
+#   - a chatterbox named voice (Dylan/Abigail) -> the chatterbox host that advertises it;
+#     fish (clone-only) is dropped. Chatterbox stays the fast path for its own voices;
+#   - a named voice nobody advertises -> any non-fish passthrough host (chatterbox/localai
+#     carry named voices), still fast, never comfy;
+#   - no voice -> every passthrough host is in play.
 
 def _neutral(monkeypatch):
     monkeypatch.setattr(dyva, "load_marks", lambda: {})
@@ -68,35 +72,43 @@ def _neutral(monkeypatch):
     monkeypatch.setattr(dyva, "rerank_scores", lambda: {})
     monkeypatch.setattr(dyva, "capability_tier", lambda *a, **k: 0)
     monkeypatch.setattr(dyva, "_idle_first", lambda hs: hs)
+    monkeypatch.setattr(dyva, "load_voice_catalog", lambda: [{"id": "en-US_f_jodi"}])
 
 
-OAI_SERVERS = [{"server": "fish1", "service": "fish", "models": ["fish"]},
-               {"server": "cb1", "service": "chatterbox", "models": ["chatterbox"]}]
+OAI_SERVERS = [
+    {"server": "fish1", "service": "fish", "models": ["fish"], "voices": []},
+    {"server": "cb1", "service": "chatterbox", "models": ["chatterbox"],
+     "voices": ["Abigail.wav", "Adrian.wav", "Dylan.wav"]},
+    {"server": "cb2", "service": "chatterbox", "models": ["chatterbox"],
+     "voices": ["Serena.wav"]}]
 
 
 def test_catalog_voice_restricts_to_fish_hosts(monkeypatch):
     _neutral(monkeypatch)
     monkeypatch.setattr(dyva, "load_servers", lambda: OAI_SERVERS)
-    monkeypatch.setattr(dyva, "load_voice_catalog", lambda: [{"id": "en-US_f_jodi"}])
-    hosts = dyva._find_openai_tts_hosts("en-US_f_jodi")
-    assert [h[0] for h in hosts] == ["fish1"]         # chatterbox can't clone it
+    assert [h[0] for h in dyva._find_openai_tts_hosts("en-US_f_jodi")] == ["fish1"]
 
 
-def test_non_catalog_voice_keeps_all_openai_hosts(monkeypatch):
+def test_named_voice_goes_to_the_chatterbox_host_that_has_it(monkeypatch):
+    # "Dylan" is a chatterbox voice -> the chatterbox host advertising it, FAST (no comfy).
+    # fish (clone-only) and the other chatterbox (wrong catalog) are excluded.
     _neutral(monkeypatch)
     monkeypatch.setattr(dyva, "load_servers", lambda: OAI_SERVERS)
-    monkeypatch.setattr(dyva, "load_voice_catalog", lambda: [{"id": "en-US_f_jodi"}])
-    # "Abigail" is a chatterbox voice, not in the catalog -> no fish restriction
-    hosts = dyva._find_openai_tts_hosts("Abigail")
-    assert set(h[0] for h in hosts) == {"fish1", "cb1"}
+    assert [h[0] for h in dyva._find_openai_tts_hosts("Dylan")] == ["cb1"]
 
 
-def test_no_voice_named_keeps_all_openai_hosts(monkeypatch):
+def test_unadvertised_named_voice_falls_back_to_non_fish_passthrough(monkeypatch):
+    # a voice no table lists -> still served by the passthrough path (chatterbox hosts),
+    # never forced to comfy; fish dropped (it can't honour a named voice).
     _neutral(monkeypatch)
     monkeypatch.setattr(dyva, "load_servers", lambda: OAI_SERVERS)
-    monkeypatch.setattr(dyva, "load_voice_catalog", lambda: [{"id": "en-US_f_jodi"}])
-    hosts = dyva._find_openai_tts_hosts(None)
-    assert set(h[0] for h in hosts) == {"fish1", "cb1"}
+    assert set(h[0] for h in dyva._find_openai_tts_hosts("Nonexistent")) == {"cb1", "cb2"}
+
+
+def test_no_voice_named_keeps_all_passthrough_hosts(monkeypatch):
+    _neutral(monkeypatch)
+    monkeypatch.setattr(dyva, "load_servers", lambda: OAI_SERVERS)
+    assert set(h[0] for h in dyva._find_openai_tts_hosts(None)) == {"fish1", "cb1", "cb2"}
 
 
 if __name__ == "__main__":
