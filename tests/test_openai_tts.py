@@ -96,6 +96,40 @@ def test_fish_is_always_a_tts_model():
     assert dyva._openai_tts_model({"service": "fish"}) == "fish"
 
 
+# --- models shape tolerance -------------------------------------------------
+# load_servers() normalizes every record's `models` to canonical Form A (a dict
+# {name: {caps:[...]}}). _openai_tts_model must read through that like the rest of
+# dyva (model_names) — a raw models[0] on the dict raised KeyError: 0 and 500'd the
+# WHOLE /v1/audio/speech request (the crash took out host discovery, so no host ran).
+
+def test_chatterbox_model_from_form_a_dict():
+    # the regression: post-normalization models is a dict, not a list.
+    s = {"service": "chatterbox", "models": {"ChatterboxTTS": {"caps": []}}}
+    assert dyva._openai_tts_model(s) == "ChatterboxTTS"
+
+
+def test_chatterbox_model_from_legacy_list():
+    # pre-normalization / graflex-fresh shape still works (back-compat).
+    assert dyva._openai_tts_model(
+        {"service": "chatterbox", "models": ["ChatterboxTTS"]}) == "ChatterboxTTS"
+
+
+def test_chatterbox_with_empty_or_missing_models_defaults():
+    # no advertised model -> the literal the request body sends anyway.
+    assert dyva._openai_tts_model({"service": "chatterbox", "models": {}}) == "chatterbox"
+    assert dyva._openai_tts_model({"service": "chatterbox"}) == "chatterbox"
+
+
+def test_localai_tts_model_found_in_form_a_dict():
+    # localai qualifies on a TTS-looking model name, dict shape included.
+    s = {"service": "localai", "models": {"gpt-4": {}, "tts-1": {"caps": []}}}
+    assert dyva._openai_tts_model(s) == "tts-1"
+
+
+def test_localai_without_a_tts_model_is_none():
+    assert dyva._openai_tts_model({"service": "localai", "models": {"gpt-4": {}}}) is None
+
+
 if __name__ == "__main__":
     import pytest
     raise SystemExit(pytest.main([__file__, "-v"]))

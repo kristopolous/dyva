@@ -17231,13 +17231,18 @@ _OPENAI_TTS_MODEL_RE = re.compile(
 
 def _openai_tts_model(server):
     """The TTS model id a host advertises, or None. chatterbox is always TTS;
-    a localai host qualifies only when one of its models looks like a TTS model."""
+    a localai host qualifies only when one of its models looks like a TTS model.
+
+    Reads names through model_names(), which is tolerant of every `models` shape:
+    load_servers() normalizes records to canonical Form A (a dict {name: {caps}}),
+    so a raw models[0] / list iteration here saw a dict and raised KeyError: 0,
+    500ing the whole /v1/audio/speech request before any host was tried."""
     if server.get("service") == "chatterbox":
-        models = server.get("models") or []
-        return models[0] if models else "chatterbox"
+        names = model_names(server)
+        return names[0] if names else "chatterbox"
     if server.get("service") == "fish":
         return "fish"   # fishaudio hosts are always TTS (bare /v1/tts)
-    for m in server.get("models") or []:
+    for m in model_names(server):
         if isinstance(m, str) and _OPENAI_TTS_MODEL_RE.search(m):
             return m
     return None
