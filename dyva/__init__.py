@@ -22597,13 +22597,52 @@ def make_app():
             app.router.add_get("/demos/", _serve_demos_index)
         app.router.add_static("/demos", demos_dir, show_index=True)
 
-    # Serve the repo's docs/ (reference docs, the query-syntax cheat sheet, …) at /docs/.
-    # Registered BEFORE the "/" catch-all so /docs/* resolves here; show_index lists the
-    # directory for browsing. Guarded so a package install without an adjacent docs/ dir
-    # doesn't fail startup.
+    # Serve the FLAT files in the repo's docs/ at /docs/ (reference docs + the query-syntax
+    # cheat sheet) — top-level files ONLY, never the subdirs (superpowers specs, video
+    # assets). Custom routes, not add_static, so the subdir trees can't be walked and no
+    # path traversal escapes docs/. Registered before the "/" catch-all. Guarded so a
+    # package install without an adjacent docs/ dir doesn't fail startup.
     docs_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "docs")
     if os.path.isdir(docs_dir):
-        app.router.add_static("/docs", docs_dir, show_index=True)
+        _docs_root = os.path.realpath(docs_dir)
+
+        def _docs_esc(s):
+            return (s.replace("&", "&amp;").replace("<", "&lt;")
+                     .replace(">", "&gt;").replace('"', "&quot;"))
+
+        def _docs_files():
+            return sorted(f for f in os.listdir(_docs_root)
+                          if not f.startswith(".")
+                          and os.path.isfile(os.path.join(_docs_root, f)))
+
+        async def _docs_index(request):
+            rows = "".join('<li><a href="%s">%s</a></li>' % (_docs_esc(f), _docs_esc(f))
+                           for f in _docs_files())
+            body = ("<!doctype html><meta charset=utf-8>"
+                    "<meta name=viewport content='width=device-width,initial-scale=1'>"
+                    "<title>dyva docs</title><style>body{font:15px/1.65 system-ui,sans-serif;"
+                    "max-width:40em;margin:3em auto;padding:0 1.2em;color:#1b2130}"
+                    "h1{font-size:1.3em}a{color:#5a4bd6;text-decoration:none}"
+                    "a:hover{text-decoration:underline}"
+                    "@media(prefers-color-scheme:dark){body{background:#0e1017;color:#e6eaf3}"
+                    "a{color:#9a8cff}}</style><h1>dyva docs</h1><ul>%s</ul>" % rows)
+            return web.Response(text=body, content_type="text/html")
+
+        async def _docs_file(request):
+            name = request.match_info["name"]
+            path = os.path.realpath(os.path.join(_docs_root, name))
+            # a regular file sitting DIRECTLY in docs/ — no subdirs, no "." entries, no ".."
+            if ("/" in name or name.startswith(".")
+                    or os.path.dirname(path) != _docs_root
+                    or not os.path.isfile(path)):
+                return web.Response(status=404, text="not found")
+            return web.FileResponse(path, headers={"Cache-Control": "no-cache"})
+
+        async def _docs_redirect(request):
+            raise web.HTTPFound("docs/")   # relative — survives a reverse-proxy path prefix
+        app.router.add_get("/docs", _docs_redirect)
+        app.router.add_get("/docs/", _docs_index)
+        app.router.add_get("/docs/{name}", _docs_file)
 
     static_dir = os.path.join(os.path.dirname(__file__), "static")
     app.router.add_static("/", static_dir, show_index=False)

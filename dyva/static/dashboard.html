@@ -1770,6 +1770,11 @@ body.dragging-image .hist-item{cursor:grabbing}
 <div id="ttsResult" class="media-result"></div>
 <div class="img-side-title">Recent</div>
 <div id="ttsGallery" class="media-gallery"></div>
+<div id="ttsHistPager" class="img-pager" style="display:none">
+  <button type="button" id="ttsHistPrev" class="pager-btn" title="Newer">&#8249;</button>
+  <span id="ttsHistPageInfo" class="pager-info"></span>
+  <button type="button" id="ttsHistNext" class="pager-btn" title="Older">&#8250;</button>
+</div>
 </div>
 </div>
 </div>
@@ -9382,9 +9387,24 @@ function loadTtsHistory(){
       _renderTtsHistory(el,merged);
     });
 }
+// The Recent gallery pages the same way the image history does (IMG_PAGE_SIZE/_imgPage):
+// server clips + local can run to a hundred-plus, so only one page of cards is in the DOM.
+var TTS_HIST_PAGE_SIZE=36,_ttsHistPage=0,_ttsHist=[];
+// Fresh data (a reload, or a clip this tab just made) enters here and snaps to the newest
+// page; the pager below the gallery walks the rest with no refetch (see _paintTtsHistory).
 function _renderTtsHistory(el,hist){
+  _ttsHist=hist||[];_ttsHistPage=0;_paintTtsHistory();
+}
+function _paintTtsHistory(){
+  var el=document.getElementById('ttsGallery');
+  if(!el)return;
+  var hist=_ttsHist,pager=document.getElementById('ttsHistPager');
+  var pages=Math.max(1,Math.ceil(hist.length/TTS_HIST_PAGE_SIZE));
+  if(_ttsHistPage>pages-1)_ttsHistPage=pages-1;
+  if(_ttsHistPage<0)_ttsHistPage=0;
+  var from=_ttsHistPage*TTS_HIST_PAGE_SIZE,to=Math.min(from+TTS_HIST_PAGE_SIZE,hist.length);
   el.innerHTML='';
-  hist.forEach(function(e){
+  hist.slice(from,to).forEach(function(e){
     var item=document.createElement('div');
     item.className='tts-item';
     var au=_mediaPlayer(e.url);
@@ -9434,7 +9454,22 @@ function _renderTtsHistory(el,hist){
     item.appendChild(del);
     el.appendChild(item);
   });
+  if(pager){
+    pager.style.display=hist.length>TTS_HIST_PAGE_SIZE?'flex':'none';
+    document.getElementById('ttsHistPageInfo').textContent=
+      hist.length?((from+1)+'–'+to+' of '+hist.length):'none';
+    document.getElementById('ttsHistPrev').disabled=_ttsHistPage<=0;
+    document.getElementById('ttsHistNext').disabled=_ttsHistPage>=pages-1;
+  }
 }
+function ttsHistPageBy(d){
+  _ttsHistPage+=d;
+  _paintTtsHistory();
+  var g=document.getElementById('ttsGallery');
+  if(g&&g.scrollIntoView)g.scrollIntoView({block:'nearest'});
+}
+document.getElementById('ttsHistPrev').addEventListener('click',function(){ttsHistPageBy(-1)});
+document.getElementById('ttsHistNext').addEventListener('click',function(){ttsHistPageBy(1)});
 
 // ---- video ---------------------------------------------------------------
 // Async: POST returns 202 + an id, then poll until completed/failed.
