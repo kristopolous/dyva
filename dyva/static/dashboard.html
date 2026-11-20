@@ -9238,7 +9238,7 @@ async function generateSpeech(){
     out.appendChild(a);
     // save to local history for gallery
     var clip=r.headers.get('X-Dyva-File')||'';
-    _ttsRemember({text:text.slice(0,200),voice:v||'default',model:m||'auto',
+    _ttsRemember({text:text.slice(0,200),voice:v||'default',model:'auto',
                   host:provHost,node:provNode,ts:Date.now(),
                   url:clip?'v1/audio/clips/'+clip:url});
   }catch(ex){_mediaError(out,ex.message)}
