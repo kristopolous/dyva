@@ -1756,7 +1756,8 @@ body.dragging-image .hist-item{cursor:grabbing}
 <div class="studio-sep"></div>
 <div class="field">
 <label for="ttsVoice">Voice</label>
-<input id="ttsVoice" type="text" placeholder="host default" autocomplete="off">
+<input id="ttsVoice" type="text" list="ttsVoices" placeholder="host default" autocomplete="off">
+<datalist id="ttsVoices"></datalist>
 </div>
 <button id="ttsGenerate" class="studio-go">Speak</button>
 </div>
@@ -8827,7 +8828,7 @@ function attachPicker(inputId,listId){
     }else if(e.key==='Escape'){close()}
   });
 }
-['sdModel:sdModels','editModel:editModels','vidModel:vidModels']
+['sdModel:sdModels','editModel:editModels','vidModel:vidModels','ttsVoice:ttsVoices']
   .forEach(function(pair){var p=pair.split(':');attachPicker(p[0],p[1])});
 
 var _editModelsLoaded=false;
@@ -9179,6 +9180,17 @@ function loadTtsVoices(){
     inp.placeholder=vs.length
       ? (vs.length+' voices from '+hosts+' host'+(hosts===1?'':'s'))
       : 'host default';
+    // Feed the typeahead picker (attachPicker reads this datalist) so typing in the
+    // Voice field surfaces matching voices — same widget the image/video model fields use.
+    var dl=document.getElementById('ttsVoices');
+    if(dl){
+      dl.innerHTML='';
+      vs.forEach(function(v){
+        var o=document.createElement('option');
+        o.value=v.voice;o.label=v.hosts+' host'+(v.hosts===1?'':'s');
+        dl.appendChild(o);
+      });
+    }
     // the scannable, popularity-sorted list — voice + host count, click to pick,
     // same idea as the models panel
     var list=document.getElementById('ttsVoiceList');
