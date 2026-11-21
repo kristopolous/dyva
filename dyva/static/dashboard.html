@@ -1391,6 +1391,17 @@ body.dragging-image .hist-item{cursor:grabbing}
 .tts-pick{font-family:var(--font-mono);font-size:var(--fs-sm);color:var(--accent);font-weight:600}
 .tts-pick .tts-pick-x{color:var(--text-faint);cursor:pointer;font-weight:400}
 .tts-pick .tts-pick-x:hover{color:var(--err)}
+/* Add-voice: upload a clip that fish can clone. Sits under the voice list. */
+.tts-addvoice{margin-top:var(--sp-3);display:flex;flex-direction:column;gap:var(--sp-2)}
+.tts-addvoice-lead{font-size:var(--fs-xs);color:var(--text-dim)}
+.tts-addvoice-row{display:flex;gap:var(--sp-2);align-items:stretch;flex-wrap:wrap}
+.tts-addvoice-name{flex:1;min-width:120px}
+.tts-addvoice-file{display:inline-flex;align-items:center;padding:var(--sp-3) var(--sp-3);border:1px solid var(--border);border-radius:var(--r-md);background:var(--surface);color:var(--text-2);font-size:var(--fs-md);cursor:pointer;white-space:nowrap}
+.tts-addvoice-file:hover{background:var(--accent-bg);color:var(--text)}
+.tts-addvoice-file.has-file{color:var(--accent);border-color:var(--border-accent)}
+.tts-addvoice-status{font-size:var(--fs-xs);min-height:1em}
+.tts-addvoice-status.err{color:var(--err)}
+.tts-addvoice-status.ok{color:var(--accent)}
 .hist-item{position:relative;display:flex;gap:10px;align-items:center;cursor:zoom-in;border:1px solid var(--border);border-radius:var(--r-lg);padding:var(--sp-2);background:var(--bg-sunken-alt)}
 .hist-item:hover{border-color:var(--border-accent)}
 .hist-del{position:absolute;top:2px;right:var(--sp-1);color:var(--border-hover);cursor:pointer;font-size:var(--fs-xs);line-height:1;padding:2px 5px;border-radius:var(--r-sm);z-index:2}
@@ -1763,6 +1774,15 @@ body.dragging-image .hist-item{cursor:grabbing}
 <label for="ttsVoice">Voice <span id="ttsVoicePick" class="tts-pick"></span></label>
 <input id="ttsVoice" type="text" placeholder="host default" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" oninput="renderTtsVoiceList(this.value)">
 <div id="ttsVoiceList" class="modellist tts-voicelist"></div>
+<div class="tts-addvoice">
+<span class="tts-addvoice-lead">Add a voice — upload a short clip, fish can clone it:</span>
+<div class="tts-addvoice-row">
+<input id="ttsAddName" type="text" class="tts-addvoice-name" placeholder="voice name" autocomplete="off" spellcheck="false">
+<label class="tts-addvoice-file" title="choose an audio clip"><input id="ttsAddFile" type="file" accept="audio/*" hidden><span id="ttsAddFileLabel">Choose audio…</span></label>
+<button id="ttsAddBtn" type="button" class="pager-btn">Add</button>
+</div>
+<span id="ttsAddStatus" class="tts-addvoice-status"></span>
+</div>
 </div>
 <button id="ttsGenerate" class="studio-go">Speak</button>
 </div>
@@ -9254,6 +9274,47 @@ function _setTtsVoice(voice){
     r.classList.toggle('active',r.getAttribute('data-name')===_ttsSelectedVoice);
   });
 }
+// Add-voice: POST the clip to /v1/audio/voices (multipart). On success reload the voice
+// list so the new voice shows and auto-select it. The Voice field stays filter-only.
+(function(){
+  var fileInp=document.getElementById('ttsAddFile'),
+      fileLbl=document.getElementById('ttsAddFileLabel'),
+      fileBox=document.querySelector('.tts-addvoice-file'),
+      nameInp=document.getElementById('ttsAddName'),
+      btn=document.getElementById('ttsAddBtn'),
+      stat=document.getElementById('ttsAddStatus');
+  if(!fileInp||!btn)return;
+  function setStat(msg,kind){stat.textContent=msg||'';stat.className='tts-addvoice-status'+(kind?' '+kind:'');}
+  function resetFile(){fileInp.value='';fileLbl.textContent='Choose audio…';if(fileBox)fileBox.classList.remove('has-file');}
+  fileInp.addEventListener('change',function(){
+    var f=fileInp.files&&fileInp.files[0];
+    fileLbl.textContent=f?f.name:'Choose audio…';
+    if(fileBox)fileBox.classList.toggle('has-file',!!f);
+    if(f&&!nameInp.value)nameInp.value=f.name.replace(/\.[^.]+$/,'');   // prefill name from filename
+  });
+  btn.addEventListener('click',function(){
+    var f=fileInp.files&&fileInp.files[0];
+    if(!f){setStat('pick an audio clip first','err');return}
+    var fd=new FormData();
+    fd.append('file',f);
+    if(nameInp.value.trim())fd.append('name',nameInp.value.trim());
+    btn.disabled=true;setStat('uploading…');
+    fetch('v1/audio/voices',{method:'POST',body:fd}).then(function(r){
+      return r.json().catch(function(){return {}}).then(function(j){return {ok:r.ok,j:j}});
+    }).then(function(res){
+      btn.disabled=false;
+      if(!res.ok||!res.j||res.j.error){
+        setStat((res.j&&res.j.error&&(res.j.error.message||res.j.error))||'upload failed','err');
+        return;
+      }
+      var v=res.j.voice;
+      setStat('added “'+v+'”','ok');
+      resetFile();nameInp.value='';
+      _ttsVoicesLoaded=false;loadTtsVoices();   // refetch so the new voice lists
+      _setTtsVoice(v);                          // and select it (marked active on re-render)
+    }).catch(function(){btn.disabled=false;setStat('upload failed','err');});
+  });
+})();
 async function generateSpeech(){
   var btn=document.getElementById('ttsGenerate'),out=document.getElementById('ttsResult');
   var text=document.getElementById('ttsText').value.trim();

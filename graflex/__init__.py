@@ -3706,10 +3706,16 @@ def synthetic_digest_catalog(payload):
     if any(_synthetic_digest(h) for h in hexes):
         return True
     # 32 hex = 16 bytes: two independent sha256 colliding on a run this long is ~2**-128,
-    # so a shared run means both were cut from one generated sequence (byte-shifted copies).
-    for i in range(len(hexes)):
-        for j in range(i + 1, len(hexes)):
-            if _shares_run(hexes[i], hexes[j], 32):
+    # so a shared run between DISTINCT digests means both were cut from one generated
+    # sequence (byte-shifted copies). Compare distinct digests only: a real host that
+    # `ollama cp`'d one model to several names, or has `latest` aliasing a concrete tag,
+    # lists the SAME genuine digest repeatedly — an identical pair is one real blob, not a
+    # costume, and feeding those duplicates to the pairwise check condemned ordinary hosts
+    # wholesale (15.204.174.89, ollama.itm.uni-luebeck.de and many more, 2026-11-21).
+    uniq = sorted(set(hexes))
+    for i in range(len(uniq)):
+        for j in range(i + 1, len(uniq)):
+            if _shares_run(uniq[i], uniq[j], 32):
                 return True
     return False
 

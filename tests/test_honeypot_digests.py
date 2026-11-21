@@ -72,6 +72,33 @@ def test_real_catalog_is_not_flagged():
     assert not graflex.synthetic_digest_catalog(payload)
 
 
+def test_aliased_duplicate_digests_are_not_flagged():
+    # A real host that `ollama cp`'d one model to several names, or has `latest` aliasing
+    # a concrete tag, reports the SAME genuine sha256 under multiple names. Identical
+    # digests are one real blob, not the byte-shifted copies a costume mints — the
+    # cross-digest run check must compare DISTINCT digests only. (Live false positives
+    # 2026-11-21: 15.204.174.89, ollama.itm.uni-luebeck.de and many more real ollama
+    # hosts evicted as honeypots purely for `ollama cp` / `latest` aliases.)
+    reals = _real_digests(12)
+    dup = reals[0]
+    aliased = [{"name": n, "digest": dup}
+               for n in ("llama3.2:latest", "llama3.2:3b", "mymodel:latest")]
+    rest = [{"name": f"m{i}", "digest": d} for i, d in enumerate(reals[1:])]
+    assert not graflex.synthetic_digest_catalog({"models": aliased + rest})
+
+
+def test_flag_synthetic_digests_absent_for_aliased_real_host():
+    # Same false positive, through the pipeline the gate actually uses.
+    reals = _real_digests(10)
+    dup = reals[0]
+    raw = {"models": [{"name": n, "digest": dup}
+                      for n in ("a:latest", "a:7b", "a-copy:latest")]
+                     + [{"name": f"m{i}", "digest": d} for i, d in enumerate(reals[1:])]}
+    result = {"service": "ollama", "models": graflex._filter_models(raw["models"])}
+    assert graflex._flag_synthetic_digests(result, raw) is False
+    assert "honeypot_digests" not in result
+
+
 def test_openai_payload_without_digests_is_not_flagged():
     # /v1/models (openai/vllm) carries no digests; this signal must not fire there.
     payload = {"object": "list", "data": [{"id": "llama3:8b"}, {"id": "qwen2.5:72b"}]}

@@ -17034,6 +17034,105 @@ def _fish_reference_body(input_text, ref_audio):
             "format": "wav"}
 
 
+# --- adding a voice by upload ----------------------------------------------
+# A user drops an audio clip on the Speech pane; it lands in the WRITABLE drop-in
+# (CACHE_DIR/voices) as an ordinary catalog voice and is cloned by fish through the
+# normal reference-audio path. No routing changes — the catalog already feeds both the
+# voices list (_catalog_voice_rows) and fish cloning (_voice_reference_audio).
+_VOICE_AUDIO_EXTS = {"wav", "mp3", "m4a", "ogg", "oga", "opus", "flac", "aac", "webm", "aiff", "wma"}
+MAX_VOICE_UPLOAD = 25 * 1024 * 1024        # a reference clip is short; cap the public upload
+
+
+def _safe_voice_id(name):
+    """A user-supplied voice name turned into a catalog id that is also a safe
+    filename stem: path components stripped, only [A-Za-z0-9._-] kept, repeats
+    collapsed, length capped. Empty/garbage -> "voice" (the caller makes it unique)."""
+    base = os.path.basename(str(name or "")).strip()
+    base = re.sub(r"[^A-Za-z0-9._-]+", "_", base)
+    base = re.sub(r"_{2,}", "_", base).strip("._-")[:64].strip("._-")
+    return base or "voice"
+
+
+def _unique_voice_id(base, existing):
+    """`base` if free, else base-2, base-3, … — so an upload never shadows an
+    existing catalog id (a shipped CC0 voice or someone else's earlier upload)."""
+    existing = set(existing or ())
+    if base not in existing:
+        return base
+    i = 2
+    while f"{base}-{i}" in existing:
+        i += 1
+    return f"{base}-{i}"
+
+
+def _transcode_to_wav(data, src_ext):
+    """Opportunistically convert arbitrary audio bytes to 24kHz mono wav via ffmpeg.
+    Returns wav bytes, or None when the input is already wav, ffmpeg is absent, or the
+    conversion fails — the caller then stores the original bytes as-is (best effort, per
+    the 'convert if we can' contract). Runs ffmpeg in a temp dir; never raises."""
+    import tempfile
+    if not data:
+        return None
+    if str(src_ext or "").lower().lstrip(".") == "wav":
+        return None
+    ff = shutil.which("ffmpeg")
+    if not ff:
+        return None
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            ext = src_ext if str(src_ext).startswith(".") else "." + str(src_ext or "bin")
+            ipath = os.path.join(td, "in" + ext)
+            opath = os.path.join(td, "out.wav")
+            with open(ipath, "wb") as fh:
+                fh.write(data)
+            r = subprocess.run([ff, "-nostdin", "-y", "-i", ipath, "-ar", "24000",
+                                "-ac", "1", opath], capture_output=True, timeout=60)
+            if r.returncode != 0 or not os.path.exists(opath):
+                return None
+            with open(opath, "rb") as fh:
+                return fh.read()
+    except Exception:
+        return None
+
+
+def _add_catalog_voice(name, data, src_ext="wav"):
+    """Write an uploaded clip into the drop-in voices dir and append a catalog.json
+    entry, returning that entry. Converts to wav when ffmpeg is available, else keeps
+    the original bytes. The id is made unique against the whole merged catalog so a new
+    upload never clobbers a shipped or earlier voice. Raises ValueError on empty audio."""
+    if not data:
+        raise ValueError("empty audio")
+    dropin = os.path.join(CACHE_DIR, "voices")
+    os.makedirs(dropin, exist_ok=True)
+    wav = _transcode_to_wav(data, src_ext)
+    if wav:
+        data, ext = wav, "wav"
+    else:
+        ext = str(src_ext or "wav").lower().lstrip(".") or "wav"
+    existing = {e["id"] for e in load_voice_catalog()}
+    dropin_cat = _load_dropin_catalog(dropin)
+    existing |= {str(e.get("id")) for e in dropin_cat if e.get("id")}
+    vid = _unique_voice_id(_safe_voice_id(name), existing)
+    fname = f"{vid}.{ext}"
+    with open(os.path.join(dropin, fname), "wb") as fh:
+        fh.write(data)
+    entry = {"id": vid, "file": fname, "source": "upload",
+             "added": datetime.datetime.now().isoformat(timespec="seconds")}
+    dropin_cat.append(entry)
+    _save_json_atomic(os.path.join(dropin, "catalog.json"), dropin_cat)
+    return entry
+
+
+def _load_dropin_catalog(dropin):
+    """The drop-in dir's catalog.json as a list (missing/garbled -> [])."""
+    try:
+        with open(os.path.join(dropin, "catalog.json")) as fh:
+            cat = json.load(fh)
+        return cat if isinstance(cat, list) else []
+    except Exception:
+        return []
+
+
 _OPENAI_TTS_SERVICES = {"chatterbox", "localai", "fish"}
 
 
@@ -20106,6 +20205,19 @@ async def handle_tts_speech(request):
     # they're not a fallback here. Fail clean if no fish host is up rather than deliver
     # the wrong voice — "the user shouldn't have to care" means we pick right or say so.
     is_catalog = bool(voice and not target and _resolve_voice(voice, load_voice_catalog()))
+    # Cloning ships the reference wav to fish as a msgpack body. Without the optional
+    # msgpack package the reference is silently dropped and fish speaks each host's OWN
+    # default voice — a different random voice every race ("I asked for bm_george and got
+    # a child, then an Indian man"). Refuse up front with the fix rather than deliver
+    # nonsense. (Plain host-voice requests don't clone, so they're unaffected.)
+    if is_catalog and _msgpack is None:
+        log.warning("voice %r needs cloning but msgpack isn't installed — refusing rather "
+                    "than return a random host-default voice; install the 'voice' extra "
+                    "(pip install msgpack) and restart dyva", voice)
+        return web.json_response(
+            {"error": f"'{voice}' is a cloned voice, but this dyva can't clone: the msgpack "
+                      f"package isn't installed. Install it (pip install msgpack) and "
+                      f"restart dyva."}, status=503)
     hosts = [] if is_catalog else _find_tts_hosts(
         target, str(body.get("model") or "").strip() or None, voice=voice)
     # OpenAI-compatible TTS hosts (LocalAI, Chatterbox, Fish): clean voiced speech by
@@ -20367,6 +20479,70 @@ async def handle_audio_voices(request):
                 "checked": sub[h].get("checked")} for h in hosts if h in sub]
     return web.json_response({"voices": voices, "hosts": details,
                               "surveying": len(stale) if not force else 0})
+
+
+async def handle_add_voice(request):
+    """
+    Add a voice by uploading a reference clip
+    ---
+    tags: [Audio]
+    summary: POST /v1/audio/voices — upload an audio clip as a new catalog voice
+    description: |
+      multipart/form-data with an audio `file` (and optional `name`). The clip is
+      stored in the writable voices drop-in and appended to the catalog — converted to
+      wav when ffmpeg is available, otherwise kept as-is. It then appears in GET
+      /v1/audio/voices and is cloneable by the fish pool through the normal
+      reference-audio path.
+    responses:
+      '200': {description: The new voice}
+      '400': {description: No audio uploaded}
+      '413': {description: Upload too large}
+    """
+    resp = await _check_local(request)
+    if resp:
+        return resp
+    try:
+        reader = await request.multipart()
+    except Exception:
+        return web.json_response(err_obj("expected multipart/form-data"), status=400)
+    name, stem, data, src_ext = "", "", b"", "wav"
+    while True:
+        part = await reader.next()
+        if part is None:
+            break
+        if part.name == "name":
+            name = (await part.text()).strip()
+        elif part.name in ("file", "audio", "voice"):
+            fn = os.path.basename(part.filename or "")
+            stem = os.path.splitext(fn)[0]
+            ext = os.path.splitext(fn)[1].lower().lstrip(".")
+            if ext in _VOICE_AUDIO_EXTS:
+                src_ext = ext
+            buf = bytearray()
+            while True:
+                chunk = await part.read_chunk()
+                if not chunk:
+                    break
+                buf += chunk
+                if len(buf) > MAX_VOICE_UPLOAD:
+                    return web.json_response(
+                        err_obj(f"audio too large (max {MAX_VOICE_UPLOAD // (1024 * 1024)} MB)"),
+                        status=413)
+            data = bytes(buf)
+    if not data:
+        return web.json_response(err_obj("no audio uploaded"), status=400)
+    if not name:
+        name = stem or "voice"
+    try:
+        entry = await asyncio.get_event_loop().run_in_executor(
+            None, _add_catalog_voice, name, data, src_ext)
+    except ValueError as e:
+        return web.json_response(err_obj(str(e)), status=400)
+    except Exception as e:
+        log.warning(f"add voice failed: {e}")
+        return web.json_response(err_obj("could not add voice"), status=500)
+    return web.json_response({"ok": True, "voice": entry["id"], "entry": entry,
+                              "fish_hosts": _fish_host_count()})
 
 
 # ---- Image editing ------------------------------------------------------
@@ -22557,6 +22733,7 @@ def make_app():
     app.router.add_post("/v1/images/edits", handle_image_edit)
     swagger.add_get("/v1/images/edit-models", handle_edit_models)
     swagger.add_get("/v1/audio/voices", handle_audio_voices)
+    swagger.add_post("/v1/audio/voices", handle_add_voice)
     swagger.add_get("/v1/audio/clips", handle_audio_clips)   # the speech-history list (gallery source)
     app.router.add_get("/v1/audio/clips/{name}", handle_audio_clip)
     # Registered on the plain router (not swagger) so path params and the
