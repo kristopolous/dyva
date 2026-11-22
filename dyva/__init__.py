@@ -15113,6 +15113,94 @@ async def _session_search(session, userhash, query, limit=8):
         return None
 
 
+# --- Phase 2: the opt-in session tools (prefixed, injected, intercepted) --------------------
+# Named with a random prefix so they can never collide with a caller's own tool names. Injected
+# into a request's tool array only when BOTH gates hold: the caller is opted in (userhash) AND
+# already tool-calling (has client tools) — so plain and anonymous requests are untouched. A tool
+# call whose name carries the prefix is ours (run here); anything else is relayed to the client.
+# See brainstorm/user-account.md.
+SESSION_TOOL_PREFIX = "m4x1aaz40I9z"
+
+
+def _session_tool_defs():
+    """The two session tools, as prefixed OpenAI function-tool defs."""
+    return [
+        {"type": "function", "function": {
+            "name": f"{SESSION_TOOL_PREFIX}_list_sessions",
+            "description": ("List the user's own previous saved conversations (most recent "
+                            "first), each with a title and id. Use when the user asks what you "
+                            "talked about before, or wants to see or revisit past sessions."),
+            "parameters": {"type": "object", "properties": {
+                "limit": {"type": "integer",
+                          "description": "Max sessions to return (default 10)."}}}}},
+        {"type": "function", "function": {
+            "name": f"{SESSION_TOOL_PREFIX}_search_sessions",
+            "description": ("Semantically search the user's own previous conversations for ones "
+                            "relevant to a query. Use when the user refers to something from a "
+                            "past conversation, e.g. 'what was that thing about routing?'."),
+            "parameters": {"type": "object",
+                           "properties": {
+                               "query": {"type": "string",
+                                         "description": "What to look for across past sessions."},
+                               "limit": {"type": "integer",
+                                         "description": "Max results (default 8)."}},
+                           "required": ["query"]}}},
+    ]
+
+
+def _is_session_tool(name):
+    """True iff `name` is one of our prefixed session tools (ours to run, not the client's)."""
+    return bool(name) and str(name).startswith(SESSION_TOOL_PREFIX + "_")
+
+
+def _inject_session_tools(tools, userhash):
+    """Return `tools` with the session tools appended — but ONLY when both gates hold: a userhash
+    (opted in) AND existing client tools (already tool-calling). Otherwise return `tools`
+    unchanged, and never mutate the caller's list."""
+    if not userhash or not tools:
+        return tools
+    return list(tools) + _session_tool_defs()
+
+
+async def _run_session_tool(session, userhash, name, args):
+    """Execute one prefixed session tool for `userhash`; return a text result for the model.
+    Strictly scoped to the caller's own sessions; never raises (returns an error string)."""
+    args = args if isinstance(args, dict) else {}
+    try:
+        short = str(name or "")[len(SESSION_TOOL_PREFIX) + 1:]
+        if short == "list_sessions":
+            try:
+                limit = int(args.get("limit") or 10)
+            except (TypeError, ValueError):
+                limit = 10
+            rows = _session_list(userhash)[:max(1, limit)]
+            if not rows:
+                return "You have no saved sessions yet."
+            return "Your recent sessions:\n" + "\n".join(
+                f"{i + 1}. {r['title'] or '(untitled)'}  [id {r['affinity_id']}]"
+                for i, r in enumerate(rows))
+        if short == "search_sessions":
+            query = str(args.get("query") or "").strip()
+            if not query:
+                return "Provide a 'query' to search your sessions."
+            try:
+                limit = int(args.get("limit") or 8)
+            except (TypeError, ValueError):
+                limit = 8
+            hits = await _session_search(session, userhash, query, limit=max(1, limit))
+            if hits is None:
+                return "Session search is unavailable right now (no embedding host)."
+            if not hits:
+                return f"No past sessions matched {query!r}."
+            return f"Sessions matching {query!r}:\n" + "\n".join(
+                f"{i + 1}. {h['title'] or '(untitled)'} — {h['snippet']}  [id {h['affinity_id']}]"
+                for i, h in enumerate(hits))
+        return f"(unknown session tool {name!r})"
+    except Exception as e:
+        log.debug(f"session tool {name} failed: {e}")
+        return f"(session tool {name!r} failed)"
+
+
 # Read-only SQL for the do_action "query" tool (admin-gated at the endpoint). Only these
 # dyva DBs are reachable. "No update" is enforced STRUCTURALLY, not by string-matching:
 # the DB is opened mode=ro (any write raises at the engine) AND an authorizer denies
