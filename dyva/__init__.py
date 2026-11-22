@@ -10303,6 +10303,11 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
     # the event loop on exactly the 100k-token prompts this feature targets.
     _acrc = _affinity_key(_amsgs)
     _affinity_ctx.set((_acrc, len(json.dumps(_amsgs, ensure_ascii=False)) // 4 if _amsgs else 0))
+    # Opt-in session capture: if the client's api-key carries a user bag, snapshot this inbound
+    # conversation into their session store. Fire-and-forget off the critical path (the blocking
+    # write runs in a thread executor), no-op for anonymous callers, never blocks or raises, and
+    # stores raw only — embedding is deferred to query time. See brainstorm/user-account.md.
+    _capture_session(request, opayload)
     # A comma fallback chain ('qwen,gemma', or an alias expanding to one) is STRICT ordered
     # exhaustion, not a pool: segment 0's hosts are raced out entirely before segment 1 gets a
     # turn. find_servers_fallback tags each host with its segment; the map rides a contextvar the
@@ -14285,6 +14290,205 @@ async def handle_image_delete(request):
     return web.json_response({"removed": removed})
 
 
+# --- Opt-in user identity: the api-key field as a `key=value;` env-var bag ---
+# The public demo ignores the api-key field, so we repurpose it as a general, open-ended
+# `k=v;` bag (env-vars for your session). `user`/`pass` are the first two keys and derive an
+# opaque, stable userhash that keys a user's stored sessions; `pass` is OPTIONAL entropy
+# (collision-safety), not a credential. No `user` -> no identity -> nothing stored, exactly as
+# today. Zero-trust by premise — this is pseudonymous keying, not auth. See
+# brainstorm/user-account.md.
+def _parse_env_bag(s):
+    """Parse `key=value;key2=value2` into a dict. Keys are trimmed + lowercased (forgiving for a
+    human-typed field); values are trimmed but otherwise verbatim (split on the FIRST '=', so a
+    value may itself contain '='). Segments with no key are dropped. None/'' -> {}."""
+    out = {}
+    for seg in str(s or "").split(";"):
+        if "=" not in seg:
+            continue
+        k, v = seg.split("=", 1)
+        k = k.strip().lower()
+        if k:
+            out[k] = v.strip()
+    return out
+
+
+def _userhash_from_bag(bag):
+    """Opaque, stable identity for a parsed env bag, or None when there's no `user` (no opt-in,
+    so nothing is stored). `pass` is optional and defaults to empty — a bare `user` and
+    `user` + empty-pass are the same identity — and a NUL joins the two fields so ('a','bc') and
+    ('ab','c') can't collide."""
+    user = (bag or {}).get("user") or ""
+    if not user:
+        return None
+    pw = (bag or {}).get("pass") or ""
+    return hashlib.sha256((user + "\x00" + pw).encode("utf-8", "ignore")).hexdigest()
+
+
+def _apikey_from_request(request):
+    """The raw client api-key string, normalised across dialects (confirmed via
+    `llcat --curlify`): `Authorization: Bearer <k>` for openai/ollama/llama.cpp, or
+    `x-api-key: <k>` for anthropic. The 'Bearer' scheme is stripped case-insensitively; a bare
+    `Authorization` value with no scheme is taken whole. '' when no key header is present."""
+    auth = (request.headers.get("Authorization") or "").strip()
+    if auth:
+        parts = auth.split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            return parts[1].strip()
+        if len(parts) == 1 and parts[0].lower() == "bearer":
+            return ""                               # 'Bearer' with no value
+        return auth
+    return (request.headers.get("x-api-key") or "").strip()
+
+
+def _userhash_from_request(request):
+    """Opaque userhash for the opted-in client, or None (anonymous / blank key) — the whole
+    chain the capture hook gates on. Never raises on a weird header."""
+    try:
+        return _userhash_from_bag(_parse_env_bag(_apikey_from_request(request)))
+    except Exception:
+        return None
+
+
+# --- Per-user session store (own DB; a vector index reuses the sem scaffolding) ---
+# Durable store for opt-in users' sessions, keyed (userhash, affinity_id) so repeated turns of
+# one context dedup to a single row updated in place (no per-turn flood). Its OWN sqlite file,
+# independent of whether sqlite-vec loads, mirroring how CHATS_DB is separate from SEMINDEX_DB.
+# UNCAPPED for 1.0 (deliberately NOT the global CHATS_KEEP cap); delete is soft (row kept). The
+# global demo chats store is untouched. See brainstorm/user-account.md.
+SESSIONS_DB = os.path.join(CACHE_DIR, "sessions.db")
+_sessions_db = None
+
+
+def _get_sessions_db():
+    global _sessions_db
+    if _sessions_db is None:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        db = sqlite3.connect(SESSIONS_DB, check_same_thread=False)
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA synchronous=NORMAL")
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS user_sessions("
+            "userhash TEXT NOT NULL, affinity_id TEXT NOT NULL, title TEXT, "
+            "data TEXT NOT NULL, created REAL NOT NULL, updated REAL NOT NULL, "
+            "deleted INTEGER NOT NULL DEFAULT 0, "
+            "PRIMARY KEY(userhash, affinity_id))")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_user_sessions_owner "
+                   "ON user_sessions(userhash, deleted, updated)")
+        db.commit()
+        _sessions_db = db
+    return _sessions_db
+
+
+def _session_upsert(userhash, affinity_id, title, obj):
+    """Store/refresh one context's session. Dedups on (userhash, affinity_id): a second write
+    to the same key updates the row in place (and revives it if it was soft-deleted — a new
+    turn on a context means it's active again). `created` is preserved; `updated` moves."""
+    db = _get_sessions_db()
+    now = time.time()
+    db.execute(
+        "INSERT INTO user_sessions(userhash,affinity_id,title,data,created,updated,deleted) "
+        "VALUES(?,?,?,?,?,?,0) "
+        "ON CONFLICT(userhash,affinity_id) DO UPDATE SET "
+        "title=excluded.title, data=excluded.data, updated=excluded.updated, deleted=0",
+        (userhash, str(affinity_id), title or "",
+         json.dumps(obj, ensure_ascii=False), now, now))
+    db.commit()
+
+
+def _session_get(userhash, affinity_id, include_deleted=False):
+    row = _get_sessions_db().execute(
+        "SELECT data, deleted FROM user_sessions WHERE userhash=? AND affinity_id=?",
+        (userhash, str(affinity_id))).fetchone()
+    if not row or (row[1] and not include_deleted):
+        return None
+    try:
+        return json.loads(row[0])
+    except (ValueError, TypeError):
+        return None
+
+
+def _session_list(userhash):
+    """Lightweight per-user list (newest-first), excluding soft-deleted. No message bodies."""
+    return [{"affinity_id": r[0], "title": r[1] or "", "updated": r[2]}
+            for r in _get_sessions_db().execute(
+                "SELECT affinity_id, title, updated FROM user_sessions "
+                "WHERE userhash=? AND deleted=0 ORDER BY updated DESC", (userhash,)).fetchall()]
+
+
+def _session_soft_delete(userhash, affinity_id):
+    db = _get_sessions_db()
+    db.execute("UPDATE user_sessions SET deleted=1 WHERE userhash=? AND affinity_id=?",
+               (userhash, str(affinity_id)))
+    db.commit()
+
+
+# Ingress capture: snapshot the inbound conversation into the opted-in user's store at request
+# INGRESS (never mid-stream — the generation/race path is untouched), fire-and-forget so it
+# adds no latency to the response. Keyed by the routing affinity id, so once the 4-user-message
+# prefix saturates further turns dedup onto one row. See brainstorm/user-account.md.
+_capture_tasks = set()   # hold refs so fire-and-forget captures aren't GC'd mid-write
+
+
+def _session_title(body):
+    """A short display title for a captured session: its first user message, trimmed."""
+    for m in ((body or {}).get("messages") or []):
+        if (m or {}).get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, str) and c.strip():
+            return c.strip()[:80]
+        if isinstance(c, list):
+            for p in c:
+                if isinstance(p, dict) and isinstance(p.get("text"), str) and p["text"].strip():
+                    return p["text"].strip()[:80]
+    return ""
+
+
+def _session_capture_target(request, body):
+    """Decide whether an inbound chat request should snapshot a session, and with what key.
+    Returns {userhash, affinity_id, obj} for an opted-in request that has user messages, else
+    None. Pure and cheap — safe to call on the critical path; the write is dispatched off it."""
+    try:
+        uh = _userhash_from_request(request)
+        if not uh:
+            return None
+        msgs = (body or {}).get("messages") or []
+        aff = _affinity_key(msgs)
+        if aff is None:
+            return None
+        return {"userhash": uh, "affinity_id": str(aff),
+                "obj": {"title": _session_title(body), "messages": msgs}}
+    except Exception:
+        return None
+
+
+def _capture_session(request, body):
+    """Fire-and-forget ingress capture: snapshot the inbound conversation WITHOUT blocking the
+    request — no Amdahl hit on the generation path. The decision is cheap and synchronous; the
+    blocking sqlite write runs in a thread executor. Returns the captured userhash (for
+    callers/tests) or None when nothing was captured. Never raises into the caller."""
+    target = _session_capture_target(request, body)
+    if target is None:
+        return None
+    uh, aff, obj = target["userhash"], target["affinity_id"], target["obj"]
+    title = obj.get("title") or ""
+
+    async def _run():
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, _session_upsert, uh, aff, title, obj)
+        except Exception as e:
+            log.debug(f"session capture write failed: {e}")
+
+    try:
+        task = asyncio.create_task(_run())
+        _capture_tasks.add(task)
+        task.add_done_callback(_capture_tasks.discard)
+    except RuntimeError:
+        pass          # no running loop (not the normal handler path) — skip, never block
+    return uh
+
+
 CHATS_KEEP = 200
 
 
@@ -14705,6 +14909,207 @@ async def _semantic_search(session, model, query, kinds=None, limit=8):
         return _sem_knn(db, nq, kinds=kinds, limit=limit)
     except Exception:
         log.exception("semantic search failed; falling back to keyword")
+        return None
+
+
+# --- Session semantic index: a vec0 partition-keyed index over user_sessions ----------------
+# Parallels the global docs+chats index above but lives in its own tables inside SEMINDEX_DB,
+# sharded by userhash via a vec0 PARTITION KEY so a user's KNN only scans their shard (no
+# cross-user leakage, no over-fetch starvation). Fed from the durable user_sessions store;
+# built LAZILY at query time (embedding is an on-demand cost, paid only for what's new since
+# the user last searched). Reuses the pinned embedder, dim/meta, normalize and hash. See
+# brainstorm/user-account.md.
+def _session_sem_check_model(db, model):
+    """If the pinned embed model changed, the session vectors are from a different (likely
+    different-dimension) model and no longer comparable — drop the session index so it rebuilds.
+    Independent of the global index's own model check; the durable sessions are untouched."""
+    if _sem_meta_get(db, "session_model") != model:
+        db.execute("DROP TABLE IF EXISTS session_vec")
+        db.execute("DROP TABLE IF EXISTS session_items")
+        db.execute("DELETE FROM meta WHERE key='session_dim'")
+        _sem_meta_set(db, "session_model", model)
+        db.commit()
+
+
+def _session_items_table(db):
+    db.execute("CREATE TABLE IF NOT EXISTS session_items("
+               "rowid INTEGER PRIMARY KEY, userhash TEXT, affinity_id TEXT, "
+               "title TEXT, text TEXT, hash TEXT, UNIQUE(userhash, affinity_id))")
+
+
+def _session_ensure_vec(db, dim):
+    """Create the partitioned vec0 table at `dim` on first use; remember the dim. Idempotent."""
+    cur = _sem_meta_get(db, "session_dim")
+    if cur is None:
+        db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS session_vec USING vec0("
+                   "userhash text partition key, embedding float[%d])" % int(dim))
+        _sem_meta_set(db, "session_dim", int(dim))
+        db.commit()
+        return int(dim)
+    return int(cur)
+
+
+def _session_corpus(userhash):
+    """One dict per live (non-deleted) session for `userhash`: {affinity_id, title, text, hash}.
+    `text` is the flattened conversation (same extractor the global index uses), capped; `hash`
+    is over the capped text so change detection matches exactly what was embedded."""
+    out = []
+    for aff, title, data in _get_sessions_db().execute(
+            "SELECT affinity_id, title, data FROM user_sessions WHERE userhash=? AND deleted=0",
+            (userhash,)).fetchall():
+        try:
+            obj = json.loads(data or "")
+        except (ValueError, TypeError):
+            continue
+        text = _chat_text(obj, title)[:SEM_TEXT_CHARS]
+        if not text:
+            continue
+        out.append({"affinity_id": aff, "title": title or "",
+                    "text": text, "hash": _sem_hash(text)})
+    return out
+
+
+def _session_plan(db, userhash, items):
+    """Diff this user's live sessions against what's indexed. Returns (to_delete_rowids,
+    to_embed): sessions whose affinity_id is new or whose hash changed need embedding; indexed
+    rows whose affinity_id is gone from the live set get deleted. Scoped to one userhash."""
+    _session_items_table(db)
+    have = {aff: (rid, h) for rid, aff, h in db.execute(
+        "SELECT rowid, affinity_id, hash FROM session_items WHERE userhash=?", (userhash,))}
+    live, to_embed = set(), []
+    for it in items:
+        aff = it["affinity_id"]
+        live.add(aff)
+        cur = have.get(aff)
+        if cur is None or cur[1] != it["hash"]:
+            to_embed.append(it)
+    to_delete = [rid for aff, (rid, _h) in have.items() if aff not in live]
+    return to_delete, to_embed
+
+
+def _session_remove(db, userhash, rowids):
+    for rid in rowids:
+        db.execute("DELETE FROM session_items WHERE rowid=?", (rid,))
+        db.execute("DELETE FROM session_vec WHERE userhash=? AND rowid=?", (userhash, rid))
+
+
+def _session_store(db, userhash, item, vec):
+    """Upsert one session's item row and (re)place its partitioned vector. `vec` is unit-
+    normalized and its length equals the table's dim (the caller guards that)."""
+    _session_items_table(db)
+    db.execute("INSERT INTO session_items(userhash,affinity_id,title,text,hash) VALUES(?,?,?,?,?) "
+               "ON CONFLICT(userhash,affinity_id) DO UPDATE SET "
+               "title=excluded.title, text=excluded.text, hash=excluded.hash",
+               (userhash, item["affinity_id"], item["title"], item["text"], item["hash"]))
+    rid = db.execute("SELECT rowid FROM session_items WHERE userhash=? AND affinity_id=?",
+                     (userhash, item["affinity_id"])).fetchone()[0]
+    db.execute("DELETE FROM session_vec WHERE userhash=? AND rowid=?", (userhash, rid))
+    db.execute("INSERT INTO session_vec(rowid, userhash, embedding) VALUES(?,?,?)",
+               (rid, userhash, sqlite_vec.serialize_float32(vec)))
+
+
+async def _session_build(session, model, userhash, max_embed=None):
+    """Bring `userhash`'s session shard in line with their live sessions under the pinned
+    `model`: prune dropped/soft-deleted sessions, then embed new/changed ones. Best-effort,
+    incremental, committed as each embed lands (mirrors _sem_build). Returns the count embedded."""
+    db = _get_sem_db()
+    if db is None:
+        return 0
+    cap = SEM_MAX_BUILD if max_embed is None else max_embed
+    _session_sem_check_model(db, model)
+    to_delete, to_embed = _session_plan(db, userhash, _session_corpus(userhash))
+    _session_remove(db, userhash, to_delete)
+    db.commit()
+    if cap:
+        to_embed = to_embed[:cap]
+    if not to_embed:
+        return 0
+
+    gate = asyncio.Semaphore(SEM_BUILD_CONCURRENCY)
+
+    async def _one(it):
+        async with gate:
+            try:
+                return it, await _embed_text(session, model, it["text"])
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return it, None
+
+    tasks = [asyncio.ensure_future(_one(it)) for it in to_embed]
+    embedded = 0
+    try:
+        for fut in asyncio.as_completed(tasks):
+            it, vec = await fut
+            if not vec:
+                continue
+            nv = _sem_normalize(vec)
+            if nv is None:
+                continue
+            dim = _session_ensure_vec(db, len(nv))
+            if len(nv) != dim:
+                continue
+            _session_store(db, userhash, it, nv)
+            embedded += 1
+            if embedded % SEM_COMMIT_EVERY == 0:
+                db.commit()
+    finally:
+        db.commit()
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+    return embedded
+
+
+def _session_knn(db, userhash, qvec, limit=8):
+    """Nearest sessions to `qvec` within `userhash`'s shard. Returns [{affinity_id, title,
+    snippet, score}] best-first; score is cosine in [0,1]."""
+    if _sem_meta_get(db, "session_dim") is None:
+        return []
+    want = max(1, min(50, int(limit)))
+    pairs = db.execute(
+        "SELECT rowid, distance FROM session_vec WHERE userhash=? AND embedding MATCH ? "
+        "ORDER BY distance LIMIT ?",
+        (userhash, sqlite_vec.serialize_float32(qvec), want)).fetchall()
+    out = []
+    for rid, dist in pairs:
+        row = db.execute("SELECT affinity_id, title, text FROM session_items WHERE rowid=?",
+                         (rid,)).fetchone()
+        if not row:
+            continue
+        aff, title, text = row
+        out.append({"affinity_id": aff, "title": title or "",
+                    "snippet": (text or "")[:300].strip(),
+                    "score": round(max(0.0, 1.0 - float(dist) * float(dist) / 2.0), 4)})
+    return out
+
+
+async def _session_search(session, userhash, query, limit=8):
+    """Embedding search over `userhash`'s OWN sessions. Returns [{affinity_id, title, snippet,
+    score}] best-first, or None when semantic search is unavailable (no embed host for the
+    pinned model, or sqlite-vec missing) so the caller can fall back. Empty query / no user ->
+    []. Builds this user's shard lazily first (the on-demand embedding cost)."""
+    query = (query or "").strip()
+    if not query or not userhash:
+        return []
+    qvec = await _embed_text(session, EMBED_MODEL, query)
+    if qvec is None:
+        return None                                 # can't embed the query -> no semantic search
+    db = _get_sem_db()
+    if db is None:
+        return None                                 # sqlite-vec missing -> caller falls back
+    try:
+        try:
+            await _session_build(session, EMBED_MODEL, userhash)
+        except Exception:
+            log.exception("session index build failed")
+        nq = _sem_normalize(qvec)
+        dim = _sem_meta_get(db, "session_dim")
+        if nq is None or dim is None or len(nq) != int(dim):
+            return None
+        return _session_knn(db, userhash, nq, limit=limit)
+    except Exception:
+        log.exception("session search failed")
         return None
 
 
