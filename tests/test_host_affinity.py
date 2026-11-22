@@ -31,6 +31,7 @@ def store(monkeypatch):
     # Throwaway in-memory cache + a low size gate so touch() fires on small test prompts,
     # and reset the request-scoped affinity context around each test.
     monkeypatch.setattr(dyva, "_affinity", {})
+    monkeypatch.setattr(dyva, "_affinity_derank", {})
     monkeypatch.setattr(dyva, "AFFINITY_MIN_TOKENS", 10)
     monkeypatch.setattr(dyva, "AFFINITY_TTL_SECS", 300)
     monkeypatch.setattr(dyva, "AFFINITY_MAX_ENTRIES", 40)
@@ -243,6 +244,65 @@ def test_forget_drops_every_pin_to_host(store):
     assert dyva.affinity_view(2)[0] == ""
     assert dyva.affinity_view(3)[0] == NH("http://live:1")   # other hosts' pins untouched
     assert NH("http://dead:1") not in dyva.affinity_view(3)[1]   # dead host no longer reserved
+
+
+def test_forget_ctx_busts_this_requests_pin(store):
+    # An affinity-matched request whose host returned no usable response busts ITS OWN pin
+    # (this crc), so the next turn of this exact context doesn't get handed back to that host.
+    # Other threads' pins to the same host are untouched — the host is fine for everyone else.
+    dyva.affinity_touch(1, "http://h:1", 50)           # this request's context, pinned to h
+    dyva.affinity_touch(2, "http://h:1", 50)           # another thread, same host
+    dyva._affinity_ctx.set((1, 50_000))
+    dyva._affinity_forget_ctx()
+    assert dyva.affinity_view(1)[0] == ""              # this context's pin is busted
+    assert dyva.affinity_view(2)[0] == NH("http://h:1")  # the other thread keeps its pin
+
+
+def test_forget_ctx_without_context_is_noop(store):
+    dyva.affinity_touch(1, "http://h:1", 50)
+    dyva._affinity_ctx.set(None)
+    dyva._affinity_forget_ctx()                         # no request context -> nothing to bust
+    assert dyva.affinity_view(1)[0] == NH("http://h:1")
+
+
+# ---- per-context derank (the 600s cooldown so the warm banker can't snap back) ------------
+# After a context gets no usable answer from a host, that host is sunk for THIS context for a
+# cooldown, giving the context time to settle on a new home. Strictly per-crc, self-expiring,
+# never a reputation write — the host keeps its (98%!) global standing and its warmth elsewhere.
+
+def test_derank_ctx_records_for_this_context(store):
+    dyva._affinity_ctx.set((777, 50_000))
+    dyva._affinity_derank_ctx("http://h:1")
+    assert dyva._affinity_deranked(777) == {NH("http://h:1")}
+
+
+def test_derank_scoped_to_crc(store):
+    dyva._affinity_ctx.set((777, 50_000))
+    dyva._affinity_derank_ctx("http://h:1")
+    assert dyva._affinity_deranked(888) == set()       # a different context sees nothing
+
+
+def test_derank_expires_and_reaps(store):
+    dyva._affinity_derank[777] = {NH("http://h:1"): time.time() - 1}   # already expired
+    assert dyva._affinity_deranked(777) == set()
+    assert 777 not in dyva._affinity_derank             # empty bucket self-heals
+
+
+def test_derank_ctx_without_context_is_noop(store):
+    dyva._affinity_ctx.set(None)
+    dyva._affinity_derank_ctx("http://h:1")
+    assert dyva._affinity_derank == {}
+
+
+def test_find_servers_deranked_host_sinks_to_back(routed):
+    # HB just failed THIS context; even though it's a live candidate it must sink to the back for
+    # this crc for the cooldown, so the retry tries the other host first (banker warm can't rescue
+    # it: find_servers sinks it below the tier, which leads the race sort above warm0).
+    crc = 777
+    dyva._affinity_ctx.set((crc, 50_000))
+    dyva._affinity_derank_ctx(HB)
+    order = _order()
+    assert HB in order and order[-1] == HB
 
 
 def test_forget_unknown_host_is_noop(store):

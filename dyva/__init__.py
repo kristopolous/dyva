@@ -447,6 +447,9 @@ AFFINITY_MIN_TOKENS = 8000    # engage gate: only pin prompts this big (a small 
 AFFINITY_TTL_SECS = 300       # sliding KV-warmth window per entry; refreshed on every hit
 AFFINITY_MAX_ENTRIES = 40     # L1 cache cap (LRU-evicted)
 AFFINITY_FLOOR_HOSTS = 5      # good hosts affinity may NEVER reserve away (cold-start landing pads)
+AFFINITY_DERANK_SECS = 600    # after a context gets no usable answer from a host, sink THAT host for
+                              # THIS context this long — long enough for the context to find a new
+                              # home before the (deliberately dumb) warm banker could snap it back
 # A race that's still SEARCHING (no host found) past this many seconds logs its internal
 # state every RACE_WATCHDOG seconds — tried/started/permit/n, the fan-out task's liveness
 # and any exception — so a wedged search (e.g. a continuation pinned to a dead warm host,
@@ -4277,6 +4280,10 @@ def rerank_scores():
 # rounds. The request's (crc, prompt-size) rides a contextvar: find_servers reads it to reorder,
 # record_verdict reads it on a win to record the warm host. See brainstorm/host-affinity.md.
 _affinity = {}                                      # crc:int -> (host_norm, expire_at); insertion order = LRU
+# crc:int -> {host_norm: expire_at}. Per-context cooldown: a host that returned no usable answer
+# for THIS context is sunk for this context until its entry expires, so the warm banker can't
+# re-front it round after round. Self-expiring, scoped to the crc, NEVER a reputation write.
+_affinity_derank = {}
 # (crc, size) for THIS request, or None. Annotated so the type-checker knows .get() is optional.
 _affinity_ctx: "contextvars.ContextVar[tuple[int | None, int] | None]" = \
     contextvars.ContextVar("affinity_ctx", default=None)
@@ -4391,6 +4398,16 @@ def _affinity_candidates(cand_hosts):
     if crc is None:
         return "", set()
     match, reserved = affinity_view(crc)
+    # Fold in this context's deranks: a host that returned no usable answer for THIS context is
+    # sunk for the cooldown, exactly like a foreign reservation (freshest-first, floor-respected),
+    # so the deliberately-dumb warm banker can't re-front it. The pin to it was already busted, so
+    # it isn't the match and nothing protects it from demotion.
+    deranked = _affinity_deranked(crc)
+    if deranked:
+        reserved = dict(reserved)
+        _exp = time.time() + AFFINITY_DERANK_SECS
+        for h in deranked:
+            reserved[h] = max(reserved.get(h, 0), _exp)   # freshest -> demoted first
     if not match and not reserved:
         return "", set()
     return _affinity_plan(match, reserved, cand_hosts, AFFINITY_FLOOR_HOSTS)
@@ -4402,6 +4419,65 @@ def _affinity_touch_ctx(host):
     if aff is not None:
         crc, size = aff
         affinity_touch(crc, host, size)
+
+
+def _affinity_forget_ctx():
+    """Bust THIS request's own pin: an affinity-matched request whose committed host returned
+    no usable response (dropped mid-stream) drops its own crc from the cache, so the next turn
+    of this exact context isn't handed back to the same host. Scoped to this crc only — other
+    threads pinned to the same host are untouched (the host is fine for everyone else; all we
+    observed is that this context on this host failed, so this context moves on)."""
+    aff = _affinity_ctx.get()
+    if aff is None or aff[0] is None:
+        return
+    try:
+        _affinity.pop(aff[0], None)
+    except Exception as e:
+        log.debug(f"_affinity_forget_ctx failed: {e}")
+
+
+def _affinity_derank_ctx(host):
+    """Record: THIS request's context got no usable answer from `host`, so sink that host for THIS
+    context for AFFINITY_DERANK_SECS. We claim nothing about WHY or about the host's capacity — a
+    98%-success host keeps its global standing and its warmth for every other context; this one
+    context just stops being handed back to the host that didn't answer it. No ctx / host -> no-op."""
+    aff = _affinity_ctx.get()
+    if aff is None or aff[0] is None:
+        return
+    try:
+        h = _norm_host(host)
+        if not h:
+            return
+        now = time.time()
+        _affinity_derank.setdefault(aff[0], {})[h] = now + AFFINITY_DERANK_SECS
+        # Opportunistic global reap (writes happen only on a failure, so this is rare and cheap):
+        # drop any crc bucket whose entries have all expired, so the store self-bounds.
+        for k in list(_affinity_derank):
+            b = _affinity_derank[k]
+            for hh in [hh for hh, exp in list(b.items()) if exp <= now]:
+                b.pop(hh, None)
+            if not b:
+                _affinity_derank.pop(k, None)
+    except Exception as e:
+        log.debug(f"_affinity_derank_ctx failed: {e}")
+
+
+def _affinity_deranked(crc, now=None):
+    """Hosts currently sunk for `crc` (expired entries reaped; an emptied crc bucket is dropped so
+    the store self-heals without a sweeper). Empty set when the context has no live deranks."""
+    now = time.time() if now is None else now
+    try:
+        d = _affinity_derank.get(crc)
+        if not d:
+            return set()
+        for h in [h for h, exp in list(d.items()) if exp <= now]:
+            d.pop(h, None)
+        if not d:
+            _affinity_derank.pop(crc, None)
+            return set()
+        return {h for h, exp in d.items() if exp > now}
+    except Exception:
+        return set()
 
 
 def _affinity_match_host():
@@ -9468,6 +9544,14 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
             await broadcast_activity(host, full, "failed",
                 f"tool call truncated on {host} after {made} chars — not resuming "
                 f"(set tool_resume to retry)", wid=job_wid)
+            # This affinity-matched context went to this host and got no usable answer (the
+            # stream dropped mid-tool-call). We claim nothing about WHY or about the host's
+            # capacity — only that this context on this host failed — so bust this context's
+            # own pin AND sink this host for this context for the cooldown, so the warm banker
+            # can't snap the same context straight back onto it. The context finds a new home;
+            # the host returns for this context on its own once the derank expires.
+            _affinity_forget_ctx()
+            _affinity_derank_ctx(host)
             with contextlib.suppress(Exception):
                 await _write_terminal_done(response, full, openai_format)
             break
@@ -14736,6 +14820,95 @@ def _doc_content_type(doc):
     return "text/plain"
 
 
+def _doc_is_markdown(doc):
+    """A prose/markdown document (not a code file, a spreadsheet, or raw HTML). A shared link
+    to one renders it to a reader page — the generated HTML a reader expects — rather than
+    showing the raw source. Code and sheets still serve as-is."""
+    t = (doc.get("type") or "").lower()
+    if t in ("code", "sheet") or _doc_content_type(doc) == "text/html":
+        return False
+    title = (doc.get("title") or "").strip().lower()
+    return t == "markdown" or title.endswith(".md")
+
+
+# Reader page for a shared markdown document: the SAME marked@12 + DOMPurify@3 + highlight.js +
+# mermaid@10 stack the dashboard renders chat markdown with, so a shared link looks like the doc
+# does in the app. The markdown is JSON-embedded (</ escaped so it can't break out of the script)
+# and sanitized by DOMPurify before it ever hits the DOM; the page is sandboxed by the caller's
+# CSP so even a sanitizer bypass can't reach dyva's storage.
+_MD_SHARE_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__DOC_TITLE__</title>
+<script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/dompurify@3/dist/purify.min.js"></script>
+<link id="hljsDark" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+<link id="hljsLight" rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css" disabled>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+:root{color-scheme:light dark;--bg:#ffffff;--fg:#1b1f24;--dim:#5a636e;--line:#e5e8ec;--code-bg:#f5f7f9;--link:#0b6cce;--accent:#0b6cce}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1319;--fg:#dde2e8;--dim:#9aa4b0;--line:#232a33;--code-bg:#161b22;--link:#6cb6ff;--accent:#6cb6ff}}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg)}
+body{font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-text-size-adjust:100%}
+main{max-width:760px;margin:0 auto;padding:40px 20px 96px}
+main>*:first-child{margin-top:0}
+h1,h2,h3,h4{line-height:1.25;font-weight:650;margin:1.6em 0 .6em}
+h1{font-size:1.9em}h2{font-size:1.5em;border-bottom:1px solid var(--line);padding-bottom:.3em}h3{font-size:1.25em}
+a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}
+p,ul,ol,blockquote,table,pre{margin:0 0 1em}
+ul,ol{padding-left:1.5em}li{margin:.25em 0}
+blockquote{border-left:3px solid var(--line);margin-left:0;padding:.2em 0 .2em 1em;color:var(--dim)}
+code{font-family:"Cousine",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:.9em;background:var(--code-bg);padding:.15em .4em;border-radius:4px}
+pre{background:var(--code-bg);padding:14px 16px;border-radius:8px;overflow:auto}
+pre code{background:none;padding:0;font-size:.875em}
+table{border-collapse:collapse;width:100%;display:block;overflow:auto}
+th,td{border:1px solid var(--line);padding:.5em .7em;text-align:left}
+th{background:var(--code-bg)}
+img{max-width:100%;height:auto}
+hr{border:none;border-top:1px solid var(--line);margin:2em 0}
+.mermaid{background:transparent;text-align:center;margin:0 0 1em}
+</style>
+</head>
+<body>
+<main id="doc"></main>
+<script>
+(function(){
+  var SRC=__DOC_SRC__;
+  var el=document.getElementById("doc");
+  try{var dark=matchMedia("(prefers-color-scheme: dark)").matches;
+      var hd=document.getElementById("hljsDark"),hl=document.getElementById("hljsLight");
+      if(hd)hd.disabled=!dark; if(hl)hl.disabled=dark;}catch(e){}
+  var out="";
+  try{if(window.marked){marked.setOptions({gfm:true,breaks:false});out=marked.parse(SRC);}}catch(e){out="";}
+  try{if(window.DOMPurify){out=DOMPurify.sanitize(out);}}catch(e){}
+  el.innerHTML=out;
+  try{if(window.hljs){el.querySelectorAll("pre code").forEach(function(b){
+        if(!b.classList.contains("language-mermaid"))hljs.highlightElement(b);});}}catch(e){}
+  try{el.querySelectorAll("code.language-mermaid").forEach(function(c){
+        var pre=c.closest("pre");var d=document.createElement("div");
+        d.className="mermaid";d.textContent=c.textContent;
+        if(pre&&pre.parentNode)pre.parentNode.replaceChild(d,pre);});
+      if(window.mermaid){mermaid.initialize({startOnLoad:false,
+        theme:matchMedia("(prefers-color-scheme: dark)").matches?"dark":"default"});
+        mermaid.run({querySelector:".mermaid"});}}catch(e){}
+})();
+</script>
+</body>
+</html>"""
+
+
+def _render_markdown_share(title, md):
+    """Build the self-contained reader page for a shared markdown document."""
+    src = json.dumps(md or "").replace("</", "<\\/").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+    return (_MD_SHARE_PAGE
+            .replace("__DOC_TITLE__", html_mod.escape(title or "Document"))
+            .replace("__DOC_SRC__", src))
+
+
 async def handle_doc_share(request):
     """
     Shareable document
@@ -14768,6 +14941,13 @@ async def handle_doc_share(request):
     if doc is None:
         return web.Response(text="document not found", status=404, content_type="text/plain")
     ctype = _doc_content_type(doc)
+    if ctype != "text/html" and _doc_is_markdown(doc):
+        # A markdown doc: render it to the reader page a shared link is expected to show, rather
+        # than the raw source. Served as sandboxed HTML (same opaque-origin CSP as an HTML doc).
+        body = _render_markdown_share(doc.get("title") or "Document", doc.get("content") or "")
+        r = web.Response(text=body, content_type="text/html", charset="utf-8")
+        r.headers["Content-Security-Policy"] = "sandbox allow-scripts allow-popups allow-forms"
+        return r
     r = web.Response(text=(doc.get("content") or ""), content_type=ctype, charset="utf-8")
     if ctype == "text/html":
         # Model/user-authored HTML served from dyva's own origin could otherwise read the
