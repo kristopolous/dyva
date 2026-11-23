@@ -31,7 +31,7 @@ voice = ["msgpack>=1.0.0"]
 
 [tool.setuptools]
 include-package-data = true
-packages = ["dyva", "dyva.static", "graflex"]
+packages = ["dyva", "dyva.static", "dyva.voices", "graflex"]
 
 [tool.setuptools.package-data]
 dyva = ["static/*", "*.json", "voices/*"]
