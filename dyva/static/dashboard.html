@@ -3355,7 +3355,13 @@ function renderWorkers(workers){
     var find=document.createElement('span');find.className='wk-seg wk-find';
     var run=document.createElement('span');run.className='wk-seg wk-run';
     tl.appendChild(ts);tl.appendChild(find);tl.appendChild(run);
-    paintTimeline(tl,w);
+    // Drive the LIVE clock off `started` (true elapsed), exactly like the 100ms ticker —
+    // NOT off the snapshot's `age`. age is only correct at the instant the snapshot was
+    // built; a late / buffered / out-of-order snapshot (the reverse proxy bursts WS frames,
+    // and a slammed pool floods them) carries a stale age, so painting it would snap the
+    // clock backward and the ticker would jump it forward again — the two fighting is the
+    // jitter. A finished worker's age is frozen and authoritative, so keep it for done.
+    paintTimeline(tl,w,w.done?(w.age||0):Math.max(0,(Date.now()-started)/1000));
     top.appendChild(tl);             // top row, pulled right, beside the model
     card.appendChild(body);
     return card;

@@ -9660,12 +9660,27 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
     return response
 
 
-async def _drain_stream(resp, first_line, upstream_openai, model):
+async def _drain_stream(resp, first_line, upstream_openai, model,
+                        cancel=None, skip=None, wid=None):
     """Consume a streaming upstream response into ONE complete Ollama-shaped object
     (the same shape the old non-streaming path returned), so a client that asked for
     stream:false still gets a single response — while we always stream from the host
     (the race only has to bound first-token, not the whole generation). `first_line`
-    was already normalized to an Ollama JSON line by the race; later lines are raw."""
+    was already normalized to an Ollama JSON line by the race; later lines are raw.
+
+    Honours the SAME operator controls and wall-clock ceiling as the streaming pump
+    (_pump_stream): each read is raced against a manual Stop (`cancel`) and Skip (`skip`)
+    signal and against the absolute WORKER_MAX deadline (anchored to the worker's start,
+    looked up by `wid`). Without these, a host that TRICKLES a line every <TIMEOUT
+    seconds (keep-alive / slow reasoning / empty deltas) defeats the per-read silence
+    watchdog forever, and the buffered drain runs unbounded with dead Stop/Skip buttons.
+
+    Returns (data, outcome). outcome is one of:
+      'done'     the host signalled a terminal done chunk — a finished answer;
+      'stalled'  went silent past TIMEOUT (or dropped) with NO done — caller fails over;
+      'skip'     operator hit Skip — abandon this host, caller fails over;
+      'stopped'  operator hit Stop — caller ends with the partial, no failover;
+      'capped'   hit the WORKER_MAX run-time ceiling with no done — caller ends/fails over."""
     content, thinking, tool_calls, done_obj = "", "", [], None
 
     def accept(obj):
@@ -9686,12 +9701,66 @@ async def _drain_stream(resp, first_line, upstream_openai, model):
             accept(json.loads(first_line))
         except Exception:
             pass
+
+    # Absolute run-time ceiling for this buffered drain, anchored to the worker's START
+    # (caps TOTAL run time, not per read). 0/unset WORKER_MAX, or no worker, disables it.
+    _w = _workers.get(wid) if wid else None
+    _started = _w.get("started") if isinstance(_w, dict) else None
+    _hard_deadline = _stream_deadline(_started, WORKER_MAX)
+    cancel_wait = asyncio.ensure_future(cancel.wait()) if cancel is not None else None
+    skip_wait = asyncio.ensure_future(skip.wait()) if skip is not None else None
+
+    def _ended():
+        # A non-interrupt end: 'done' if the host actually signalled it, else a stall.
+        return "done" if done_obj is not None else "stalled"
+
+    outcome = None
     try:
         while True:
-            # WATCHDOG (after first token): a silence longer than TIMEOUT means
-            # the connection stalled — stop draining and return what we have.
-            raw = await asyncio.wait_for(resp.content.readline(), TIMEOUT)
+            # WATCHDOG + MANUAL STOP/SKIP + HARD DEADLINE, mirroring _pump_stream's loop:
+            # race the next read against TIMEOUT silence, the manual signals, and the cap.
+            _wait = TIMEOUT
+            if _hard_deadline is not None:
+                _rem = _hard_deadline - time.time()
+                if _rem <= 0:
+                    outcome = "done" if done_obj is not None else "capped"
+                    break
+                _wait = min(TIMEOUT, _rem)
+            read_task = asyncio.ensure_future(resp.content.readline())
+            waiters = ([read_task]
+                       + ([cancel_wait] if cancel_wait is not None else [])
+                       + ([skip_wait] if skip_wait is not None else []))
+            done_set, _pending = await asyncio.wait(
+                waiters, timeout=_wait, return_when=asyncio.FIRST_COMPLETED)
+            if cancel_wait is not None and cancel_wait.done():
+                read_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await read_task
+                outcome = "stopped"
+                break
+            if skip_wait is not None and skip_wait.done():
+                read_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await read_task
+                outcome = "skip"
+                break
+            if read_task not in done_set:
+                read_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await read_task
+                # silence watchdog, OR the hard deadline expired mid-wait
+                if _hard_deadline is not None and time.time() >= _hard_deadline and done_obj is None:
+                    outcome = "capped"
+                else:
+                    outcome = _ended()
+                break
+            try:
+                raw = read_task.result()
+            except (aiohttp.ClientError, OSError):
+                outcome = _ended()   # dropped mid-drain — return the partial
+                break
             if not raw:
+                outcome = _ended()
                 break
             if raw == b"\n":
                 continue
@@ -9706,8 +9775,14 @@ async def _drain_stream(resp, first_line, upstream_openai, model):
                 except Exception:
                     continue
             accept(obj)
-    except (asyncio.TimeoutError, aiohttp.ClientError, OSError):
-        pass   # stalled/dropped mid-drain — return the partial rather than hanging
+    finally:
+        for _t in (cancel_wait, skip_wait):
+            if _t is not None and not _t.done():
+                _t.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await _t
+    if outcome is None:
+        outcome = _ended()
 
     data = dict(done_obj or {})
     data.setdefault("model", model)
@@ -9718,10 +9793,7 @@ async def _drain_stream(resp, first_line, upstream_openai, model):
     if tool_calls:
         msg["tool_calls"] = tool_calls
     data["message"] = msg
-    # `complete` = the host actually signalled done. False means it went silent past
-    # TIMEOUT (or dropped) mid-generation — a stall the caller must fail over on,
-    # not a finished answer. (done_obj is only set by a real done chunk.)
-    return data, (done_obj is not None)
+    return data, outcome
 
 
 def chat_fmt(data, model, openai_format):
@@ -10487,26 +10559,46 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                     # generation, so if we stamped `found` afterwards the tps
                     # window would collapse to ~0s and read as millions of tok/s.
                     mark_worker_found(job_wid, host, full)
+                    # Re-arm the worker's Stop/Skip onto THIS leg's events before draining:
+                    # _race_servers just repointed them at its own (now-finished) race
+                    # handles, so without this a click during the buffered drain hits a dead
+                    # signal — the stream:false twin of the committed-stream bug fixed for
+                    # _pump_stream / _forward_stream. _drain_stream also enforces WORKER_MAX.
+                    _wd = _workers.get(job_wid)
+                    if _wd is not None:
+                        _wd["stop"] = cancel.set
+                        _wd["skip"] = skip.set
                     try:
-                        data, complete = await _drain_stream(resp, first_line, _oai, full)
+                        data, outcome = await _drain_stream(resp, first_line, _oai, full,
+                                                            cancel=cancel, skip=skip, wid=job_wid)
                     finally:
                         await resp.release()
-                    if not complete:
-                        # Streamed some tokens then went silent past TIMEOUT (or
-                        # dropped) before the host signalled done — the same conclusion
-                        # the streaming paths reach: the host stalled. SOFT demote and
-                        # fail over; the sticky is cleared in record_verdict so it stops
-                        # being tried FIRST next time.
-                        record_verdict(host, full, timed_out("stream stalled"))
-                        errors.append(f"{host}: stream stalled")
+                    if outcome == "stopped":
+                        # Operator Stop on a committed buffered stream: end with the partial
+                        # we have, NO failover (mirrors _pump_stream's 'stopped'). The client
+                        # still gets a valid response instead of a dropped connection.
+                        await broadcast_activity(host, model, "stopped",
+                            f"worker manually stopped: {model}", wid=job_wid)
+                    elif outcome != "done":
+                        # 'skip' (operator), 'stalled' (silent past TIMEOUT / dropped), or
+                        # 'capped' (hit WORKER_MAX): abandon THIS host. SOFT demote and fail
+                        # over; the sticky is cleared in record_verdict so it isn't tried
+                        # FIRST next time.
+                        _why = {"skip": "skipped by operator",
+                                "capped": f"hit the {WORKER_MAX}s max run time"}.get(
+                                    outcome, f"no tokens for {TIMEOUT}s")
+                        record_verdict(host, full, timed_out(f"stream {outcome}"))
+                        errors.append(f"{host}: stream {outcome}")
                         await broadcast_activity(host, model, "failed",
-                            f"stream stalled: {host}@{model} — no tokens for {TIMEOUT}s",
-                            wid=job_wid)
+                            f"stream {outcome}: {host}@{model} — {_why}", wid=job_wid)
                         _servers = [s for s in _servers if s[1] != host]
                         _set_worker_phase(job_wid, None)
-                        if _servers:
+                        if outcome == "skip":
+                            skip.clear()   # Skip advances ONE host; don't let the latched event skip them all
+                        # 'capped' honours WORKER_MAX_FAILOVER: off -> end with the partial here.
+                        if _servers and not (outcome == "capped" and not WORKER_MAX_FAILOVER):
                             continue                    # re-race the remaining pool
-                        # nothing left to try -> return the partial we have, not a hang
+                        # nothing left to try (or cap+no-failover) -> return the partial, not a hang
                     if _is_truncated(data, sent_ctx):
                         if _attempt < NUM_CTX_RETRIES and sent_ctx < NUM_CTX_MAX:
                             nctx_pin = min(sent_ctx * 2, NUM_CTX_MAX)
