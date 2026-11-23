@@ -14589,7 +14589,12 @@ def _get_chats_db():
             _chats_db.execute("DROP TABLE chats")
         _chats_db.execute(
             "CREATE TABLE IF NOT EXISTS chats("
-            "id TEXT PRIMARY KEY, title TEXT, created REAL, data TEXT NOT NULL)")
+            "id TEXT PRIMARY KEY, title TEXT, created REAL, data TEXT NOT NULL, "
+            "userhash TEXT)")
+        # Additive provenance migration: a pre-provenance chats.db has no userhash column.
+        # Add it; existing rows read as NULL, which means GLOBAL (the unchanged behavior).
+        if "userhash" not in [r[1] for r in _chats_db.execute("PRAGMA table_info(chats)").fetchall()]:
+            _chats_db.execute("ALTER TABLE chats ADD COLUMN userhash TEXT")
         _chats_db.commit()
     return _chats_db
 
@@ -14612,7 +14617,7 @@ def _chat_get(cid):
         return None
 
 
-def _chat_upsert(cid, obj):
+def _chat_upsert(cid, obj, userhash=None):
     db = _get_chats_db()
     title = (obj.get("title") or "") if isinstance(obj, dict) else ""
     try:
@@ -14620,11 +14625,15 @@ def _chat_upsert(cid, obj):
     except (TypeError, ValueError, AttributeError):
         created = time.time() * 1000.0
     # created is preserved on update (only title/data change), keeping the
-    # newest-first ordering stable across edits.
+    # newest-first ordering stable across edits. userhash is PROVENANCE (NULL == global):
+    # claim-once / never-steal via COALESCE(existing, new) — a global chat is claimed by the
+    # first identified saver, but an owned chat is never reassigned or un-claimed by a later
+    # (anonymous or other-user) save.
     db.execute(
-        "INSERT INTO chats(id,title,created,data) VALUES(?,?,?,?)"
-        " ON CONFLICT(id) DO UPDATE SET title=excluded.title, data=excluded.data",
-        (str(cid), title, created, json.dumps(obj, ensure_ascii=False)))
+        "INSERT INTO chats(id,title,created,data,userhash) VALUES(?,?,?,?,?)"
+        " ON CONFLICT(id) DO UPDATE SET title=excluded.title, data=excluded.data,"
+        " userhash=COALESCE(chats.userhash, excluded.userhash)",
+        (str(cid), title, created, json.dumps(obj, ensure_ascii=False), userhash or None))
     db.execute(
         "DELETE FROM chats WHERE id NOT IN "
         "(SELECT id FROM chats ORDER BY created DESC LIMIT ?)", (CHATS_KEEP,))
@@ -15482,7 +15491,7 @@ async def handle_chat_post(request):
         return web.json_response({"error": "invalid JSON"}, status=400)
     if not isinstance(body, dict):
         return web.json_response({"error": "expected a chat object"}, status=400)
-    _chat_upsert(request.match_info["cid"], body)
+    _chat_upsert(request.match_info["cid"], body, _userhash_from_request(request))
     return web.json_response({"ok": True})
 
 

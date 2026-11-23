@@ -1909,6 +1909,26 @@ body.dragging-image .hist-item{cursor:grabbing}
 <div id="settings" class="panel">
 <div class="settings-wrap">
 <div class="card"><div class="card-inner settings-inner">
+<!-- Session login (privacy facet, NOT the admin password and NOT a privilege system).
+     "Register" is deliberately meaningless: it just stores user/pass in localStorage so
+     your chats and sessions follow you. The password is not a real credential — it can't
+     be revoked, cycled, or recovered; it's entropy that namespaces your space. Sits above
+     BOTH the admin unlock (non-admin view) and the routing config (admin view). The inputs
+     are type=text on purpose: no secret, "don't forget it" favors seeing it, and it avoids
+     the live-password-field autofill hijack the admin password dances around. -->
+<div id="userLogin" class="settings-card user-login">
+<div class="settings-card-title">Login</div>
+<div class="rc-hint">A private space for your chats and sessions, so they follow you across devices. Pick a name and (optionally) a passphrase. This has <b>nothing to do with the admin password</b> &mdash; it gates nothing, it's only a privacy facet. <b>There is no signup &mdash; just choose one. There is no recovery &mdash; don't forget it.</b></div>
+<div id="userLoginOut">
+<label class="setting"><span class="setting-text"><span class="setting-name">Username</span></span><input type="text" id="userLoginName" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="choose any name" onkeydown="if(event.key==='Enter'){event.preventDefault();userLoginSet();}"></label>
+<label class="setting"><span class="setting-text"><span class="setting-name">Password</span><small class="setting-help">Optional &mdash; a passphrase keeps your space to yourself. Leave it blank to make your sessions openly browsable by anyone who picks the same name.</small></span><input type="text" id="userLoginPass" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="optional" onkeydown="if(event.key==='Enter'){event.preventDefault();userLoginSet();}"></label>
+<div class="settings-actions"><span class="settings-status" id="userLoginStatus"></span><button type="button" class="settings-save" onclick="userLoginSet()">Log in</button></div>
+</div>
+<div id="userLoginIn" style="display:none">
+<p class="setting-help">Logged in as <b id="userLoginWho"></b>. New chats and sessions are kept under this identity on this device.</p>
+<div class="settings-actions"><span class="settings-status"></span><button type="button" class="settings-save" onclick="userLoginClear()">Log out</button></div>
+</div>
+</div>
 <div id="settingsLogin" class="settings-login" style="display:none">
 <p class="setting-help">These settings are protected.</p>
 <div class="login-row"><button type="button" id="loginBtn" class="settings-save">Unlock</button></div>
@@ -10936,6 +10956,36 @@ function showSettingsLocked(locked){
   document.getElementById('settingsLogin').style.display=locked?'':'none';
   document.getElementById('settingsBody').style.display=locked?'none':'';
 }
+// Session login: a PRIVACY facet, independent of the admin lock above. "Logging in" just
+// stores user/pass in localStorage (no signup, no server round-trip, no recovery); the
+// website has the privilege of deciding later how to hand this to dyva, so nothing here
+// touches request headers. render() reflects the stored state in both (locked/unlocked) views.
+function userLoginRender(){
+  var u='';try{u=localStorage.getItem('dyva_user')||'';}catch(e){}
+  var out=document.getElementById('userLoginOut'),inn=document.getElementById('userLoginIn');
+  if(!out||!inn)return;
+  if(u){inn.style.display='';out.style.display='none';
+    var who=document.getElementById('userLoginWho');if(who)who.textContent=u;}
+  else{inn.style.display='none';out.style.display='';}
+}
+function userLoginSet(){
+  var name=(document.getElementById('userLoginName').value||'').trim();
+  var pass=(document.getElementById('userLoginPass').value||'').trim();
+  var st=document.getElementById('userLoginStatus');
+  if(!name){if(st){st.textContent='Pick a name first.';}return;}
+  try{localStorage.setItem('dyva_user',name);
+    if(pass)localStorage.setItem('dyva_pass',pass);else localStorage.removeItem('dyva_pass');
+  }catch(e){if(st){st.textContent='Could not save (storage blocked).';}return;}
+  if(st)st.textContent='';
+  document.getElementById('userLoginPass').value='';
+  userLoginRender();
+}
+function userLoginClear(){
+  try{localStorage.removeItem('dyva_user');localStorage.removeItem('dyva_pass');}catch(e){}
+  var n=document.getElementById('userLoginName');if(n)n.value='';
+  userLoginRender();
+}
+try{userLoginRender();}catch(e){}
 // Live settings filter, same idea as a browser's settings search box: type to narrow
 // the cards and rows to what matches; Escape (wired on the input) clears it. The input
 // sits outside every .settings-card, so its own input events never trip _markDirty.
