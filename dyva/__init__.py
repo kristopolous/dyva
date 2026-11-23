@@ -8892,7 +8892,8 @@ def _is_empty_answer(partial):
 
 
 async def _pump_stream(response, resp, first_line, host, full, openai_format,
-                       upstream_openai, wid, num_ctx, partial, cancel=None, skip=None):
+                       upstream_openai, wid, num_ctx, partial, cancel=None, skip=None,
+                       tap=None):
     """Forward ONE already-won upstream stream to the already-prepared client
     `response`, translating dialect as needed and accumulating the assistant text
     into partial[0] so a mid-stream failover can carry the work forward. Returns:
@@ -8945,6 +8946,15 @@ async def _pump_stream(response, resp, first_line, host, full, openai_format,
                 await _broadcast_workers()
     await _phase("generating")
 
+    # Session-tool tap (opt-in agentic requests only). `tap` is None for every other
+    # request, so `_filt` returns the message unchanged and the forward paths below run
+    # byte-for-byte as before — the text path is untouched. When set, it strips OUR
+    # prefixed tool-call fragments out of what reaches the client and accumulates them;
+    # the turn-boundary check routes the pump "to us" (status 'session_tool').
+    def _filt(obj):
+        m = (obj or {}).get("message") or {}
+        return tap.filter(m) if tap is not None else m
+
     # One persistent waiter on the manual-stop signal, raced against each upstream read
     # below so a Stop registers within one line even on a slow (or scaled-long TIMEOUT)
     # stream, instead of only being noticed at the next line boundary.
@@ -8957,14 +8967,22 @@ async def _pump_stream(response, resp, first_line, host, full, openai_format,
             if not tool_phase[0] and _has_tool(first):
                 tool_phase[0] = True
                 await _phase("running tools")
-            msg = _openai_reasoning(dict(first.get("message", {})))
-            tcs = msg.pop("tool_calls", None)
-            if tcs:
-                msg["tool_calls"] = _fmt_tool_calls_delta(tcs)
-                msg["content"] = None
-            await cw(sse_str(sse_chunk(full, msg)).encode())
+            _src = _filt(first)
+            if _src is not None:
+                msg = _openai_reasoning(dict(_src))
+                tcs = msg.pop("tool_calls", None)
+                if tcs:
+                    msg["tool_calls"] = _fmt_tool_calls_delta(tcs)
+                    msg["content"] = None
+                await cw(sse_str(sse_chunk(full, msg)).encode())
         else:
-            await cw(first_line + b"\n")
+            if tap is not None:
+                _o = json.loads(first_line)
+                _src = tap.filter(_o.get("message") or {})
+                if _src is not None:
+                    await cw((json.dumps(dict(_o, message=_src)) + "\n").encode())
+            else:
+                await cw(first_line + b"\n")
             try:
                 accum(json.loads(first_line))
             except Exception:
@@ -8984,6 +9002,10 @@ async def _pump_stream(response, resp, first_line, host, full, openai_format,
             _fobj = None
         if isinstance(_fobj, dict) and _fobj.get("done"):
             await account_tokens(wid, host, full, _fobj, num_ctx)
+            # Our session tool(s) fired (and no client tool did): route the pump to us —
+            # withhold the terminal done, keep the connection open, let the caller loop.
+            if tap is not None and tap.has_capture() and not tap.saw_client_tool():
+                return "session_tool"
             if _fobj.get("done_reason") == "length":
                 return "length"
             if _is_empty_answer(partial):
@@ -9091,6 +9113,11 @@ async def _pump_stream(response, resp, first_line, host, full, openai_format,
                             break
                 # account tokens either way — the usage on the done chunk is real
                 await account_tokens(wid, host, full, obj, num_ctx)
+                # Filter the done message FIRST (single-message hosts carry the whole tool
+                # call here), so has_capture() sees it before we decide to loop.
+                _dmsg = _filt(obj)
+                if tap is not None and tap.has_capture() and not tap.saw_client_tool():
+                    return "session_tool"   # our tool fired; withhold done, loop in the caller
                 # done_reason 'length' = the window cut the generation short. It's a
                 # truncation, so SWALLOW the done (don't close the client's stream)
                 # and let the caller continue the answer on the same connection.
@@ -9106,31 +9133,40 @@ async def _pump_stream(response, resp, first_line, host, full, openai_format,
                 if _is_empty_answer(partial):
                     return "empty"      # answer went to the thinking channel — swallow done, let caller retry
                 if openai_format:
-                    m = _openai_reasoning(dict((obj or {}).get("message", {})))
-                    tcs = m.pop("tool_calls", None)
-                    if tcs:
-                        m["tool_calls"] = _fmt_tool_calls_delta(tcs)
-                        m["content"] = None
-                    if m.get("content") or m.get("tool_calls") or any(m.get(k) for k in REASONING_KEYS):
-                        await cw(sse_str(sse_chunk(full, m)).encode())
+                    if _dmsg is not None:
+                        m = _openai_reasoning(dict(_dmsg))
+                        tcs = m.pop("tool_calls", None)
+                        if tcs:
+                            m["tool_calls"] = _fmt_tool_calls_delta(tcs)
+                            m["content"] = None
+                        if m.get("content") or m.get("tool_calls") or any(m.get(k) for k in REASONING_KEYS):
+                            await cw(sse_str(sse_chunk(full, m)).encode())
                     fin = obj.get("done_reason") or "stop"
                     # OpenAI's finish_reason for a turn that made tool calls is 'tool_calls',
                     # not 'stop' — a strict client keys off it to decide to run the tools.
                     if tool_phase[0] and fin == "stop":
                         fin = "tool_calls"
                     await cw(sse_str(sse_chunk(full, {}, done=True, finish_reason=fin)).encode())
+                elif tap is not None:
+                    if _dmsg is not None:
+                        await cw((json.dumps(dict(obj, message=_dmsg)) + "\n").encode())
                 else:
                     await cw(line + b"\n")
                 return "done"
             # a normal content OR tool-call chunk — accum() counts both as progress
             accum(obj)
+            _nmsg = _filt(obj)
             if openai_format:
-                m = _openai_reasoning(dict((obj or {}).get("message", {})))
-                tcs = m.pop("tool_calls", None)
-                if tcs:
-                    m["tool_calls"] = _fmt_tool_calls_delta(tcs)
-                    m["content"] = None
-                await cw(sse_str(sse_chunk(full, m)).encode())
+                if _nmsg is not None:
+                    m = _openai_reasoning(dict(_nmsg))
+                    tcs = m.pop("tool_calls", None)
+                    if tcs:
+                        m["tool_calls"] = _fmt_tool_calls_delta(tcs)
+                        m["content"] = None
+                    await cw(sse_str(sse_chunk(full, m)).encode())
+            elif tap is not None:
+                if _nmsg is not None:
+                    await cw((json.dumps(dict(obj, message=_nmsg)) + "\n").encode())
             else:
                 await cw(line + b"\n")
         return "truncated"
@@ -9371,7 +9407,7 @@ async def _race_ndjson_keepalive(request, session, model, servers, payload, req_
 
 async def _stream_chat_failover(request, session, model, servers, opayload,
                                 openai_format, req_caps, job_wid, result, cancel=None,
-                                response=None, skip=None):
+                                response=None, skip=None, tap=None):
     """Stream a chat answer, and if an upstream drops mid-stream WITHOUT a terminal
     done token, seamlessly fail over to the next server — the SAME client connection
     stays open — carrying the work so far as context (with the window bumped to fit),
@@ -9404,6 +9440,7 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
     payload = opayload
     dead = set()          # hosts that dropped the CONNECTION — don't retry those
     continues = 0
+    session_rounds = 0          # opt-in session-tool loops taken (capped, anti-runaway)
     _no_think_retried = False   # one-shot: retry once with think:false on an empty (thinking-only) answer
     while True:
         mark_worker_found(job_wid, host, full)
@@ -9421,8 +9458,34 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
                 # on a committed slow stream). Point it at this leg's skip signal.
                 if skip is not None:
                     _w["skip"] = skip.set
+        if tap is not None:
+            tap.reset()             # fresh per-turn capture before each streaming leg
         status = await _pump_stream(response, resp, first_line, host, full, openai_format,
-                                    oai, job_wid, _effective_num_ctx(payload), partial, cancel, skip)
+                                    oai, job_wid, _effective_num_ctx(payload), partial, cancel, skip,
+                                    tap=tap)
+        if status == "session_tool":
+            # Our prefixed session tool(s) fired this turn. Run them server-side, append the
+            # assistant tool-call turn + results to the payload, and re-race the pool to
+            # continue the SAME client stream with the model's real answer — reusing the
+            # routing/race machinery untouched; this is just the pump "routed to us" and back.
+            session_rounds += 1
+            if session_rounds > SESSION_MAX_ROUNDS:
+                with contextlib.suppress(Exception):
+                    await _write_terminal_done(response, full, openai_format)
+                break
+            new_msgs = await _session_loop_step(session, tap.userhash, tap.captured(),
+                                                payload.get("messages") or [])
+            payload = dict(payload, messages=new_msgs)
+            remaining = [s for s in servers if s[1] not in dead]
+            result2, _errs, _stopped = await _race_servers(
+                session, model, remaining or servers, payload, do_stream=True,
+                remote=request.remote, caps=req_caps, job_wid=job_wid, hedge_delay=HEDGE_DELAY)
+            if result2:
+                _, host, full, resp, first_line, _first, oai = result2
+                continue
+            with contextlib.suppress(Exception):
+                await _write_terminal_done(response, full, openai_format)
+            break
         if status == "capped":
             # The absolute run-time ceiling (WORKER_MAX) was hit. Two actions by setting:
             # failover -> treat exactly like a mid-stream truncation (carry partial work
@@ -10308,6 +10371,17 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
     # write runs in a thread executor), no-op for anonymous callers, never blocks or raises, and
     # stores raw only — embedding is deferred to query time. See brainstorm/user-account.md.
     _capture_session(request, opayload)
+    # Opt-in session tools (Phase 2): for an opted-in caller ALREADY making tool calls, inject
+    # our prefixed list/search tools and build the stream tap that intercepts them. Double-gated
+    # (userhash present AND the request already carries tools) and STREAMING-only — the tap lives
+    # in the pump, so a non-streaming call couldn't intercept. None (inert) otherwise, so dyva's
+    # slow-enough common path pays nothing. See brainstorm/user-account.md.
+    session_tap = None
+    if do_stream:
+        _uh = _userhash_from_request(request)
+        if _uh and opayload.get("tools"):
+            opayload["tools"] = _inject_session_tools(opayload.get("tools"), _uh)
+            session_tap = _SessionToolTap(_uh)
     # A comma fallback chain ('qwen,gemma', or an alias expanding to one) is STRICT ordered
     # exhaustion, not a pool: segment 0's hosts are raced out entirely before segment 1 gets a
     # turn. find_servers_fallback tags each host with its segment; the map rides a contextvar the
@@ -10353,7 +10427,8 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                 if result:
                     return await _stream_chat_failover(
                         request, session, model, _servers, opayload,
-                        openai_format, req_caps, job_wid, result, cancel, response=ka_resp, skip=skip)
+                        openai_format, req_caps, job_wid, result, cancel, response=ka_resp,
+                        skip=skip, tap=session_tap)
                 msg = "worker manually stopped" if stopped else "all servers failed"
                 if errors:
                     msg += ": " + "; ".join(dict.fromkeys(errors))
@@ -10377,7 +10452,8 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                 if result:
                     return await _stream_chat_failover(
                         request, session, model, _servers, opayload,
-                        openai_format, req_caps, job_wid, result, cancel, response=ka_resp, skip=skip)
+                        openai_format, req_caps, job_wid, result, cancel, response=ka_resp,
+                        skip=skip, tap=session_tap)
                 msg = "worker manually stopped" if stopped else "all servers failed"
                 if errors:
                     msg += ": " + "; ".join(dict.fromkeys(errors))
@@ -15120,6 +15196,7 @@ async def _session_search(session, userhash, query, limit=8):
 # call whose name carries the prefix is ours (run here); anything else is relayed to the client.
 # See brainstorm/user-account.md.
 SESSION_TOOL_PREFIX = "m4x1aaz40I9z"
+SESSION_MAX_ROUNDS = 4   # anti-runaway cap on server-side session-tool loops per request
 
 
 def _session_tool_defs():
@@ -15201,7 +15278,123 @@ async def _run_session_tool(session, userhash, name, args):
         return f"(session tool {name!r} failed)"
 
 
-# Read-only SQL for the do_action "query" tool (admin-gated at the endpoint). Only these
+class _SessionToolTap:
+    """The magic-string stream intercept for the opt-in session tools, WITHOUT buffering.
+
+    Fed each streamed assistant message (ollama-shaped `obj["message"]`) in order, it lets
+    everything flow to the client UNMOLESTED until a tool-call fragment names one of OUR
+    prefixed tools — on modern models the function name arrives whole in a single delta, which
+    is the entire reason the random prefix works as a magic string. From that call onward its
+    fragments are WITHHELD from the client and accumulated; `captured()` yields the complete
+    call(s), which the caller runs server-side and feeds back so the model's real answer streams
+    on. The caller's own (client) tool calls pass straight through.
+
+    Grouping mirrors the reference parser in llcat/llcat.py (~1074-1097): a non-empty `name`
+    opens a new call, `arguments` accumulate onto the currently-open call, and `index` is never
+    consulted — on modern tool calls it is "either 0 or the utime" and means nothing; `id` is
+    taken from the name fragment (it too can be a sticky 0). A model that FRAGMENTS the name
+    across deltas (some 2024-era / maverick-class tool calling) defeats the prefix match and
+    its call simply relays as the client's — fail-safe, and out of scope by design.
+
+    Inert by construction: `_is_session_tool` can only match a name we injected, so for any
+    request without our tools every message returns unchanged and nothing is captured."""
+
+    def __init__(self, userhash):
+        self.userhash = userhash
+        self._calls = []       # ours, in arrival order: {"id","name","args"}
+        self._cur_ours = None  # the currently-open OURS call dict, or None if the open call is theirs
+        self._saw_client = False  # a client (non-ours) tool call was opened this turn
+
+    def filter(self, msg):
+        """Return the message to forward to the client (our fragments stripped out), or None
+        when nothing remains to forward (an all-ours delta with no content)."""
+        if not isinstance(msg, dict):
+            return msg
+        tcs = msg.get("tool_calls")
+        if not tcs:
+            return msg
+        keep = []
+        for tc in tcs:
+            if not isinstance(tc, dict):
+                keep.append(tc)
+                continue
+            fn = tc.get("function") or {}
+            name = fn.get("name")
+            args = fn.get("arguments")
+            if name and str(name).strip():
+                # a non-empty name opens a new call (index/id unreliable — see llcat ref)
+                if _is_session_tool(name):
+                    cur = {"id": tc.get("id") or "", "name": name, "args": ""}
+                    if args is not None:
+                        cur["args"] += args if isinstance(args, str) else json.dumps(args)
+                    self._calls.append(cur)
+                    self._cur_ours = cur
+                    continue                       # withhold ours
+                self._cur_ours = None              # the open call is the client's now
+                self._saw_client = True
+                keep.append(tc)
+                continue
+            # arg-only fragment: it belongs to the currently-open call
+            if self._cur_ours is not None:
+                if args is not None:
+                    self._cur_ours["args"] += args if isinstance(args, str) else json.dumps(args)
+                continue                           # withhold ours
+            keep.append(tc)
+        if keep:
+            return dict(msg, tool_calls=keep)
+        # everything in this delta was ours: forward only if it also carried visible output
+        if msg.get("content") or any(msg.get(k) for k in REASONING_KEYS):
+            return dict(msg, tool_calls=None)
+        return None
+
+    def has_capture(self):
+        return bool(self._calls)
+
+    def saw_client_tool(self):
+        """True if the model opened one of the CLIENT's tools this turn — the mixed-turn
+        guard: we relay such a turn instead of hijacking the stream to loop on ours."""
+        return self._saw_client
+
+    def reset(self):
+        """Clear per-turn capture state for the next model turn; the failover loop reuses
+        one tap across the turns of a session-tool round, so identity (userhash) survives."""
+        self._calls = []
+        self._cur_ours = None
+        self._saw_client = False
+
+    def captured(self):
+        """The complete OURS tool calls, OpenAI-shaped, in arrival order."""
+        return [{"id": c["id"], "type": "function",
+                 "function": {"name": c["name"], "arguments": c["args"]}}
+                for c in self._calls]
+
+
+async def _session_loop_step(session, userhash, captured, messages):
+    """Run the captured (ours) session tool calls server-side and return a NEW messages list
+    with the assistant tool-call turn + tool results appended, so the re-raced model turn sees
+    them and continues the answer. Mirrors _run_agent_tools' transcript-append idiom
+    (the assistant turn carries the calls; one `tool` message per call carries the result).
+    Never mutates the caller's list."""
+    captured = [tc for tc in captured
+                if isinstance(tc, dict) and (((tc.get("function") or {}).get("name") or "").strip())]
+    if not captured:
+        return list(messages)
+    assistant_msg = {"role": "assistant", "content": "", "tool_calls": captured}
+    tool_msgs = []
+    for tc in captured:
+        fn = tc.get("function") or {}
+        name = fn.get("name")
+        a = fn.get("arguments")
+        if isinstance(a, str):
+            try:
+                a = json.loads(a or "{}")
+            except Exception:
+                a = {}
+        a = a or {}
+        text = await _run_session_tool(session, userhash, name, a)
+        tool_msgs.append({"role": "tool", "name": name,
+                          "tool_call_id": tc.get("id") or "", "content": text})
+    return list(messages) + [assistant_msg] + tool_msgs
 # dyva DBs are reachable. "No update" is enforced STRUCTURALLY, not by string-matching:
 # the DB is opened mode=ro (any write raises at the engine) AND an authorizer denies
 # ATTACH (a query can't reach another file on disk) and PRAGMA; execute() runs exactly one

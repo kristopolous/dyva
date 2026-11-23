@@ -125,6 +125,19 @@ def test_saw_client_tool_false_on_pure_content_and_our_calls():
     assert not tap.saw_client_tool()
 
 
+def test_reset_clears_per_turn_state_for_the_next_turn():
+    # the failover loop reuses ONE tap across turns — reset() must wipe captures and flags
+    tap = dyva._SessionToolTap("uh1")
+    tap.filter(_name_frag(0, "c1", f"{P}_search_sessions"))
+    tap.filter(_name_frag(0, "c2", "get_weather"))
+    assert tap.has_capture() and tap.saw_client_tool()
+    tap.reset()
+    assert not tap.has_capture()
+    assert not tap.saw_client_tool()
+    assert tap.captured() == []
+    assert tap.userhash == "uh1"            # identity survives the reset
+
+
 def test_content_alongside_our_tool_call_still_streams():
     # assistant said something AND opened our tool in the same delta: show the words,
     # swallow the tool call.

@@ -589,8 +589,6 @@ table.hd-model-kv td.hd-kv-k{color:var(--text-faint);white-space:nowrap}
 .hd-cand-svc{float:right;color:var(--text-faint);font-size:.72rem;font-family:var(--font-ui)}
 .host-checked{color:var(--text-dim);flex-shrink:0;padding-left:var(--sp-3);white-space:nowrap;font-size:var(--fs-xs)}
 .host-model{font-family:var(--font-mono);font-size:var(--fs-sm);color:var(--text-dim);max-width:50%;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.skip-link{opacity:0;color:var(--accent);font-size:var(--fs-xs);text-decoration:underline;margin:0 var(--sp-3);flex-shrink:0;transition:opacity .1s}
-.model-item:hover .skip-link{opacity:1}
 .host-tabs{display:flex;gap:var(--sp-1);border-bottom:1px solid var(--border);margin-bottom:var(--sp-4);flex-shrink:0;overflow-x:auto;overflow-y:hidden;flex-wrap:nowrap;scrollbar-width:none;-webkit-overflow-scrolling:touch}
 .host-tabs::-webkit-scrollbar{display:none}
 .htab{background:transparent;color:var(--text-muted);border:none;border-bottom:2px solid transparent;margin-bottom:-1px;padding:7px 14px;font-size:var(--fs-sm);cursor:pointer;display:inline-flex;align-items:center;gap:5px;border-radius:var(--r-md) var(--r-md) 0 0;flex-shrink:0;white-space:nowrap}
@@ -2968,12 +2966,10 @@ function hostDetailHtml(host,j){
 }
 // A host row in the recent/good/maybe/bad panes opens the HOST CARD (same as the
 // model->host list), instead of linking straight out to the box — these lists were
-// built before the host card existed. The 'skip' action stays its own link.
-function hostRow(host,model,skipHref){
+// built before the host card existed.
+function hostRow(host,model){
   var d=document.createElement('div');d.className='model-item';d.style.cursor='pointer';d.title='host details';
   var n=document.createElement('span');n.className='host-name';n.textContent=host;d.appendChild(n);
-  if(skipHref){var a=document.createElement('a');a.className='skip-link';a.href=skipHref;a.textContent='skip';
-    a.addEventListener('click',function(ev){ev.stopPropagation()});d.appendChild(a)}
   var mm=document.createElement('span');mm.className='host-model';mm.textContent=model||'(any)';mm.title=model||'(any)';d.appendChild(mm);
   d.addEventListener('click',function(){if(_selHostRow===d){closeHostDetailCard();return}selectHostRow(d);openHostDetail(host)});
   return d;
@@ -2984,12 +2980,12 @@ function hostRow(host,model,skipHref){
 var _hostData={last:[],good:[],maybe:[],bad:[]};
 function _byModel(a,b){var am=a.slice(a.indexOf(' ')+1),bm=b.slice(b.indexOf(' ')+1);return am<bm?-1:am>bm?1:(a<b?-1:a>b?1:0)}
 function _setCount(id,n){var e=document.getElementById(id);if(e)e.textContent=fmtCount(n)}
-function renderKeyPane(listId,moreId,countId,arr,q,skip,total){
+function renderKeyPane(listId,moreId,countId,arr,q,total){
   var c=document.getElementById(listId);c.innerHTML='';
   var matched=globSearch(q,arr);
   matched.slice(0,30).forEach(function(x){
     var i=x.indexOf(' '),h=x.slice(0,i),mo=x.slice(i+1);
-    c.appendChild(hostRow(h,mo,skip?'skip-good?host='+encodeURIComponent(h)+'&model='+encodeURIComponent(mo):null));
+    c.appendChild(hostRow(h,mo));
   });
   // The client only holds the most-recent slice the server sent, not the whole
   // pool — so when unfiltered, show the server's TRUE total (matched.length would
@@ -3005,11 +3001,11 @@ function renderHostPanes(){
   var lm=globSearch(q,_hostData.last,function(e){return (e.host||'')+' '+(e.model||'')});
   if(!lm.length){last.innerHTML='<div style="color:var(--text-muted);font-size:var(--fs-md)">'
     +(q&&_hostData.last.length?'None matching the filter':'None')+'</div>'}
-  else lm.forEach(function(e){last.appendChild(hostRow(e.host,e.model,'next-host?model='+encodeURIComponent(e.model||'')))});
+  else lm.forEach(function(e){last.appendChild(hostRow(e.host,e.model))});
   _setCount('cnt-last',lm.length);
-  renderKeyPane('goodList','goodMore','cnt-good',_hostData.good,q,true,_hostData.good_count);
-  renderKeyPane('maybeList','maybeMore','cnt-maybe',_hostData.maybe,q,true,_hostData.maybe_count);
-  renderKeyPane('badList','badMore','cnt-bad',_hostData.bad,q,false,_hostData.bad_count);
+  renderKeyPane('goodList','goodMore','cnt-good',_hostData.good,q,_hostData.good_count);
+  renderKeyPane('maybeList','maybeMore','cnt-maybe',_hostData.maybe,q,_hostData.maybe_count);
+  renderKeyPane('badList','badMore','cnt-bad',_hostData.bad,q,_hostData.bad_count);
 }
 function renderHostLists(d){
   _hostData.last=d.last||[];
