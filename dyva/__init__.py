@@ -10581,15 +10581,19 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                             f"worker manually stopped: {model}", wid=job_wid)
                     elif outcome != "done":
                         # 'skip' (operator), 'stalled' (silent past TIMEOUT / dropped), or
-                        # 'capped' (hit WORKER_MAX): abandon THIS host. SOFT demote and fail
-                        # over; the sticky is cleared in record_verdict so it isn't tried
-                        # FIRST next time.
+                        # 'capped' (hit WORKER_MAX): abandon THIS host and fail over. ONLY a
+                        # genuine 'stalled' is a host-quality verdict — demote it (the sticky
+                        # is cleared in record_verdict so it isn't tried FIRST next time). An
+                        # operator Skip or the duration cap are NOT the host's fault, so they
+                        # never ding reputation (mirrors _pump_stream / _stream_chat_failover).
+                        if outcome == "stalled":
+                            record_verdict(host, full, timed_out("stream stalled"))
                         _why = {"skip": "skipped by operator",
                                 "capped": f"hit the {WORKER_MAX}s max run time"}.get(
                                     outcome, f"no tokens for {TIMEOUT}s")
-                        record_verdict(host, full, timed_out(f"stream {outcome}"))
                         errors.append(f"{host}: stream {outcome}")
-                        await broadcast_activity(host, model, "failed",
+                        await broadcast_activity(host, model,
+                            "failed" if outcome == "stalled" else "warming",
                             f"stream {outcome}: {host}@{model} — {_why}", wid=job_wid)
                         _servers = [s for s in _servers if s[1] != host]
                         _set_worker_phase(job_wid, None)
