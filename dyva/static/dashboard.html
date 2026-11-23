@@ -1912,10 +1912,11 @@ body.dragging-image .hist-item{cursor:grabbing}
 <!-- Session login (privacy facet, NOT the admin password and NOT a privilege system).
      "Register" is deliberately meaningless: it just stores user/pass in localStorage so
      your chats and sessions follow you. The password is not a real credential — it can't
-     be revoked, cycled, or recovered; it's entropy that namespaces your space. Sits above
-     BOTH the admin unlock (non-admin view) and the routing config (admin view). The inputs
-     are type=text on purpose: no secret, "don't forget it" favors seeing it, and it avoids
-     the live-password-field autofill hijack the admin password dances around. -->
+     be revoked, cycled, or recovered; it's entropy that namespaces your space. Shown in both
+     views but relocated by showSettingsLocked(): non-admin -> above the admin unlock; admin
+     -> inside the settings list, below Congeniality / above Server. The inputs are type=text
+     on purpose: no secret, "don't forget it" favors seeing it, and it avoids the
+     live-password-field autofill hijack the admin password dances around. -->
 <div id="userLogin" class="settings-card user-login">
 <div class="settings-card-title">Login</div>
 <div class="rc-hint">A private space for your chats and sessions, so they follow you across devices. Pick a name and (optionally) a passphrase. This has <b>nothing to do with the admin password</b> &mdash; it gates nothing, it's only a privacy facet. <b>There is no signup &mdash; just choose one. There is no recovery &mdash; don't forget it.</b></div>
@@ -2063,7 +2064,7 @@ body.dragging-image .hist-item{cursor:grabbing}
 </div>
 <div class="settings-actions"><span class="settings-status"></span><button type="button" class="settings-save">Save</button></div>
 </div>
-<div class="settings-card">
+<div class="settings-card" id="serverCard">
 <div class="settings-card-title">Server</div>
 <label class="setting"><span class="setting-text"><span class="setting-name">Shut down dyva</span><small class="setting-help">Stop the server process (like Ctrl+C in the terminal). You'll need host/terminal access to start it again. Admin-gated: requires the admin password when one is set.</small></span><button type="button" id="shutdownBtn" class="settings-shutdown">Shutdown</button></label>
 </div>
@@ -10955,6 +10956,14 @@ function injectSettingsPwFields(){
 function showSettingsLocked(locked){
   document.getElementById('settingsLogin').style.display=locked?'':'none';
   document.getElementById('settingsBody').style.display=locked?'none':'';
+  // The Login card lives in a different spot per view (it's a privacy facet, shown in both):
+  // non-admin -> above the admin unlock; admin -> inside the settings list, below
+  // Congeniality / above Server. One node, relocated by a DOM move (never cloned).
+  var ul=document.getElementById('userLogin');
+  if(ul){
+    var anchor=locked?document.getElementById('settingsLogin'):document.getElementById('serverCard');
+    if(anchor&&anchor.parentNode&&ul.nextSibling!==anchor)anchor.parentNode.insertBefore(ul,anchor);
+  }
 }
 // Session login: a PRIVACY facet, independent of the admin lock above. "Logging in" just
 // stores user/pass in localStorage (no signup, no server round-trip, no recovery); the

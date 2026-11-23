@@ -2527,11 +2527,37 @@ def _parse_zoomeye(data, service):
     return hosts
 
 
+def _zoomeye_http_get(url, headers, params):
+    """GET www.zoomeye.ai/api/search through a Chrome-TLS-impersonating client.
+
+    ZoomEye fronts the API with bot management that fingerprints the TLS/HTTP2
+    handshake (JA3/JA4); a plain HTTP client — requests, curl — can be 403'd or
+    handed a challenge at the handshake layer no matter how right the cookie and
+    User-Agent are. curl_cffi replays Chrome's own handshake so the request is let
+    through. Same seam as _censys_http_get, with ONE difference: we KEEP the caller's
+    User-Agent. ZoomEye's session clearance is UA-bound (it must match the browser
+    that minted ZOOMEYE_COOKIE), and ZOOMEYE_UA is already a Chrome UA, so the header
+    stays consistent with the impersonated Chrome fingerprint instead of becoming the
+    kind of UA/fingerprint mismatch that is itself a detection signal.
+
+    Imported lazily so only ZoomEye fetches require curl_cffi."""
+    try:
+        from curl_cffi import requests as cffi_requests
+    except ImportError:
+        log.error("ZoomEye fetch needs curl_cffi — www.zoomeye.ai blocks plain HTTP "
+                  "clients at the TLS-fingerprint layer. It is in pyproject.toml; install "
+                  "it (e.g. `uv pip install curl_cffi`).")
+        raise SystemExit(3)
+    return cffi_requests.get(url, headers=headers, params=params, impersonate="chrome", timeout=30)
+
+
 def _fetch_zoomeye(dry, svc, base_query, page=1, run_ts=None, curlify=False, label="", pname="any"):
     """One ZoomEye /api/search page as JSON, or None to STOP. The query is base64'd
     (their `q` encoding); auth is the session cookie + the JWT echoed as
-    Cube-Authorization — both from ZOOMEYE_COOKIE, never hard-coded. No retry:
-    an HTTP error or unparsable body means we stop and die, by design."""
+    Cube-Authorization — both from ZOOMEYE_COOKIE, never hard-coded. The fetch goes
+    through _zoomeye_http_get, which impersonates Chrome's TLS handshake (see there) —
+    www.zoomeye.ai can 403/challenge a non-browser handshake. No retry: an HTTP error
+    or unparsable body means we stop and die, by design."""
     import requests
     import curlify as curlify_mod
     import base64
@@ -2566,20 +2592,23 @@ def _fetch_zoomeye(dry, svc, base_query, page=1, run_ts=None, curlify=False, lab
     # Surface the REAL error kind, not a bare status: ZoomEye puts the reason
     # (expired/invalid cookie, insufficient points, rate limit) in the response
     # body, and can even return HTTP 200 with an error `status`/`message` in JSON.
+    # curl_cffi raises its own exception types (not requests.exceptions.*), so catch broadly.
     try:
-        resp = requests.get(ZOOMEYE_API, headers=headers, params=params, timeout=30)
-    except requests.exceptions.RequestException as e:
+        resp = _zoomeye_http_get(ZOOMEYE_API, headers, params)
+    except Exception as e:
         log.warning(f"zoomeye: stopping — request failed ({type(e).__name__}): {e}")
         return None
     if resp.status_code != 200:
         log.warning(f"zoomeye: stopping — HTTP {resp.status_code}: {(resp.text or '')[:300]}")
-        # Dump the EXACT request we sent (resp.request = the real PreparedRequest, every
-        # header/cookie/UA included) so it can be diffed against the browser's request to
-        # see what the anti-bot wall is keying on. Contains the cookie — local debug only.
+        # Dump the EXACT request we sent so it can be diffed against the browser's request
+        # to see what the anti-bot wall is keying on. Rebuilt as a requests PreparedRequest
+        # (curl_cffi's resp.request isn't one curlify can read) — this reproduces every
+        # header/cookie/UA/param we set, MINUS the Chrome TLS impersonation, which plain
+        # curl can't replay. Contains the cookie — local debug only.
         try:
             import curlify as curlify_mod
             log.warning("zoomeye: the exact request we sent (compare with your browser) —\n"
-                        + curlify_mod.to_curl(resp.request))
+                        + curlify_mod.to_curl(requests.Request("GET", ZOOMEYE_API, headers=headers, params=params).prepare()))
         except Exception as _e:
             log.debug(f"zoomeye: could not curlify the failed request: {_e}")
         return None
