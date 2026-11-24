@@ -40,7 +40,9 @@ It installs to `~/dyva`; start it again anytime with `~/dyva/start.sh` (any dyva
 
 Along with being so ollama-compatible the ollama client doesn't know the difference, dyva has a feature-rich front-end with chat that includes image generation, web search, sub-agents, documents, host drilldown and exploration, video generation, tts, stats, geomaps, and even graphically tweaking the routing algorithm.
 
-Memory footprint is under 200MB. Has both light and dark mode. Out of whim and mischief you toggle it by clicking on the D in the logo. what do the letters do? Find out!
+Memory footprint is under 300MB. The demo server which often goes through 500M tokens a day, is a 2015 era desktop. Dyva runs just about anywhere.
+
+Dyva both light and dark mode. Out of whim and mischief you toggle it by clicking on the D in the logo. what do the letters do? Find out!
 <div align="center">
   <img width="45%" alt="sshot" src="https://github.com/user-attachments/assets/7e02db46-bf57-43fd-bacb-21c83c14d3ae" />
   <img width="45%" alt="sshot" src="https://github.com/user-attachments/assets/5126f11a-5d08-4136-95cc-2cbfa37f49fa" />
