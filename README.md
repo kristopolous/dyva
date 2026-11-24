@@ -42,7 +42,7 @@ Along with being so ollama-compatible the ollama client doesn't know the differe
 
 Memory footprint is under 300MB. The demo server which often serves over 1B tokens a day without any issue, is a 2015 era desktop. Dyva runs just about anywhere.
 
-Dyva both light and dark mode. Out of whim and mischief you toggle it by clicking on the D in the logo. what do the letters do? Find out!
+It has both light and dark mode. Out of whim and mischief you toggle it by clicking on the D in the logo. what do the letters do? Find out!
 <div align="center">
   <img width="45%" alt="sshot" src="https://github.com/user-attachments/assets/7e02db46-bf57-43fd-bacb-21c83c14d3ae" />
   <img width="45%" alt="sshot" src="https://github.com/user-attachments/assets/5126f11a-5d08-4136-95cc-2cbfa37f49fa" />
