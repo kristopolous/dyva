@@ -60,11 +60,22 @@ def test_owned_chat_is_never_stolen_or_unclaimed(chats_db):
     assert _uh("c1") == "uh1"                            # not un-claimed
 
 
-def test_reads_stay_global_regardless_of_provenance(chats_db):
+def test_reads_are_scoped_by_provenance(chats_db):
+    # Reads are now scoped (see test_private_chats): the public feed is global-only, a user's
+    # private view is their own-only. Provenance is what drives the split.
     dyva._chat_upsert("c1", {"title": "mine"}, "uh1")
     dyva._chat_upsert("c2", {"title": "global"})
-    ids = {c["id"] for c in dyva._chats_list()}
-    assert ids == {"c1", "c2"}                           # both listed — no filtering yet
+    assert {c["id"] for c in dyva._chats_list(scope="public")} == {"c2"}
+    assert {c["id"] for c in dyva._chats_list("uh1", scope="private")} == {"c1"}
+
+
+def test_old_chats_are_never_evicted(chats_db):
+    # We keep every chat now. Saving well past the old CHATS_KEEP cap must drop nothing —
+    # the sidebar store is durable, not a rolling window.
+    n = dyva.CHATS_KEEP + 50
+    for i in range(n):
+        dyva._chat_upsert(f"c{i}", {"title": f"t{i}", "createdAt": float(i)})
+    assert len(dyva._chats_list()) == n
 
 
 def test_existing_db_migrates_old_rows_to_null(tmp_path, monkeypatch):

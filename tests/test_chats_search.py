@@ -19,7 +19,10 @@ import dyva    # noqa: E402
 
 def _db(rows):
     conn = sqlite3.connect(":memory:")
-    conn.execute("CREATE TABLE chats(id TEXT PRIMARY KEY, title TEXT, created REAL, data TEXT NOT NULL)")
+    # userhash column matches the real schema; these rows are global (NULL), so a default
+    # (public) scope search returns them exactly as before provenance scoping existed.
+    conn.execute("CREATE TABLE chats(id TEXT PRIMARY KEY, title TEXT, created REAL, "
+                 "data TEXT NOT NULL, userhash TEXT)")
     for cid, title, created, msgs in rows:
         data = json.dumps({"id": cid, "title": title, "messages": msgs})
         conn.execute("INSERT INTO chats(id,title,created,data) VALUES(?,?,?,?)",
