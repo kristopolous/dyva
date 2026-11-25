@@ -24110,7 +24110,6 @@ def main():
     parser.add_argument("--refresh-only", nargs="?", const=True, default=False, metavar="SOURCE", help="like --refresh but do NOT cleanse — keep everything, including the fake/imposter/phantom hosts")
     parser.add_argument("--refresh-reference", nargs="*", default=None, metavar="SOURCE", help="refresh the externally-sourced reference JSONs from upstream in one go (prices from OpenRouter, release dates from Artificial Analysis) and rewrite them for you to review/commit; nothing routes or bills on them. Name sources to limit it, e.g. --refresh-reference prices dates; bare = all.")
     parser.add_argument("--cleanse", nargs="*", metavar="TYPE", help="expunge fake MODEL entries from the pool (hosts are never removed; removals logged to free-ollama.cleansed.json): '--cleanse' dry-run report of all; '--cleanse fake|cloud|junk|all [apply]' to act on one type")
-    parser.add_argument("-w", "--workers",  type=int, default=3, help="number of workers (default: 3)")
     parser.add_argument("-l", "--local",    action="store_true", help="restrict inference endpoints to localhost only")
     parser.add_argument("--socks", type=str, default=None, metavar="URL", help="route ALL upstream connections through a SOCKS/HTTP proxy, e.g. --socks socks5h://127.0.0.1:1080 (DNS resolves at the proxy, no leak). Also honored: $DYVA_SOCKS, $SOCKS_PROXY.")
     parser.add_argument("--source", nargs="+", metavar=("CMD"),
@@ -24165,7 +24164,6 @@ def main():
     if args.version:
         sys.exit(0)
 
-    WORKER_COUNT = args.workers
     TIMEOUT = args.timeout
     PORT = args.port
     _LOCAL = args.local

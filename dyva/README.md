@@ -30,7 +30,6 @@ Here it is. See all the tools. This interacts with all the discovered infrastruc
 | `-p`, `--port` | Port to listen on (default: 11434) |
 | `-u`, `--host` | Host address to bind (default: all interfaces) |
 | `-t`, `--timeout` | Request timeout seconds (default: 30) |
-| `-w`, `--workers` | Concurrent workers (default: 3) |
 | `-l`, `--local` | Restrict inference endpoints to localhost only |
 | `-r`, `--refresh` | Refresh server cache and exit; optionally name a single source (e.g. `--refresh graflex`) — other sources keep their last-fetched data |
 | `--source` | Manage host sources: `--source list`, `--source add <url>`, `--source disable <name>\|all`, `--source enable <name>\|all` — see [below](#running-it-over-your-own-machines) |
