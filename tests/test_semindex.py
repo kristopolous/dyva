@@ -241,6 +241,15 @@ class _Req:
 def test_chats_endpoint_uses_semantic(sem, monkeypatch):
     monkeypatch.setattr(dyva, "_embed_text", _fake_embedder())
     monkeypatch.setattr(dyva, "_corpus_items", _fake_corpus)
+    # The index is built from the chats table, so a ranked hit is backed by a real row. Seed the
+    # indexed chats as public (NULL userhash) so the scope post-filter keeps them.
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE chats(id TEXT PRIMARY KEY, title TEXT, created REAL, "
+                 "data TEXT, userhash TEXT)")
+    for cid in ("c1", "c2"):
+        conn.execute("INSERT INTO chats(id,title,created,data) VALUES(?,'',1.0,'{}')", (cid,))
+    conn.commit()
+    monkeypatch.setattr(dyva, "_chats_db", conn, raising=False)
 
     async def _ok(req):
         return None
@@ -258,8 +267,9 @@ def test_chats_endpoint_falls_back_to_keyword(sem, monkeypatch):
     monkeypatch.setattr(dyva, "_embed_text", _no_host)
 
     conn = sqlite3.connect(":memory:")
-    conn.execute("CREATE TABLE chats(id TEXT PRIMARY KEY, title TEXT, created REAL, data TEXT NOT NULL)")
-    conn.execute("INSERT INTO chats VALUES('k1','Garden',1.0,?)",
+    conn.execute("CREATE TABLE chats(id TEXT PRIMARY KEY, title TEXT, created REAL, "
+                 "data TEXT NOT NULL, userhash TEXT)")
+    conn.execute("INSERT INTO chats(id,title,created,data) VALUES('k1','Garden',1.0,?)",
                  (json.dumps({"messages": [{"role": "user", "content": "tomato soup"}]}),))
     conn.commit()
     monkeypatch.setattr(dyva, "_chats_db", conn, raising=False)

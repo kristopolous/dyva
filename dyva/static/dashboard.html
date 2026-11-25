@@ -934,6 +934,11 @@ body.col-resizing,body.col-resizing *{cursor:col-resize!important;user-select:no
 .sidebar-search input::placeholder{color:var(--text-faint)}
 .sidebar-add{flex:0 0 auto;width:32px;height:32px;padding:0;font-size:1.25rem;line-height:1;cursor:pointer;background:var(--surface);color:var(--text-2);border:1px solid var(--border);border-radius:var(--r-md);display:flex;align-items:center;justify-content:center}
 .sidebar-add:hover{color:var(--text);background:var(--accent-bg)}
+.scope-toggle{display:flex;gap:3px;margin:0 0 8px;background:var(--bg-sunken);border:1px solid var(--border);border-radius:var(--r-md);padding:3px}
+.scope-toggle[hidden]{display:none}
+.scope-toggle button{flex:1;border:0;background:transparent;color:var(--text-2);font:inherit;font-size:var(--fs-sm);font-weight:600;padding:5px 8px;border-radius:calc(var(--r-md) - 2px);cursor:pointer}
+.scope-toggle button:hover{color:var(--text)}
+.scope-toggle button.on{background:var(--accent-bg-active);color:var(--text)}
 .chat-list{flex:1;overflow-y:auto;padding:0 var(--sp-2) 10px}
 /* Recency group headers in the chat list — sticky so the current group labels what you're scrolling. */
 .chat-group-hdr{font-size:var(--fs-2xs);text-transform:uppercase;letter-spacing:var(--eyebrow-tracking);color:var(--text-faint);padding:12px var(--sp-3) 4px;position:sticky;top:0;background:var(--bg-sunken);z-index:1}
@@ -1553,6 +1558,10 @@ body.dragging-image .hist-item{cursor:grabbing}
 <input id="chatSearch" type="text" placeholder="Search chats" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false">
 </div>
 <button id="chatNew" class="sidebar-add" title="New chat" aria-label="New chat">+</button>
+</div>
+<div id="chatScopeToggle" class="scope-toggle" hidden>
+<button type="button" class="on" data-scope="private" onclick="setChatScope('private')">Private</button>
+<button type="button" data-scope="public" onclick="setChatScope('public')">Public</button>
 </div>
 <div id="chatList" class="chat-list"></div>
 </div>
@@ -3694,6 +3703,32 @@ function serializeChat(c){
 }
 // Per-chat saves: async, debounced, coalesced by id (latest wins), non-blocking.
 var _pendingSaves={},_saveTimer=null,_saveInFlight=false;
+// --- Private / Public chats: identity rides the api-key "env bag" (user=…;pass=…) in the
+// Authorization header, so the server scopes the sidebar to you. Blank bag == anonymous (public).
+function _chatBag(){
+  try{var u=(localStorage.getItem('dyva_user')||'').trim();if(!u)return '';
+    var p=(localStorage.getItem('dyva_pass')||'').trim();
+    return 'user='+u+(p?';pass='+p:'');}catch(e){return ''}
+}
+function _loggedIn(){return !!_chatBag();}
+function _chatAuth(x){var b=_chatBag();if(b){try{x.setRequestHeader('Authorization','Bearer '+b);}catch(e){}}}
+function _chatAuthHeaders(){var b=_chatBag();return b?{'Authorization':'Bearer '+b}:{};}
+// Which half of the split the sidebar shows. Private only exists when signed in; signing out
+// falls back to the public feed.
+var _chatScope=_loggedIn()?'private':'public';
+function setChatScope(s){
+  if(s==='private'&&!_loggedIn())s='public';
+  if(s!=='private'&&s!=='public')return;
+  _chatScope=s;renderChatScope();loadChatIndex();   // re-list under the new scope
+}
+function renderChatScope(){
+  var t=document.getElementById('chatScopeToggle');if(!t)return;
+  var inn=_loggedIn();t.hidden=!inn;                 // the toggle only exists when signed in
+  if(!inn)_chatScope='public';
+  Array.prototype.forEach.call(t.querySelectorAll('button'),function(b){
+    b.classList.toggle('on',b.getAttribute('data-scope')===_chatScope);
+  });
+}
 function saveChat(chat){
   if(!chat||chat.id===undefined||chat.id===null)return;
   _pendingSaves[String(chat.id)]=serializeChat(chat);
@@ -3710,7 +3745,7 @@ function flushSaves(){
     var body=_pendingSaves[id];delete _pendingSaves[id];
     try{
       var x=new XMLHttpRequest();x.open('POST','api/chats/'+encodeURIComponent(id),true);
-      x.setRequestHeader('Content-Type','application/json');
+      x.setRequestHeader('Content-Type','application/json');_chatAuth(x);
       x.onloadend=done;x.send(JSON.stringify(body));
     }catch(e){done()}
   });
@@ -3725,7 +3760,7 @@ window.addEventListener('pagehide',_beaconSave);
 document.addEventListener('visibilitychange',function(){if(document.hidden)_beaconSave()});
 function fetchChat(id,cb){
   try{
-    var x=new XMLHttpRequest();x.open('GET','api/chats/'+encodeURIComponent(id),true);
+    var x=new XMLHttpRequest();x.open('GET','api/chats/'+encodeURIComponent(id),true);_chatAuth(x);
     x.onload=function(){var c=null;if(x.status===200){try{c=JSON.parse(x.responseText)}catch(e){}}cb(c)};
     x.onerror=function(){cb(null)};
     x.send();
@@ -3734,7 +3769,7 @@ function fetchChat(id,cb){
 function fetchChatP(id){return new Promise(function(res){fetchChat(id,res)})}
 function loadChatIndex(cb){
   try{
-    var x=new XMLHttpRequest();x.open('GET','api/chats',true);
+    var x=new XMLHttpRequest();x.open('GET','api/chats?scope='+_chatScope,true);_chatAuth(x);
     x.onload=function(){_chatIndexLoaded=true;if(x.status===200){try{chatIndex=JSON.parse(x.responseText).chats||[]}catch(e){chatIndex=[]}}renderSidebar();if(cb)cb()};
     x.onerror=function(){_chatIndexLoaded=true;if(cb)cb()};
     x.send();
@@ -3807,7 +3842,7 @@ function deleteChat(id){
   if(String(currentChat.id)===String(id)){currentChat={id:Date.now(),createdAt:Date.now(),title:'',model:'',messages:[],documents:[]};renderMessages();activeStatus=null;refreshSendButton();activeDocId=null;hideDocPanel();refreshDocUI();location.hash='chat';}
   var i=idxOf(id);if(i>=0)chatIndex.splice(i,1);
   delete _pendingSaves[String(id)];   // don't let a queued save resurrect it
-  try{var x=new XMLHttpRequest();x.open('POST','api/chats/'+encodeURIComponent(id)+'/delete',true);x.send();}catch(e){}
+  try{var x=new XMLHttpRequest();x.open('POST','api/chats/'+encodeURIComponent(id)+'/delete',true);_chatAuth(x);x.send();}catch(e){}
   renderSidebar();
 }
 function cleanTitle(txt){
@@ -6407,7 +6442,7 @@ async function runStream(chatId,chatCreated,chatTitle,model,msgs,bubble,depth,ex
         if(!_cq){results.push({text:'Call search_chats again with "query" set to what to look for.'});}
         else{
           try{
-            var _cr=await fetch('api/chats?q='+encodeURIComponent(_cq),{cache:'no-store',signal:ac.signal});
+            var _cr=await fetch('api/chats?q='+encodeURIComponent(_cq)+'&scope='+_chatScope,{cache:'no-store',signal:ac.signal,headers:_chatAuthHeaders()});
             var _cj=await _cr.json();var _chits=(_cj&&_cj.hits)||[];
             if(!_chits.length)results.push({text:'No past chats mention "'+_cq+'".',md:'`search_chats` "'+_cq.slice(0,60)+'" → 0'});
             else{
@@ -10982,6 +11017,7 @@ function userLoginRender(){
   if(u){inn.style.display='';out.style.display='none';
     var who=document.getElementById('userLoginWho');if(who)who.textContent=u;}
   else{inn.style.display='none';out.style.display='';}
+  renderChatScope();            // keep the sidebar's Private/Public toggle in sync with login
 }
 function userLoginSet(){
   var name=(document.getElementById('userLoginName').value||'').trim();
@@ -10994,11 +11030,13 @@ function userLoginSet(){
   if(st)st.textContent='';
   document.getElementById('userLoginPass').value='';
   userLoginRender();
+  setChatScope('private');       // signed in now — show your private chats
 }
 function userLoginClear(){
   try{localStorage.removeItem('dyva_user');localStorage.removeItem('dyva_pass');}catch(e){}
   var n=document.getElementById('userLoginName');if(n)n.value='';
   userLoginRender();
+  setChatScope('public');        // back to the public feed
 }
 try{userLoginRender();}catch(e){}
 // Live settings filter, same idea as a browser's settings search box: type to narrow

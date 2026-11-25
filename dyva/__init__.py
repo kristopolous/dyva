@@ -14875,14 +14875,26 @@ def _get_chats_db():
     return _chats_db
 
 
-def _chats_list():
-    """Lightweight sidebar list: id, title, createdAt only — no message bodies."""
-    return [{"id": r[0], "title": r[1] or "", "createdAt": r[2]}
-            for r in _get_chats_db().execute(
-                "SELECT id, title, created FROM chats ORDER BY created DESC").fetchall()]
+def _chats_list(userhash=None, scope="public"):
+    """Lightweight sidebar list: id, title, createdAt only — no message bodies. Scoped by
+    provenance for the Private / Public split: scope="public" is the global feed (userhash IS
+    NULL) — all a signed-out caller ever sees; scope="private" is the signed-in caller's own
+    chats (userhash = theirs), and empty with no identity."""
+    db = _get_chats_db()
+    if scope == "private":
+        if not userhash:
+            return []
+        rows = db.execute("SELECT id, title, created FROM chats WHERE userhash=? "
+                          "ORDER BY created DESC", (userhash,)).fetchall()
+    else:
+        rows = db.execute("SELECT id, title, created FROM chats WHERE userhash IS NULL "
+                          "ORDER BY created DESC").fetchall()
+    return [{"id": r[0], "title": r[1] or "", "createdAt": r[2]} for r in rows]
 
 
 def _chat_get(cid):
+    """One chat's full content by id, UNSCOPED. Used by the explicit public share surface
+    (/docs/{cid}/{doc}); the in-app sidebar uses _chat_get_scoped instead."""
     row = _get_chats_db().execute(
         "SELECT data FROM chats WHERE id=?", (str(cid),)).fetchone()
     if not row:
@@ -14891,6 +14903,37 @@ def _chat_get(cid):
         return json.loads(row[0])
     except Exception:
         return None
+
+
+def _chat_get_scoped(cid, userhash=None):
+    """One chat by id, but only if the caller may see it: a public (NULL) chat opens for
+    anyone; an owned chat only for its owner. Returns None when the chat is missing OR hidden
+    — the two are indistinguishable so a guessed id can't confirm a private chat exists."""
+    row = _get_chats_db().execute(
+        "SELECT data, userhash FROM chats WHERE id=?", (str(cid),)).fetchone()
+    if not row:
+        return None
+    data, owner = row
+    if owner is not None and owner != userhash:
+        return None
+    try:
+        return json.loads(data)
+    except Exception:
+        return None
+
+
+def _chat_visible(cid, userhash=None, scope="public"):
+    """Is chat `cid` visible under this (userhash, scope)? Drives the semantic-search
+    post-filter so a ranked hit can't leak a chat the scoped list wouldn't show. A missing
+    chat is not visible. public -> owner IS NULL; private -> owner == userhash."""
+    row = _get_chats_db().execute(
+        "SELECT userhash FROM chats WHERE id=?", (str(cid),)).fetchone()
+    if row is None:
+        return False
+    owner = row[0]
+    if scope == "private":
+        return bool(userhash) and owner == userhash
+    return owner is None
 
 
 def _chat_upsert(cid, obj, userhash=None):
@@ -14910,29 +14953,46 @@ def _chat_upsert(cid, obj, userhash=None):
         " ON CONFLICT(id) DO UPDATE SET title=excluded.title, data=excluded.data,"
         " userhash=COALESCE(chats.userhash, excluded.userhash)",
         (str(cid), title, created, json.dumps(obj, ensure_ascii=False), userhash or None))
-    db.execute(
-        "DELETE FROM chats WHERE id NOT IN "
-        "(SELECT id FROM chats ORDER BY created DESC LIMIT ?)", (CHATS_KEEP,))
+    # No eviction: the sidebar store is durable. We used to cap it at CHATS_KEEP and drop the
+    # oldest rows, but chats are the user's data, not a rolling window — we keep them all.
+    # (CHATS_KEEP is retained as the reference the uncapped user_sessions store is measured against.)
     db.commit()
 
 
-def _chat_delete(cid):
+def _chat_delete(cid, userhash=None):
+    """Delete one chat by id. An owned chat deletes only for its owner; a public (NULL) chat
+    stays deletable by anyone (unchanged). Returns True iff a row was deleted."""
     db = _get_chats_db()
+    row = db.execute("SELECT userhash FROM chats WHERE id=?", (str(cid),)).fetchone()
+    if row is None:
+        return False
+    owner = row[0]
+    if owner is not None and owner != userhash:
+        return False                                # someone else's private chat — refuse
     db.execute("DELETE FROM chats WHERE id=?", (str(cid),))
     db.commit()
+    return True
 
 
-def _chats_search(query, limit=8):
+def _chats_search(query, userhash=None, scope="public", limit=8):
     """Search saved chats (title + message text) for ALL query words, newest-first.
     Returns up to `limit` {id, title, snippet} — a short context window around the first
-    match (via _doc_snippet). Bodies are read here but never returned whole. Same store
-    the sidebar lists, so this exposes nothing the chat list doesn't already."""
+    match (via _doc_snippet). Bodies are read here but never returned whole. Scoped the same
+    way as _chats_list, so search exposes nothing the scoped sidebar list doesn't already."""
     words = [w for w in re.split(r"\W+", str(query or "").lower()) if w]
     if not words:
         return []
+    db = _get_chats_db()
+    if scope == "private":
+        if not userhash:
+            return []
+        cur = db.execute("SELECT id, title, data FROM chats WHERE userhash=? "
+                         "ORDER BY created DESC", (userhash,))
+    else:
+        cur = db.execute("SELECT id, title, data FROM chats WHERE userhash IS NULL "
+                         "ORDER BY created DESC")
     out = []
-    for cid, title, data in _get_chats_db().execute(
-            "SELECT id, title, data FROM chats ORDER BY created DESC").fetchall():
+    for cid, title, data in cur.fetchall():
         try:
             obj = json.loads(data or "")
         except (ValueError, TypeError):
@@ -15727,6 +15787,10 @@ async def handle_chats_get(request):
     resp = await _check_local(request)
     if resp:
         return resp
+    # Private / Public split: identity rides the api-key bag; the Private view only exists for a
+    # signed-in caller, so scope falls back to Public (global feed) whenever there's no userhash.
+    uh = _userhash_from_request(request)
+    scope = "private" if (request.query.get("scope") == "private" and uh) else "public"
     q = (request.query.get("q") or "").strip()
     if q:
         try:
@@ -15738,11 +15802,14 @@ async def handle_chats_get(request):
         hits = await _semantic_search(request.app["session"], EMBED_MODEL, q,
                                       kinds=("chat",), limit=limit)
         if hits is None:
-            return web.json_response({"hits": _chats_search(q, limit)})
+            return web.json_response({"hits": _chats_search(q, uh, scope, limit)})
+        # The index is global, so filter ranked hits to what this scope may actually see —
+        # a semantic hit must never surface a chat the scoped list wouldn't.
+        hits = [h for h in hits if _chat_visible(h["ref"], uh, scope)]
         return web.json_response(
             {"hits": [{"id": h["ref"], "title": h["title"], "snippet": h["snippet"]}
                       for h in hits]})
-    return web.json_response({"chats": _chats_list()})
+    return web.json_response({"chats": _chats_list(uh, scope)})
 
 
 async def handle_chat_get(request):
@@ -15750,7 +15817,9 @@ async def handle_chat_get(request):
     resp = await _check_local(request)
     if resp:
         return resp
-    chat = _chat_get(request.match_info["cid"])
+    # Ownership-gated: a public chat opens for anyone, an owned chat only for its owner, and a
+    # hidden chat 404s exactly like a missing one so a guessed id can't confirm it exists.
+    chat = _chat_get_scoped(request.match_info["cid"], _userhash_from_request(request))
     if chat is None:
         return web.json_response({"error": "not found"}, status=404)
     return web.json_response(chat)
@@ -15776,7 +15845,9 @@ async def handle_chat_delete(request):
     resp = await _check_local(request)
     if resp:
         return resp
-    _chat_delete(request.match_info["cid"])
+    ok = _chat_delete(request.match_info["cid"], _userhash_from_request(request))
+    if not ok:
+        return web.json_response({"error": "not found"}, status=404)
     return web.json_response({"ok": True})
 
 
