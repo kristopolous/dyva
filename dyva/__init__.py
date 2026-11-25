@@ -11037,9 +11037,9 @@ async def handle_dashboard(request):
     servers = load_servers()
     html = _dashboard_template()
     # Only small scalars and the SD-model datalist are inlined; the Server Room's
-    # heavy data (per-model hosts, good/bad/last lists, checked timestamps) AND
-    # the chat model list are fetched from /dashboard-models + /dashboard-data and
-    # rendered client-side, so nothing large is duplicated in the document.
+    # heavy data (per-model hosts + aggregates, checked timestamps) AND the chat
+    # model list are fetched from /dashboard-models and rendered client-side, so
+    # nothing large is duplicated in the document.
     # (The image-model datalist is no longer inlined — loadImageModels() fetches
     #  sdapi/v1/sd-models and fills #sdModels client-side, so a server-injected
     #  a1111-only option list was both dead weight and wrong for the comfy models.)
@@ -12266,53 +12266,6 @@ async def handle_model_hosts(request):
         if hobj["attested"]:
             stats["attested"] += 1
     return web.json_response({"model": q, "hosts": hosts, "stats": stats})
-
-
-async def handle_dashboard_data(request):
-    """
-    Dashboard data (JSON)
-    ---
-    tags: [UI]
-    summary: Current last-successful, good, and bad host lists for live dashboard updates
-    responses:
-      '200':
-        description: Current list state
-        content:
-          application/json:
-            schema:
-              type: object
-    """
-    # Send only the most-recent N per state, not the whole pool: a 15k-host bad
-    # list must not be serialized and shipped in full just to show 30 rows. The
-    # true totals ride along as counts; the filter box searches this recent slice.
-    # "Recent" = most-recently-touched (last_fail for bad, last_good for good, ...
-    # via COALESCE), newest first, id as the stable tiebreak.
-    DASH_RECENT = 200
-    db = _get_db()
-    counts = dict(db.execute(
-        f"SELECT state, COUNT(*) FROM host_status WHERE {_LIVE_REAL} GROUP BY state").fetchall())
-
-    def _recent(state):
-        rows = db.execute(
-            f"SELECT host, model FROM host_status WHERE state=? AND {_LIVE_REAL} "
-            "ORDER BY COALESCE(last_fail, last_race, last_good) DESC, id DESC "
-            "LIMIT ?", (state, DASH_RECENT)).fetchall()
-        # The host-wide unreachable mark is a \x00-prefixed sentinel "model"; strip
-        # it for display (the raw null byte renders as a tofu box otherwise).
-        return [f"{h} {m}".replace(UNREACHABLE_KEY, "(unreachable)") for h, m in rows]
-
-    load_last()
-    last = [{"host": entry["host"], "model": model}
-            for model, entry in list(_last_cache.items())[:20]]
-    return web.json_response({
-        "last": last,
-        "good": _recent("good"),
-        "maybe": _recent("maybe_good"),
-        "bad": _recent("bad"),
-        "good_count": counts.get("good", 0),
-        "maybe_count": counts.get("maybe_good", 0),
-        "bad_count": counts.get("bad", 0),
-    })
 
 
 async def handle_settings_get(request):
@@ -23908,7 +23861,6 @@ def make_app():
     swagger.add_get("/geo-summary", handle_geo_summary)
     swagger.add_get("/geo-compare", handle_geo_compare)
     swagger.add_get("/dashboard", handle_dashboard)
-    swagger.add_get("/dashboard-data", handle_dashboard_data)
     swagger.add_get("/dashboard-models", handle_dashboard_models)
     swagger.add_get("/dashboard-model-hosts", handle_model_hosts)
     swagger.add_get("/dashboard/host-status", handle_host_status_query)

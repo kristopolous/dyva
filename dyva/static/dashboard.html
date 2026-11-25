@@ -289,7 +289,7 @@ body.chat{height:100vh;height:100dvh}
 #modelStats td:first-child{color:var(--text-muted)}
 #modelStats td:last-child{text-align:right;font-variant-numeric:tabular-nums;color:var(--text)}
 /* tabs + filter stay pinned; only the list scrolls */
-#mpane-text,#mpane-image,#pane-last,#pane-good,#pane-maybe,#pane-bad,#pane-workers,#hostList{flex:1;min-height:0;overflow-y:auto}
+#mpane-text,#mpane-image,#pane-workers,#hostList{flex:1;min-height:0;overflow-y:auto}
 .card h2{font-size:var(--fs-xl);text-transform:uppercase;letter-spacing:var(--eyebrow-tracking);color:var(--text-muted);margin-bottom:10px}
 .status-line{padding:2px 0;font-size:var(--fs-xs)}
 /* Linkified host URLs match their line's status color instead of default link blue;
@@ -1515,29 +1515,9 @@ body.dragging-image .hist-item{cursor:grabbing}
 <h2>Hosts</h2>
 <div class="card-inner">
 <div class="host-tabs">
-<button type="button" class="htab active" data-pane="workers" title="Workers">🛠️<span class="htab-count" id="cnt-workers">0</span></button>
-<button type="button" class="htab" data-pane="last" title="Recent">🥇<span class="htab-count" id="cnt-last"></span></button>
-<button type="button" class="htab" data-pane="good" title="Good">🍀<span class="htab-count" id="cnt-good"></span></button>
-<button type="button" class="htab" data-pane="maybe" title="Maybe">🤷🏼<span class="htab-count" id="cnt-maybe"></span></button>
-<button type="button" class="htab" data-pane="bad" title="Bad">💀<span class="htab-count" id="cnt-bad"></span></button>
-</div>
+<button type="button" class="htab active" data-pane="workers" title="Workers">🛠️<span class="htab-count" id="cnt-workers">0</span></button></div>
 <div class="filter-row">
 <input type="text" id="hostLookup" placeholder="look up a host — IP or host:port, then Enter" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" title="Type a host address (full ip:port, or just an IP) and press Enter to open its host card. A partial that matches several hosts shows a pick-list. While the Workers tab is open, typing also filters the worker rows live." oninput="applyWorkerFilter()" onkeydown="if(event.key==='Enter'&&this.value.trim()){event.preventDefault();hostLookup(this.value);}">
-</div>
-<div id="pane-last" style="display:none">
-<div id="lastList"></div>
-</div>
-<div id="pane-good" style="display:none">
-<div id="goodList"></div>
-<div id="goodMore"></div>
-</div>
-<div id="pane-maybe" style="display:none">
-<div id="maybeList"></div>
-<div id="maybeMore"></div>
-</div>
-<div id="pane-bad" style="display:none">
-<div id="badList"></div>
-<div id="badMore"></div>
 </div>
 <div id="pane-workers">
 <div id="paneConnCount" class="conn-count-row"></div>
@@ -2139,10 +2119,9 @@ function _applyActFilter(){
   var c=document.getElementById('activityList');if(!c)return;
   var kids=c.children;for(var i=0;i<kids.length;i++){kids[i].hidden=!_actMatch(kids[i].textContent||'')}
 }
-function refreshListsNow(){fetch('dashboard-data').then(function(r){return r.json()}).then(function(d){_good=new Set(d.good||[]);_bad=new Set(d.bad||[]);renderHostLists(d);refreshModelBars()}).catch(function(){})}
-// The model coverage bars read _good/_bad only when built, so after reputation
-// changes (e.g. a :test-all sweep) rebuild each visible bar in place — cheap, and
-// no list rebuild/scroll-jump like a full renderModels would cause.
+// Repaint the model coverage bars in place from the per-model aggregates (dashboard-models)
+// after a reputation change (e.g. a :test-all sweep or a flag/vote) — cheap, and no full
+// renderModels rebuild/scroll-jump.
 function refreshModelBars(){
   // Bars read the per-model aggregates (modelAgg), which come from dashboard-models
   // — so refresh those counts (small now, ETag-304 when unchanged) and repaint.
@@ -2169,11 +2148,11 @@ function _linkifyActivity(text){
   return out+escHtml(s.slice(last));
 }
 function onActivityMessage(e){try{if(paused)return;var d=JSON.parse(e.data);if(!d.message)return;
-  // We deliberately do NOT refetch the host lists / model-bar counts on live events.
-  // dashboard-data loads every good/maybe/bad row from host_status and serializes it,
-  // so polling it per connected/failed event (even debounced) hammers the DB for
-  // counts nobody needs live. Lists/bars refresh on load, the manual 💻 host-count
-  // click, and after a flag — not on every event.
+  // We deliberately do NOT refetch the model-bar counts on live events.
+  // refreshModelBars re-queries dashboard-models and repaints every visible bar, so
+  // polling it per connected/failed event (even debounced) is needless churn for
+  // counts nobody needs live. Bars refresh on load, the manual 💻 host-count click,
+  // and after a flag/vote — not on every event.
   paintGenStatus(activeStatus,d);paintGenStatus(activeImgStatus,d);paintMediaStatus(d);var c=document.getElementById('activityList');
   // An event carrying an id owns one line for the life of the request: reuse
   // that line so a fan-out resolves in place instead of stacking a row per host.
@@ -2531,16 +2510,13 @@ function _applyModelFilter(q){
     wrap.style.display=vis?'':'none';
   });
   updateModelPaneCounts(q);
-  // the same query re-renders the Hosts card panes from the full arrays, so it
-  // searches the whole list and the "... and N more" count matches the results
-  if(typeof renderHostPanes==='function')renderHostPanes();
 }
 
 document.querySelectorAll('.htab[data-pane]').forEach(function(t){
   t.addEventListener('click',function(){
     var pane=t.getAttribute('data-pane');
     document.querySelectorAll('.htab[data-pane]').forEach(function(x){x.classList.toggle('active',x===t)});
-    ['good','maybe','bad','last','workers'].forEach(function(p){document.getElementById('pane-'+p).style.display=p===pane?'':'none'});
+    ['workers'].forEach(function(p){document.getElementById('pane-'+p).style.display=p===pane?'':'none'});
     localStorage.setItem('dyva_hostpane',pane);
   })
 });
@@ -2577,7 +2553,6 @@ var _currentModel=null;
 // Server Room data is fetched (not inlined) and rendered here, so each host
 // string lives in the payload once instead of being repeated per model.
 var modelAgg={},imageModels={};   // model id -> {count,good,bad}; host lists fetched on demand
-var _good=new Set(),_bad=new Set();
 function checkedAgo(iso){if(!iso)return'';var t=Date.parse(iso);if(isNaN(t))return'';var days=Math.floor((Date.now()-t)/86400000);if(days<=0)return'today';if(days===1)return'1 day';return days+' days'}
 // A model's host coverage as a partitioned bar rather than "g/b/u" text: working
 // (green) / failing (red) / untested (grey), pastel so a long list doesn't read like
@@ -2837,7 +2812,7 @@ function _wireHostVotes(){
         body:JSON.stringify({host:fhost,action:fact})})
         .then(function(r){if(r.status===403){alert('Admin password required — unlock Settings first.');throw 0;}
           if(!r.ok)throw 0;return r.json()})
-        .then(function(){openHostDetail(fhost);if(typeof refreshListsNow==='function')refreshListsNow();})
+        .then(function(){openHostDetail(fhost);refreshModelBars();})
         .catch(function(){fb.disabled=false;});
       return;
     }
@@ -2852,7 +2827,7 @@ function _wireHostVotes(){
         if(dn)dn.classList.toggle('active',vote==='down');   // down active iff 👎 (deprio +1)
         if(up)up.classList.toggle('active',vote==='up');     // up active iff 👍 (favor -1)
         b.disabled=false;
-        if(typeof refreshListsNow==='function')refreshListsNow();
+        refreshModelBars();
       }).catch(function(){b.disabled=false;});
   });
 }
@@ -2994,58 +2969,7 @@ function hostDetailHtml(host,j){
   if(!j.found)h.push('<div class="hd-attr">not in the current host cache — reputation only</div>');
   return h.join('');
 }
-// A host row in the recent/good/maybe/bad panes opens the HOST CARD (same as the
-// model->host list), instead of linking straight out to the box — these lists were
-// built before the host card existed.
-function hostRow(host,model){
-  var d=document.createElement('div');d.className='model-item';d.style.cursor='pointer';d.title='host details';
-  var n=document.createElement('span');n.className='host-name';n.textContent=host;d.appendChild(n);
-  var mm=document.createElement('span');mm.className='host-model';mm.textContent=model||'(any)';mm.title=model||'(any)';d.appendChild(mm);
-  d.addEventListener('click',function(){if(_selHostRow===d){closeHostDetailCard();return}selectHostRow(d);openHostDetail(host)});
-  return d;
-}
-// Full sorted key arrays are stored so the model filter can search the WHOLE
-// list (not just the 30 rendered rows) and the "... and N more" count reflects
-// the actual number of matches beyond what's shown.
-var _hostData={last:[],good:[],maybe:[],bad:[]};
-function _byModel(a,b){var am=a.slice(a.indexOf(' ')+1),bm=b.slice(b.indexOf(' ')+1);return am<bm?-1:am>bm?1:(a<b?-1:a>b?1:0)}
 function _setCount(id,n){var e=document.getElementById(id);if(e)e.textContent=fmtCount(n)}
-function renderKeyPane(listId,moreId,countId,arr,q,total){
-  var c=document.getElementById(listId);c.innerHTML='';
-  var matched=globSearch(q,arr);
-  matched.slice(0,30).forEach(function(x){
-    var i=x.indexOf(' '),h=x.slice(0,i),mo=x.slice(i+1);
-    c.appendChild(hostRow(h,mo));
-  });
-  // The client only holds the most-recent slice the server sent, not the whole
-  // pool — so when unfiltered, show the server's TRUE total (matched.length would
-  // undercount). While filtering, show matches within the loaded slice.
-  var eff=(q||total==null)?matched.length:total;
-  var more=Math.max(0,eff-Math.min(matched.length,30));
-  document.getElementById(moreId).innerHTML=more>0?'<div class="more">... and '+fmtCount(more)+' more</div>':'';
-  _setCount(countId,eff);
-}
-function renderHostPanes(){
-  var q=_effFilterName();
-  var last=document.getElementById('lastList');last.innerHTML='';
-  var lm=globSearch(q,_hostData.last,function(e){return (e.host||'')+' '+(e.model||'')});
-  if(!lm.length){last.innerHTML='<div style="color:var(--text-muted);font-size:var(--fs-md)">'
-    +(q&&_hostData.last.length?'None matching the filter':'None')+'</div>'}
-  else lm.forEach(function(e){last.appendChild(hostRow(e.host,e.model))});
-  _setCount('cnt-last',lm.length);
-  renderKeyPane('goodList','goodMore','cnt-good',_hostData.good,q,_hostData.good_count);
-  renderKeyPane('maybeList','maybeMore','cnt-maybe',_hostData.maybe,q,_hostData.maybe_count);
-  renderKeyPane('badList','badMore','cnt-bad',_hostData.bad,q,_hostData.bad_count);
-}
-function renderHostLists(d){
-  _hostData.last=d.last||[];
-  _hostData.good=(d.good||[]).filter(function(x){return x.indexOf(' ')>=0}).sort(_byModel);
-  _hostData.maybe=(d.maybe||[]).filter(function(x){return x.indexOf(' ')>=0}).sort(_byModel);
-  // bad arrives most-recent-first from the server — keep that order (don't sort).
-  _hostData.bad=(d.bad||[]).filter(function(x){return x.indexOf(' ')>=0});
-  _hostData.good_count=d.good_count; _hostData.maybe_count=d.maybe_count; _hostData.bad_count=d.bad_count;
-  renderHostPanes();
-}
 function agoText(secs){
   if(!isFinite(secs)||secs<0)secs=0;
   if(secs<60)return Math.floor(secs)+'s';
@@ -3311,7 +3235,7 @@ function renderWorkers(workers){
           fetch(ep+'?'+_vq).then(function(r){if(!r.ok)throw 0;return r.json()}).then(function(){
             if(_down)_down.classList.remove('active');if(_up)_up.classList.remove('active');
             b.classList.add('active');b.disabled=false;
-            if(typeof refreshListsNow==='function')refreshListsNow();
+            refreshModelBars();
           }).catch(function(){b.disabled=false;});
         });
         return b;
@@ -3496,12 +3420,8 @@ var snackStatus={
   set textContent(v){showSnack(v)}
 };
 function loadDashboard(){
-  Promise.all([
-    fetch('dashboard-models').then(function(r){return r.json()}),
-    fetch('dashboard-data').then(function(r){return r.json()})
-  ]).then(function(res){
-    var mv=res[0]||{},dv=res[1]||{};
-    _good=new Set(dv.good||[]);_bad=new Set(dv.bad||[]);
+  fetch('dashboard-models').then(function(r){return r.json()}).then(function(mv){
+    mv=mv||{};
     _modelSizes=mv.sizes||{};
     _RELEASE_DATES=mv.dates||{};   // server sends the flat {normkey: 'YYYY-MM-DD'} map
     _OLLAMA_PARAMS=mv.params||{};  // {'model:tag': params_b} for the size (parameter) facet
@@ -3509,7 +3429,6 @@ function loadDashboard(){
     _RELEASE_KEYS=Object.keys(_RELEASE_DATES).sort(function(a,b){return b.length-a.length});
     _relDateMemo={};
     renderModels(mv.models||[]);
-    renderHostLists(dv);
     hideSnack();
   }).catch(function(){
     showSnack('Couldn’t load dashboard data',false);
