@@ -171,3 +171,43 @@ gibberish sample exists to validate it. Each detector earns enforcement on its o
   `worker-jobs.jsonl` / `traffic.jsonl` for token counts and timing.
 - **tps histories:** `worker-jobs.jsonl`, `~/.cache/free-ollama/stats.db`.
 - **Type B sample:** none yet — needed before (b) can be tuned.
+
+## Evidence log (gathering, not yet tuned)
+
+Live specimens pulled from `worker-jobs.jsonl`. We don't persist bodies yet, so these are
+timing/accounting only — the thing the shadow-mark step (rollout 1) is meant to start capturing.
+
+**2026-11-24 — `bcb13d3f-1a9f-4be0-9a13-c0cd6464c2b2`** (flagged live by operator as "probably a
+job runaway"; confirmed). Model `huihui_ai/glm-4.7-flash-abliterated` (abliterated), host
+`203.253.72.47:11434`, won race in 21 s then streamed **1550.7 s (~25.8 min)**. `stalled: false`
+(never tripped the 33 s read watchdog — the slow-trickle Type-A signature again), `outcome:
+completed`, `prompt_tokens`/`completion_tokens` **null**. Body not captured (connection already
+closed when inspected). First non-qwen specimen.
+
+**The distinguishing tell (free, already in the log).** Across today's sample, legitimate
+completions carry token counts; every long runner that looks like a runaway shows the same triad:
+**long `inference_secs` + `stalled: false` + `completion_tokens: null` + `outcome: completed`** — a
+"completed" that never delivered a usage/done summary because the host emitted forever and then
+dropped. This is a cheap retro-filter over existing records, no new instrumentation. (Caveat: a
+genuine huge-context dump could also null out tokens; the triad narrows the audit set, it is not
+itself the verdict.)
+
+**Recurrence.** Not a one-off. On 2026-11-24, 10 jobs ran `inference_secs > 600 s`, all
+`stalled: false`, all `outcome: completed`:
+
+| start | model | inference_secs |
+|---|---|---|
+| 02:33 | qwen3.8 | 602 |
+| 02:33 | qwen3.8 | 1014 |
+| 02:33 | qwen3.8 | 1566 |
+| 02:33 | qwen3.8 | 1682 |
+| 02:33 | qwen3.8 | **3575.7** (rode `WORKER_MAX` to the wall) |
+| 15:14 | qwen3.8 | 852 |
+| 15:14 | qwen3.8 | 905 |
+| 19:53 | qwen3.8 | **3583.6** (rode `WORKER_MAX` to the wall) |
+| 23:25 | glm-4.7-flash-abliterated | 1550.7 (`bcb13d3f`) |
+
+Two jobs held a connection the full `WORKER_MAX = 3600 s` hour — exactly the "obviously dead at
+minute 3, sat on for 57 more" gap. `outcome: completed` does not distinguish any of these today,
+including the capped ones. qwen3.8 dominates (matches the original `873a263f` sample); the
+abliterated glm is a second model family now in the set.
