@@ -2126,7 +2126,20 @@ function refreshModelBars(){
   // Bars read the per-model aggregates (modelAgg), which come from dashboard-models
   // — so refresh those counts (small now, ETag-304 when unchanged) and repaint.
   fetch('dashboard-models').then(function(r){return r.json()}).then(function(mv){
-    (mv.models||[]).forEach(function(m){if(m.id)modelAgg[m.id]={count:m.count||0,good:m.good||0,bad:m.bad||0}});
+    var models=mv.models||[];
+    models.forEach(function(m){if(m.id)modelAgg[m.id]={count:m.count||0,good:m.good||0,bad:m.bad||0}});
+    // A model can ENTER the pool (or cross the MIN_COUNT floor) AFTER the initial render —
+    // inkling-2-mini:latest going from a handful of hosts to 29 is the case that surfaced
+    // this. renderModels builds the rows once; the filter only toggles EXISTING rows, so a
+    // model we never built a row for can't be searched to, even though the resolver routes
+    // to it fine. If the fresh payload carries a renderable model we have no row for, rebuild
+    // the list (renderModels re-applies the active filter) rather than only repainting bars.
+    var have=new Set();
+    document.querySelectorAll('.model-item[data-name]').forEach(function(el){have.add(el.getAttribute('data-name'));});
+    for(var i=0;i<models.length;i++){
+      var id=models[i].id;
+      if(id&&id.length&&!/[:-]cloud/.test(id)&&!have.has(id)){renderModels(models);return;}
+    }
     var items=document.querySelectorAll('.model-item[data-name]');
     for(var i=0;i<items.length;i++){var mid=items[i].getAttribute('data-name');var old=items[i].querySelector('.model-bar');if(old)old.replaceWith(makeModelBar(mid));}
   }).catch(function(){});
