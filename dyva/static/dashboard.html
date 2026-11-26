@@ -7294,11 +7294,29 @@ async function runAgentJob(payload,signal,onTick){
   if(!sr.ok){var em='HTTP '+sr.status;try{var je=await sr.json();em=(je.error&&(je.error.message||je.error))||em}catch(e){}throw new Error(em);}
   var jid=(await sr.json()).id;
   var off=0,full='',host='',fmodel=payload.model||'';
+  // A durable server-side job survives a dropped poll (mirrors the main chat loop ~6538): a
+  // transient browser<->tunnel fetch blip must RESUME from the same offset, not abandon a
+  // sub-agent whose job is still running — and usually completing (seen: jobs marked
+  // "failed: Failed to fetch" in the viewer while jobs.db had them `completed` with 1MB+ of
+  // output). Only a SUSTAINED run of poll failures is a real error. Reset on every clean poll.
+  var pollErrs=0,MAX_POLL_ERRS=12;
   while(true){
     if(signal&&signal.aborted)throw new DOMException('aborted','AbortError');
-    var pr=await fetch('api/chat/jobs/'+encodeURIComponent(jid)+'?offset='+off,{signal:signal});
-    if(pr.status===404)throw new Error('job lost');
-    var pj=await pr.json();
+    var pr,pj;
+    try{
+      pr=await fetch('api/chat/jobs/'+encodeURIComponent(jid)+'?offset='+off,{signal:signal});
+      if(pr.status===404)throw new Error('job lost');
+      pj=await pr.json();
+    }catch(fe){
+      if(signal&&signal.aborted)throw fe;              // user stop / navigation — propagate
+      if(fe&&fe.message==='job lost')throw fe;         // terminal 404 — not a transient blip
+      if(++pollErrs>MAX_POLL_ERRS)throw fe;            // sustained outage (dyva down?) — surface it
+      // transient blip: the job keeps running server-side, so wait briefly and re-poll from
+      // the SAME offset rather than killing a sub-agent whose work is still in flight.
+      await new Promise(function(res){var t=setTimeout(res,Math.min(2000,300*pollErrs));try{signal&&signal.addEventListener('abort',function(){clearTimeout(t);res()},{once:true})}catch(e){}});
+      continue;
+    }
+    pollErrs=0;   // a clean poll ends any transient-failure streak
     if(pj.host)host=pj.host;
     if(pj.model)fmodel=pj.model;
     if(pj.output){

@@ -294,6 +294,26 @@ def test_derank_ctx_without_context_is_noop(store):
     assert dyva._affinity_derank == {}
 
 
+# ---- operator/auto abandon (stop a committed host) does BOTH halves ------------------------
+# When a host is abandoned for a context — the operator hits Stop on its live stream, or an
+# auto mid-toolcall drop won't resume — the context must (1) lose its warm pin to that host AND
+# (2) sink the host for the cooldown, so the warm banker can't snap the same context back onto
+# it next turn. _affinity_abandon_ctx() is the one action both callers use.
+
+def test_abandon_ctx_busts_pin_and_deranks(store):
+    dyva.affinity_touch(777, "http://h:1", 50)        # this context pinned to its warm host
+    dyva._affinity_ctx.set((777, 50_000))
+    dyva._affinity_abandon_ctx("http://h:1")
+    assert dyva.affinity_view(777)[0] == ""           # pin busted — stop LEADING with the stopped host
+    assert dyva._affinity_deranked(777) == {NH("http://h:1")}   # and sunk for THIS context
+
+
+def test_abandon_ctx_without_context_is_noop(store):
+    dyva._affinity_ctx.set(None)
+    dyva._affinity_abandon_ctx("http://h:1")
+    assert dyva._affinity == {} and dyva._affinity_derank == {}
+
+
 def test_find_servers_deranked_host_sinks_to_back(routed):
     # HB just failed THIS context; even though it's a live candidate it must sink to the back for
     # this crc for the cooldown, so the retry tries the other host first (banker warm can't rescue

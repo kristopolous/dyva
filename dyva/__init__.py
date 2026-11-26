@@ -4609,6 +4609,15 @@ def _affinity_derank_ctx(host):
         log.debug(f"_affinity_derank_ctx failed: {e}")
 
 
+def _affinity_abandon_ctx(host):
+    """This context is done with `host` — the operator hit Stop on its committed stream, or an
+    auto mid-toolcall drop won't resume. Do BOTH halves so the warm banker can't snap the same
+    context straight back onto it next turn: bust this context's own warm pin, and sink the host
+    for this context for the cooldown. Per-crc, soft, self-expiring — NEVER a reputation write."""
+    _affinity_forget_ctx()
+    _affinity_derank_ctx(host)
+
+
 def _affinity_deranked(crc, now=None):
     """Hosts currently sunk for `crc` (expired entries reaped; an emptied crc bucket is dropped so
     the store self-heals without a sweeper). Empty set when the context has no live deranks."""
@@ -9728,7 +9737,10 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
         if status == "stopped":
             # operator killed a committed stream: close the client's stream cleanly (the
             # real API client is still connected and would otherwise hang) and stop — no
-            # failover, the host answered fine, we just don't want the rest.
+            # failover, the host answered fine, we just don't want the rest. But abandon this
+            # host FOR THIS CONTEXT (bust the warm pin + derank for the cooldown) so the next
+            # turn isn't snapped straight back onto the host the operator just stopped.
+            _affinity_abandon_ctx(host)
             with contextlib.suppress(Exception):
                 await _write_terminal_done(response, full, openai_format)
             break
@@ -9844,8 +9856,7 @@ async def _stream_chat_failover(request, session, model, servers, opayload,
             # own pin AND sink this host for this context for the cooldown, so the warm banker
             # can't snap the same context straight back onto it. The context finds a new home;
             # the host returns for this context on its own once the derank expires.
-            _affinity_forget_ctx()
-            _affinity_derank_ctx(host)
+            _affinity_abandon_ctx(host)
             with contextlib.suppress(Exception):
                 await _write_terminal_done(response, full, openai_format)
             break
@@ -10837,7 +10848,10 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                     if outcome == "stopped":
                         # Operator Stop on a committed buffered stream: end with the partial
                         # we have, NO failover (mirrors _pump_stream's 'stopped'). The client
-                        # still gets a valid response instead of a dropped connection.
+                        # still gets a valid response instead of a dropped connection. Abandon
+                        # this host for THIS context (pin + derank) so the next turn isn't
+                        # snapped straight back onto the host the operator just stopped.
+                        _affinity_abandon_ctx(host)
                         await broadcast_activity(host, model, "stopped",
                             f"worker manually stopped: {model}", wid=job_wid)
                     elif outcome != "done":
