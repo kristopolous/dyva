@@ -15,6 +15,8 @@ match. A query with no `;` facet never touches the reputation DB.
 | `*` alone | Any model | `*` |
 | `name$` | End-anchor: exact name, skip quant/finetune variants | `qwen3.8:27b$` |
 | `a,b` | Fallback chain — try `a`, then `b` (spaces optional) | `gemma3,qwen` |
+| `a\|b` | Pool — match `a` *or* `b` into one candidate set, assessed together by reputation (no "first") | `gemma3\|qwen` |
+| `a\|b,c` | `\|` binds tighter than `,`: pool `a` & `b`, then fall back to `c` | — |
 | `>` `<` `>=` `<=` + size | Filter by recorded disk size (decimal, `gb`=1e9) | `>10gb`, `qwen <=4gb`, `<700mb` |
 | `>` `<` `>=` `<=` + date | Filter by release date (year/month/day) | `qwen>2026`, `>2026-02-15` |
 | `cap/model` | Capability + model pairing | `edit/wan`, `vision/qwen` |
@@ -58,13 +60,14 @@ guarantee a hit (`!experimental,*`).
 
 ## How it all composes
 
-One query is a comma-separated list of **alternatives** tried in order; each alternative is a
-name/filter **term** plus any number of `;`-**facets**, and term and facets may appear in any
-order:
+One query is a comma-separated list of **segments** tried in order (the fallback chain); a
+segment is a `|`-separated **pool** of alternatives matched together, plus any number of
+`;`-**facets**, and term and facets may appear in any order:
 
 ```
-query       = alternative ("," alternative)*
-alternative = term (";" facet)*                 ; order-free
+query       = segment ("," segment)*            ; "," = ordered fallback
+segment     = pool (";" facet)*                 ; facets order-free
+pool        = term ("|" term)*                  ; "|" = union, ranked by reputation
 term        = [ capability "/" ] name? predicate*
 name        = text with * and ? globs, optional trailing $
 predicate   = sizepred | datepred
@@ -95,8 +98,11 @@ Because it's order-free, `qwen>2026-06>10gb;tps>100;caps=vision` is the exact sa
 - **Containment vs. `$`.** A bare name matches as a substring, so `qwen3.8:27b` also
   drafts in `qwen3.8:27b-q4_K_M` and `-abliterated`. A trailing `$` (the only regex
   metacharacter honoured) anchors the end to the exact name.
-- **Why comma for fallback.** It's shell-safe and absent from every model name in the
-  survey — unlike `%` (URL encoding) or `/` (the capability/model pairing).
+- **Comma sequences, pipe pools.** Both are shell-safe and absent from every model name
+  in the survey — unlike `%` (URL encoding) or `/` (the capability/model pairing). `a,b`
+  exhausts `a` before trying `b`; `a|b` throws both sets of matches together and lets the
+  normal reputation/priority sort decide (neither goes first). `|` binds tighter than `,`,
+  so `a|b,c` pools `a` and `b`, then falls back to `c`.
 - **Size keeps unknowns; date drops them.** Narrowing a *name* query by size keeps
   candidates of unknown size (a backend that reports none isn't dropped), but a bare
   `>10gb` returns only models known to satisfy it. A date filter **excludes** anything

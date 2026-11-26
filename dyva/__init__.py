@@ -1653,6 +1653,15 @@ def honeypot_detect(text):
 _status_db = None
 _servers_cache = None
 _servers_loaded_at = None
+# Matching-pass cache (the first pass of the multi-pass ranker). find_servers re-derived
+# model.lower()/canon_pattern(model)/embed+cloud flags for ~85k models on EVERY call — ~324ms
+# over a 15k-host pool, run per request per round, saturating the single event-loop core. The
+# pool is immutable between reloads, so normalise it ONCE here and key the cache to the pool
+# object identity (load_servers rebuilds a NEW list on every invalidation, never mutates in
+# place, so `is` detects staleness exactly). _POOL_CLOUD_RE is the per-model cloud tag.
+_pool_index_cache = None
+_pool_index_src = None
+_POOL_CLOUD_RE = re.compile(r"[:-]cloud")
 
 _activity_queues = []
 
@@ -2990,6 +2999,31 @@ def load_servers():
                 _infill_caps(_cap_rows)            # gap-fill only; never clobbers measured rows
         _servers_loaded_at = time.time()   # when this process last read the file
     return _servers_cache or []
+
+
+def _pool_index():
+    """Normalised pool for the matching pass — built once per load_servers() object and
+    reused until the pool is reloaded. Each entry is (raw_record, server, service, provider,
+    model_recs) where model_recs is a list of (raw_name, lower, canon, is_embed, is_cloud).
+    This moves the per-(host,model) lower()/canon_pattern()/embed+cloud work that
+    _find_servers_raw used to repeat on EVERY call out of the hot path (keyed to the pool
+    object identity: load_servers rebuilds a new list on invalidation, never mutates it)."""
+    global _pool_index_cache, _pool_index_src
+    servers = load_servers()
+    if _pool_index_cache is not None and _pool_index_src is servers:
+        return _pool_index_cache
+    idx = []
+    for s in servers:
+        mrecs = []
+        for m in s.get("models", []) or []:
+            lo = m.lower()
+            mrecs.append((m, lo, canon_pattern(m), "embed" in lo,
+                          bool(_POOL_CLOUD_RE.search(m))))
+        idx.append((s, s.get("server", ""), s.get("service"),
+                    (s.get("provider") or "").lower(), mrecs))
+    _pool_index_cache = idx
+    _pool_index_src = servers
+    return idx
 
 
 _dead_cache = None
@@ -6202,47 +6236,64 @@ def _find_servers_raw(sub, caps=None):
                 h = k.split(" ", 1)[0]
                 if rank[st] > rank.get(host_state.get(h, ""), 0):
                     host_state[h] = st
+    # Matching pass over the precomputed pool index (built once per load, reused across
+    # calls). The query's pattern prep is HOISTED ONCE here; every model carries its
+    # pre-lowered name, canon form, and embed/cloud flags — so the per-(host,model) work
+    # that dominated this function (lower()/canon_pattern()/regex over ~85k models on EVERY
+    # call) is gone. match_model's semantics are reproduced exactly against the pre-lowered
+    # name (sub is already canon'd above: lowercased, edge-stars stripped, '$' may remain).
+    _sub_embed = "embed" in sub
+    _sub_cloud = bool(_POOL_CLOUD_RE.search(sub))
+    _anchor = sub.endswith("$")
+    _pat = sub[:-1] if _anchor else sub
+    _has_glob = any(c in _pat for c in "*?[")
+    _glob = ("*" + _pat) if _anchor else ("*" + _pat + "*")
+    _match_all = not _pat and not _has_glob and not _anchor   # bare '*' / '' -> everything
+    def _mm(lo):
+        if _has_glob:
+            return fnmatch.fnmatch(lo, _glob)
+        return lo.endswith(_pat) if _anchor else (_pat in lo)
+    # get_last(sub) depends only on the query, not the host — compute it ONCE, not per host.
+    # The empty-query fallback below (match the sticky row to THIS host) is the only
+    # host-dependent part and stays in the loop.
+    _last_base = get_last(sub)
+    if _last_base is None and not sub and _last_cache is None:
+        load_last()
     matched = []
-    for s in servers:
-        if s.get("service") in ("comfyui", "a1111"):
+    for s, host, service, provider, mrecs in _pool_index():
+        if service in ("comfyui", "a1111"):
             continue
-        # Cloudskipper: never route to (nor even connect to) hosts on a cloud the
-        # operator has opted out of — the enrichment `provider` label, lowercased.
-        # Dropped here so the host never enters any race and dyva never TCP-connects
-        # to it. Unknown-provider hosts are never skipped (only known matches).
-        if CLOUD_SKIP and (s.get("provider") or "").lower() in CLOUD_SKIP:
+        # Cloudskipper: never route to (nor even connect to) a cloud the operator opted out
+        # of — the enrichment `provider` label (precomputed, lowercased). Unknown-provider
+        # hosts are never skipped (only known matches).
+        if CLOUD_SKIP and provider in CLOUD_SKIP:
             continue
-        # Unreachable cooldown (circuit breaker): a host confirmed dead at the socket within the
-        # last UNREACHABLE_COOLDOWN is dropped — don't re-probe a corpse every request. It re-enters
+        # Unreachable cooldown (circuit breaker): a host confirmed dead at the socket within
+        # UNREACHABLE_COOLDOWN is dropped — don't re-probe a corpse every request. It re-enters
         # as a half-open TIER_BAD candidate once the window elapses (see load_unreachable_cooling).
-        if s.get("server") in cooling:
+        if host in cooling:
             continue
-        models = s.get("models", [])
-        ms = [m for m in models if match_model(m, sub)]
-        if not ms:
+        # One pass: pattern-match AND drop embedders. Embedding models can't chat, so a plain
+        # text query ("qwen3") must not sweep in "qwen3-embedding:0.6b"; it's per-MODEL, since a
+        # host may serve qwen3:8b AND qwen3-embedding:0.6b (both match "qwen3") — keep the chat
+        # one. Carry (raw, canon, is_cloud) so the cloud check and reputation keys below reuse
+        # the precomputed forms instead of recomputing canon_pattern(m)/regex per model.
+        recs = [(raw, ca, cl) for (raw, lo, ca, emb, cl) in mrecs
+                if (_match_all or _mm(lo)) and (_sub_embed or not emb)]
+        if not recs:
             continue
-        # Embedding models can't chat, so a plain text query ("qwen3") must not
-        # sweep in "qwen3-embedding:0.6b" just because the name contains the
-        # pattern. Routing is symmetric on the "embed" substring: ask for embed
-        # and you get embedders; don't, and they're dropped. Per-MODEL (not
-        # whole-host) — a host may serve qwen3:8b AND qwen3-embedding:0.6b, both
-        # matching "qwen3"; keep the chat one, drop the embedder.
-        if "embed" not in sub:
-            ms = [m for m in ms if "embed" not in m.lower()]
-            if not ms:
-                continue
-        if any(re.search(r"[:-]cloud", m) for m in ms) and not re.search(r"[:-]cloud", sub):
+        if not _sub_cloud and any(cl for _r, _c, cl in recs):
             continue
-        host = s.get("server", "")
-        # Drop (host, model) pairs that failed STRUCTURALLY (old-ollama "unknown
-        # renderer", missing/corrupt blob, model-not-found): they never work, so
-        # they must not be candidates at all — not a bad-tier last resort re-raced
-        # every request, and not an Explore "unmapped" re-try. Transient-bad pairs
-        # are untouched (still retryable, just tier-last).
+        # Drop (host, model) pairs that failed STRUCTURALLY (old-ollama "unknown renderer",
+        # missing/corrupt blob, model-not-found): they never work, so they must not be
+        # candidates at all — not a bad-tier last resort re-raced every request, and not an
+        # Explore "unmapped" re-try. Transient-bad pairs are untouched (still retryable).
         if incompatible:
-            ms = [m for m in ms if f"{host} {canon_pattern(m)}" not in incompatible]
-            if not ms:
+            recs = [(raw, ca, cl) for raw, ca, cl in recs if f"{host} {ca}" not in incompatible]
+            if not recs:
                 continue
+        ms = [raw for raw, _c, _cl in recs]
+        _canons = [ca for _r, ca, _cl in recs]
         # Special-cap ORDERING key (not a filter): 0 = host has a model advertised/known-capable
         # for the required caps, 1 = only unknown-cap models, 2 = only flagged-incapable. Race
         # advertised first, then unknown, then flagged-incapable — because the flag is imperfect
@@ -6276,7 +6327,7 @@ def _find_servers_raw(sub, caps=None):
             # must also honor marks on the concrete models it resolves to (ms) —
             # otherwise a host proven good at "qwen2.5:7b" looks "unknown" to a
             # "qwen" query and gets probed cold alongside the dead ones.
-            keys = [key] + [f"{host} {canon_pattern(m)}" for m in ms]
+            keys = [key] + [f"{host} {ca}" for ca in _canons]
             in_good = any(k in good for k in keys)
             in_maybe = any(k in maybe for k in keys)
             in_bad = any(k in bad for k in keys)
@@ -6294,12 +6345,10 @@ def _find_servers_raw(sub, caps=None):
             in_bad = st == "bad"
             if st is None and host in attested_pass_hosts:
                 in_maybe = True
-        _last = get_last(sub)
+        _last = _last_base
         if _last is None and not sub:
-            if _last_cache is None:
-                load_last()
             _last = next(
-                ((v["host"], v.get("full", "")) for v in _last_cache.values()
+                ((v["host"], v.get("full", "")) for v in (_last_cache or {}).values()
                  if v.get("host") == host),
                 None)
         is_last = _last is not None and host == _last[0]
@@ -19702,9 +19751,12 @@ async def _run_chat_job(session, jid):
                                         break
                             finally:
                                 _cw.cancel(); _sw.cancel()
-                                with contextlib.suppress(Exception):
+                                # await the cancelled waiters to drain them — CancelledError is a
+                                # BaseException, NOT an Exception, so suppress(Exception) let it
+                                # escape and every normally-finished job was misreported CANCELED.
+                                with contextlib.suppress(asyncio.CancelledError, Exception):
                                     await _cw
-                                with contextlib.suppress(Exception):
+                                with contextlib.suppress(asyncio.CancelledError, Exception):
                                     await _sw
                         await _flush(force=True)
 
