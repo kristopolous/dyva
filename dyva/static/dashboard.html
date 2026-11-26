@@ -6650,6 +6650,12 @@ async function runStream(chatId,chatCreated,chatTitle,model,msgs,bubble,depth,ex
     if(stopped){
       clearInflight();
       if(gen.jobId){try{fetch('api/chat/jobs/'+encodeURIComponent(gen.jobId)+'/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({op:'cancel'}),keepalive:true})}catch(e){}}
+      // A manual stop is almost always "this host is a runaway or crawling", so treat it as a
+      // 👎: derank the host/model pair for RERANK_DOWN_SECS and drop its sticky (flag-worker
+      // does both). Without this the sticky (checked as TIER_LAST, ahead of everything) locks
+      // a retry straight back onto the host you just stopped. Only when a host was bound; GET
+      // to match the host-card vote, keepalive since a stop may coincide with the tab closing.
+      if(host){try{fetch('flag-worker?host='+encodeURIComponent(host)+'&model='+encodeURIComponent(fmodel||model||''),{keepalive:true})}catch(e){}}
     }else if(!document.hidden){clearInflight();}
     if(stopped){
       if(full){
