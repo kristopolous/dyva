@@ -3613,6 +3613,13 @@ def check_batch(hosts, service, name=None, check_timeout=60, workers=10, session
                 continue
             kept.append(h)
         to_check = kept
+    # Report the REAL probe count, not the fetch-dedup count. A page's "+N new" is new to
+    # this run's fetch; most already carry a verdict in the DB (working/notworking/bad) and
+    # are skipped here. Logging len(hosts) up front made a 15-fetched/1-probed page look
+    # broken ("+15" then only 1 checked). Show both, including the all-skipped case (0 probe).
+    _skipped = len(hosts) - len(to_check)
+    log.info(f"  check batch: {len(hosts)} fetched, {len(to_check)} to probe"
+             + (f" ({_skipped} already recorded)" if _skipped else ""))
     if not to_check:
         return
 
@@ -4993,8 +5000,8 @@ The other actions find hosts, reshape the stores, or mine the snapshots:
                     # check_batch), not a per-page cap; slicing to it silently left
                     # every new host beyond the 65th unchecked, piling up a backlog
                     # you then had to chase with a manual check-new. fetch-check must
-                    # check everything it fetches.
-                    log.info(f"  check batch: {len(fresh_hosts)} new host(s) (interleaved)")
+                    # check everything it fetches. check_batch logs the honest fetched/
+                    # to-probe split (most fetched hosts already carry a DB verdict).
                     check_batch(fresh_hosts, _svc, _nm, args.check_timeout, args.workers, args.session)
 
                 fetch(dry=args.dry, curlify=args.curlify, service=_svc, query=args.query,
