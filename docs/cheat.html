@@ -133,14 +133,16 @@ footer code{font-family:var(--mono);color:var(--code)}
       <div class="note"><b>Containment vs. <code style="font-family:var(--mono)">$</code>.</b> <code style="font-family:var(--mono)">qwen3.8:27b</code> also drafts in <code style="font-family:var(--mono)">&#8209;q4_K_M</code> and <code style="font-family:var(--mono)">&#8209;abliterated</code>; the trailing <code style="font-family:var(--mono)">$</code> (the only regex metachar honoured) pins the end.</div>
     </div>
 
-    <!-- FALLBACK -->
+    <!-- FALLBACK / POOL -->
     <div class="sec">
-      <div class="sec-h">Fallback Chain</div>
+      <div class="sec-h">Fallback &amp; Pool</div>
       <table>
         <tr><td class="k"><code>a,b</code></td><td class="v">Try <code>a</code>; only once it&rsquo;s <b style="color:var(--ink)">exhausted</b> does <code>b</code> get a turn. Spaces optional. <span class="eg"><code>gemma3,qwen</code></span></td></tr>
+        <tr><td class="k"><code>a|b</code></td><td class="v"><b style="color:var(--ink)">Pool</b> &mdash; match <code>a</code> <em>or</em> <code>b</code> into one candidate set, assessed together by the usual reputation / priority. No &ldquo;first&rdquo;. <span class="eg"><code>gemma3|qwen</code></span></td></tr>
+        <tr><td class="k"><code>a|b,c</code></td><td class="v"><code>|</code> binds <b style="color:var(--ink)">tighter</b> than <code>,</code>: pool <code>a</code>&nbsp;&amp;&nbsp;<code>b</code>, then fall back to <code>c</code>.</td></tr>
         <tr><td class="k"><code>&hellip;,*</code></td><td class="v">End a chain with <code>*</code> to guarantee a hit. <span class="eg"><code>!experimental,*</code></span></td></tr>
       </table>
-      <div class="note">Comma is the separator because it&rsquo;s shell&#8209;safe and never appears in a model name.</div>
+      <div class="note"><b><code style="font-family:var(--mono)">,</code> sequences, <code style="font-family:var(--mono)">|</code> pools.</b> A comma exhausts one target before trying the next; a pipe throws both sets of matches together and lets reputation sort them. Both are shell&#8209;safe and never appear in a model name.</div>
     </div>
 
     <!-- SIZE -->
@@ -237,8 +239,9 @@ footer code{font-family:var(--mono);color:var(--code)}
       <div class="compose">
         <div>
           <h3>Grammar</h3>
-          <pre class="gram"><code><b>query</b>       = alternative ("," alternative)*
-<b>alternative</b> = term (";" facet)*          <span style="opacity:.7">; order-free</span>
+          <pre class="gram"><code><b>query</b>       = segment ("," segment)*      <span style="opacity:.7">; "," ordered fallback</span>
+<b>segment</b>     = pool (";" facet)*           <span style="opacity:.7">; facets order-free</span>
+<b>pool</b>        = term ("|" term)*            <span style="opacity:.7">; "|" union &rarr; reputation</span>
 <b>term</b>        = [ capability "/" ] name? predicate*
 <b>name</b>        = text with * ? globs, opt. trailing $
 <b>predicate</b>   = size | date
