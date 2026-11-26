@@ -18727,6 +18727,111 @@ async def _openai_tts_race(session, entries, input_text, voice, tkey, label, job
     return result
 
 
+# ---- Speech-to-text (STT): OpenAI /v1/audio/transcriptions -> fish /v1/asr --------
+# Fish-speech hosts whose surveyed capability set includes `asr` expose POST /v1/asr
+# (msgpack body {audios:[bytes], sample_rate, language}, reply {transcriptions:[{text}]}).
+# We front it with the OpenAI transcription shape so any OpenAI client (oa, the SDKs)
+# transcribes through dyva. Raced best-first through the same reputation / 👎 / activity
+# machinery as every other capability. Many hosts ADVERTISE the route without an asr_model
+# loaded (they 500 "'ModelManager' object has no attribute 'asr_model'"); that's a per-host
+# failure like any other here — the race records it, drops the host, and moves on.
+ASR_KEY = "asr"
+ASR_TIMEOUT = 120               # a short clip transcribes fast; long audio gets headroom
+_ASR_LANGS = {"zh", "en", "ja", "auto"}
+
+
+class _AsrError(Exception):
+    pass
+
+
+def _find_asr_hosts():
+    """Discovered fish-speech hosts advertising the `asr` capability, best-first by the
+    same reputation tiering + 👍/👎 rerank + idle-spread the TTS race uses, so a 👎 on one
+    sinks it like any other host. Entry is the bare host string."""
+    marks = load_marks()
+    last = get_last(ASR_KEY)
+    last_host = last[0] if last and last[0] else None
+    rr = rerank_scores()
+    hosts = []
+    for s in load_servers():
+        if s.get("service") != "fish":
+            continue
+        host = s.get("server")
+        if host and "asr" in (s.get("capabilities") or []):
+            hosts.append(host)
+
+    def rank(h):
+        return _rerank_prio(capability_tier(h, ASR_KEY, marks, last_host),
+                            rr.get(_norm_host(h), 0))
+
+    hosts.sort(key=rank)
+    order = {h: i for i, h in enumerate(_idle_first(hosts))}
+    hosts.sort(key=lambda h: order.get(h, 0))
+    return hosts
+
+
+def _asr_lang(language):
+    """Map an OpenAI language hint (ISO-639-1, e.g. 'en') to the fish enum
+    (zh/en/ja/auto). Anything fish doesn't know -> 'auto' (let the model detect)."""
+    if not language:
+        return "auto"
+    l = str(language).strip().lower()
+    if l in _ASR_LANGS:
+        return l
+    if l in ("zh-cn", "zh-tw", "chinese", "mandarin"):
+        return "zh"
+    if l.startswith("en"):
+        return "en"
+    if l.startswith("ja") or l == "japanese":
+        return "ja"
+    return "auto"
+
+
+def _asr_parse_text(raw):
+    """Pull the transcript out of a fish ASR reply. The server mirrors the request
+    encoding, so try msgpack then JSON. Shape is {transcriptions:[{text,...}]} (join the
+    parts); tolerate a bare {text:...} too."""
+    obj = None
+    if _msgpack is not None:
+        try:
+            obj = _msgpack.unpackb(raw, raw=False)
+        except Exception:
+            obj = None
+    if obj is None:
+        try:
+            obj = json.loads(raw.decode("utf-8", "ignore"))
+        except Exception:
+            raise _AsrError(f"unreadable response: {raw[:120].decode('utf-8', 'ignore')}")
+    if isinstance(obj, dict):
+        txs = obj.get("transcriptions")
+        if isinstance(txs, list):
+            return " ".join(str(t.get("text", "")).strip()
+                            for t in txs if isinstance(t, dict)).strip()
+        if "text" in obj:
+            return str(obj.get("text") or "").strip()
+    raise _AsrError(f"unexpected response shape: {str(obj)[:120]}")
+
+
+async def _asr_transcribe(session, host, audio, sample_rate, language):
+    """POST one fish `/v1/asr` msgpack request and return the transcript text. Raises
+    _AsrError on a non-200 or an unreadable body (incl. the common 'no asr_model' 500 from
+    a host that advertises the route without loading the model)."""
+    if _msgpack is None:
+        raise _AsrError("msgpack not installed")
+    body = {"audios": [audio], "sample_rate": int(sample_rate or 44100),
+            "language": _asr_lang(language)}
+    url = host.rstrip("/") + "/v1/asr"
+    timeout = aiohttp.ClientTimeout(total=ASR_TIMEOUT, sock_connect=CONNECT_TIMEOUT)
+    packed = _msgpack.packb(body, use_bin_type=True)
+    async with session.post(url, data=packed, timeout=timeout,
+                            headers={"Content-Type": "application/msgpack",
+                                     "Accept": "application/msgpack"}) as resp:
+        raw = await resp.read()
+        if resp.status != 200:
+            raise _AsrError(f"HTTP {resp.status}: {raw[:160].decode('utf-8', 'ignore')}")
+    return _asr_parse_text(raw)
+
+
 def _host_has_class(host, classes):
     """True if any of a ComfyUI host's cached models classify into `classes`."""
     for s in load_servers():
@@ -21720,6 +21825,114 @@ async def handle_add_voice(request):
                               "fish_hosts": _fish_host_count()})
 
 
+async def handle_transcriptions(request):
+    """
+    OpenAI-compatible speech-to-text
+    ---
+    tags: [Audio]
+    summary: POST /v1/audio/transcriptions — transcribe audio on a discovered fish ASR host
+    description: |
+      Accepts the OpenAI `/v1/audio/transcriptions` multipart shape (`file`, optional
+      `model`, `language`, `response_format`) and returns the transcript. Backed by
+      discovered fish-speech hosts that advertise the `asr` capability, raced best-first
+      through the same reputation / 👎 / activity machinery as every other capability — a
+      host that advertises the route without a loaded ASR model just fails that attempt and
+      the race moves on. `response_format` supports `json` (default, `{"text": ...}`),
+      `text` (plain body), and `verbose_json` (adds `language`). Provenance in `X-Dyva-Host`.
+    responses:
+      '200': {description: Transcript}
+      '400': {description: No audio uploaded}
+      '413': {description: Upload too large}
+      '502': {description: All hosts failed}
+      '503': {description: No STT host available}
+    """
+    resp = await _check_local(request)
+    if resp:
+        return resp
+    if _msgpack is None:
+        return web.json_response(err_obj("speech-to-text needs the msgpack package "
+            "(pip install msgpack); install it and restart dyva"), status=503)
+    try:
+        reader = await request.multipart()
+    except Exception:
+        return web.json_response(err_obj("expected multipart/form-data"), status=400)
+    audio, language, rfmt, model = b"", None, "json", ""
+    while True:
+        part = await reader.next()
+        if part is None:
+            break
+        if part.name in ("file", "audio"):
+            buf = bytearray()
+            while True:
+                chunk = await part.read_chunk()
+                if not chunk:
+                    break
+                buf += chunk
+                if len(buf) > MAX_VOICE_UPLOAD:
+                    return web.json_response(err_obj(
+                        f"audio too large (max {MAX_VOICE_UPLOAD // (1024 * 1024)} MB)"),
+                        status=413)
+            audio = bytes(buf)
+        elif part.name == "language":
+            language = (await part.text()).strip() or None
+        elif part.name == "response_format":
+            rfmt = (await part.text()).strip().lower() or "json"
+        elif part.name == "model":
+            model = (await part.text()).strip()
+    if not audio:
+        return web.json_response(
+            err_obj("no audio uploaded (multipart field 'file')"), status=400)
+
+    hosts = _find_asr_hosts()
+    if not hosts:
+        return web.json_response(err_obj("no speech-to-text host available"), status=503)
+
+    session = request.app["session"]
+    label = f"stt: {len(audio) // 1024}KB"
+    errors_list = []
+
+    async def attempt(host, wid, done):
+        await broadcast_activity(host, ASR_KEY, "trying", f"trying: {host}@{label}", wid=wid)
+        start = time.time()
+        try:
+            # fish decodes the container (wav/mp3/…) itself; sample_rate is its resample
+            # target, so the request's 44100 default is fine for any uploaded file.
+            text = await _asr_transcribe(session, host, audio, 44100, language)
+        except (_AsrError, asyncio.TimeoutError, aiohttp.ClientError, OSError) as e:
+            err = str(e) or type(e).__name__
+            dur = time.time() - start
+            errors_list.append(f"{host}: {err}")
+            await broadcast_activity(host, ASR_KEY, "failed",
+                f"failure: {host}@{label} - {err}", duration=dur, wid=wid)
+            if isinstance(e, asyncio.TimeoutError):
+                return timed_out(err)
+            if isinstance(e, (aiohttp.ClientError, OSError)):
+                return unreachable_host(err)
+            return failed(err)
+        dur = time.time() - start
+        await broadcast_activity(host, ASR_KEY, "connected",
+            f"success: {host}@{label}", duration=dur, wid=wid, rmodel="fish")
+        return accepted((host, text))
+
+    job_wid = await _register_worker(model or "*", len(hosts), lambda: None, kind="speech")
+    result, _stopped, _tried, _tally = await _race_hosts(
+        hosts, attempt, ASR_KEY, job_wid=job_wid, host_of=lambda h: h, label=label)
+    if not result:
+        await _unregister_worker(job_wid)
+        detail = "; ".join(errors_list[:5]) or "all hosts failed"
+        return web.json_response(err_obj(f"transcription failed: {detail}"), status=502)
+    host, text = result
+    await _unregister_worker(job_wid, ok=True)
+    headers = {"X-Dyva-Host": host, "X-Dyva-Service": "fish",
+               "Access-Control-Expose-Headers": "X-Dyva-Host, X-Dyva-Service"}
+    if rfmt == "text":
+        return web.Response(text=text, headers=headers, content_type="text/plain")
+    out = {"text": text}
+    if rfmt == "verbose_json":
+        out["language"] = _asr_lang(language)
+    return web.json_response(out, headers=headers)
+
+
 # ---- Image editing ------------------------------------------------------
 # Distinct from txt2img: an edit model takes a prompt plus zero or more
 # reference images ("put the feather cap on the dog", dog.jpg, cap.jpg).
@@ -23903,6 +24116,7 @@ def make_app():
     swagger.add_get("/sdapi/v1/images/thumb/{name}", handle_image_thumb)
     swagger.add_get("/sdapi/v1/images/{name}", handle_image_file)
     swagger.add_post("/v1/audio/speech", handle_tts_speech)
+    swagger.add_post("/v1/audio/transcriptions", handle_transcriptions)   # STT -> fish /v1/asr
     # plain router: multipart bodies aren't swagger-validatable
     app.router.add_post("/v1/images/edits", handle_image_edit)
     swagger.add_get("/v1/images/edit-models", handle_edit_models)

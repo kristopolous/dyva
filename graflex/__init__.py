@@ -20,6 +20,11 @@ try:
 except ImportError:
     aiohttp = None
 
+try:
+    import msgpack as _msgpack   # fish /v1/asr probe (binary audio field); optional
+except ImportError:
+    _msgpack = None
+
 log = logging.getLogger("graflex")
 
 
@@ -1184,6 +1189,48 @@ def _fish_capabilities(spec):
     return {"version": info.get("version"), "capabilities": sorted(caps)}
 
 
+def _tiny_silent_wav(ms=200, sr=16000):
+    """A minimal valid mono 16-bit WAV of silence — just enough for a host to accept and
+    reach its ASR model lookup."""
+    import struct
+    pcm = b"\x00\x00" * int(sr * ms / 1000)
+    return (b"RIFF" + struct.pack("<I", 36 + len(pcm)) + b"WAVE"
+            + b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, sr, sr * 2, 2, 16)
+            + b"data" + struct.pack("<I", len(pcm)) + pcm)
+
+
+async def _fish_asr_loaded(session, base_url, timeout):
+    """Tell a fish host that actually loaded an ASR model from one that merely advertises
+    the /v1/asr route. fish-speech checks `model_manager.asr_model` before touching the
+    audio, so a model-less host answers 500 "'ModelManager' object has no attribute
+    'asr_model'" regardless of the clip — the dominant case in the wild. We POST a tiny
+    silent clip and return False ONLY on that definitive model-absent signal; a 200, a
+    different error, or any transient is inconclusive and keeps the advertised cap (we never
+    drop asr on our own probe's hiccup). Needs msgpack to encode the binary audio field;
+    without it we can't probe, so the cap stays as advertised."""
+    if _msgpack is None:
+        return True
+    try:
+        body = _msgpack.packb({"audios": [_tiny_silent_wav()], "sample_rate": 16000,
+                               "language": "auto"}, use_bin_type=True)
+        r = await asyncio.wait_for(
+            session.post(f"{base_url}v1/asr", data=body,
+                         headers={"Content-Type": "application/msgpack"},
+                         allow_redirects=False),
+            timeout=min(timeout, 20))
+        raw = await r.read()
+        await r.release()
+        if r.status == 200:
+            return True
+        txt = raw[:300].decode("utf-8", "ignore").lower()
+        if r.status >= 500 and ("asr_model" in txt or "modelmanager" in txt
+                                or "no attribute" in txt):
+            return False
+        return True   # any other outcome -> inconclusive, keep the advertised cap
+    except Exception:
+        return True   # transient / unreachable -> inconclusive, keep the advertised cap
+
+
 async def _check_host(session, host, port, service, timeout=TIMEOUT):
     from datetime import datetime, timezone
     import urllib.parse
@@ -1532,11 +1579,18 @@ async def _check_host(session, host, port, service, timeout=TIMEOUT):
                     if not fish or not fish["capabilities"]:
                         last_error = {"error": f"not a Fish Speech API ({current_scheme})"}
                         break
+                    caps = list(fish["capabilities"])
+                    # `asr` sits in the OpenAPI whenever the route is built, even with NO ASR
+                    # model loaded — most fish hosts in the wild advertise it but 500 on use.
+                    # Verify so a recorded `asr` means a host that can actually transcribe, not
+                    # just one that answers the route (see _fish_asr_loaded).
+                    if "asr" in caps and not await _fish_asr_loaded(session, base_url, timeout):
+                        caps = [c for c in caps if c != "asr"]
                     result = {
                         "service": service,
                         "url": base_url,
                         "models": ["fish"],
-                        "capabilities": fish["capabilities"],
+                        "capabilities": caps,
                         "checked": datetime.now(timezone.utc).isoformat(),
                     }
                     if fish.get("version"):
