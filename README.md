@@ -62,6 +62,7 @@ The details:
 
 * Specified as partial strings or globs such as `qwen*27b` or even `abliterated` for the times you want to slip into something more comfortable.
 * As fallbacks with a comma such as `gemma3,qwen3.6` (try the first, fall back to the second)
+* As a pool with a pipe such as `gemma3|qwen3.6` (match either, pooled into one candidate set and ranked by the usual reputation/priority — unlike the comma, neither goes first). `|` binds tighter than `,`, so `a|b,c` pools a and b, then falls back to c.
 * By size like `qwen >10gb`
 * By release date like `qwen>2026`.
 

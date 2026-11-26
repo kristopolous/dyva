@@ -6097,6 +6097,11 @@ def find_servers_fallback(sub, caps=None):
     qwen pool. The segment map, led into the race sort, is what keeps the order the user asked
     for.) A host matching several segments is attributed to its EARLIEST (deduped, listed once).
 
+    '|' is the opposite within a single segment: 'qwen3.8|gemma4' POOLS every qwen OR gemma
+    host into one candidate set assessed together by reputation (handled in _find_servers_raw,
+    so each pooled host shares this segment's index). '|' binds tighter than ',', so
+    'a|b,c' = pool(a,b) first, then fall back to c.
+
     Returns (servers, segment_of). segment_of is {} for a single target (no chain) — an empty
     map is the no-op signal the race honours as 'order by reputation as before'. Alias expansion
     happens BEFORE the split, so a chain alias ('!uncensored' -> 'a,b') fans into real segments."""
@@ -6115,6 +6120,7 @@ def find_servers_fallback(sub, caps=None):
 
 
 _FALLBACK_RE = re.compile(r"\s*,\s*")
+_OR_RE = re.compile(r"\s*\|\s*")
 
 
 def _split_fallback(q):
@@ -6136,6 +6142,33 @@ def _find_servers_raw(sub, caps=None):
         for model in chain:
             res += find_servers(model, caps)
         return res
+
+    # '|' = POOLED UNION within a segment: 'qwen3.8|gemma4' gathers every host matching
+    # qwen3.8 OR gemma4 into ONE candidate set (deduped, model lists merged, best/lowest
+    # tier kept) and lets the normal priority sort assess them together — unlike ',', which
+    # EXHAUSTS one target before the next. '|' binds tighter than ',' (it's split after the
+    # comma chain above): 'a|b,c' = pool(a,b) first, then c. Any query modifier (>5gb,
+    # ;tps>40, >2026-02) was already peeled off upstream by find_servers, so it applies to
+    # the whole pool.
+    if sub and "|" in sub:
+        parts = [p for p in _OR_RE.split(sub) if p.strip()]
+        if len(parts) > 1:
+            pooled, order = {}, []
+            for part in parts:
+                for prio, host, ms in _find_servers_raw(part, caps):
+                    if host in pooled:
+                        cur = pooled[host]
+                        if prio < cur[0]:
+                            cur[0] = prio            # a host matching both keeps its best tier
+                        for m in ms:
+                            if m not in cur[1]:
+                                cur[1].append(m)     # and can serve either matched model
+                    else:
+                        pooled[host] = [prio, list(ms)]
+                        order.append(host)
+            out = [(pooled[h][0], h, pooled[h][1]) for h in order]
+            out.sort(key=lambda t: t[0])             # priority order; race re-sorts anyway
+            return out
 
     sub = canon_pattern(sub)
     knowns = load_knowns() if caps else {}
@@ -22317,7 +22350,7 @@ def _match_rank(needle):
     by the FIRST alternative it matches, so earlier-listed alternatives sort ahead
     — `z*image,flux` prefers a z-image over a flux even when flux sorts first by
     name — then exact/prefix/contains within that alternative."""
-    alts = [p.strip() for p in (needle or "").split(",") if p.strip()]
+    alts = [p.strip() for p in re.split(r"[,|]", needle or "") if p.strip()]
     if len(alts) > 1:
         subkeys = [(a, _match_rank(a)) for a in alts]
 
@@ -22361,8 +22394,11 @@ def model_query_match(name, query):
     superset: a comma-free query behaves exactly as before."""
     if not (query or "").strip():
         return True
-    if "," in query:
-        parts = [p.strip() for p in query.split(",") if p.strip()]
+    # ',' and '|' both list alternatives here (a name matching ANY one matches). In TEXT
+    # routing the two differ — ',' is ordered exhaustion, '|' is a pooled union — but the
+    # media match paths have no sequencing, so for matching they're the same OR.
+    if "," in query or "|" in query:
+        parts = [p.strip() for p in re.split(r"[,|]", query) if p.strip()]
         if len(parts) > 1:
             return any(model_query_match(name, p) for p in parts)
         query = parts[0] if parts else query
