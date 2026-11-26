@@ -7875,6 +7875,9 @@ function applyDocOp(chatId,name,args){
   return out;
 }
 // ---- spreadsheets (the 'sheet' document type) ---------------------------
+// SYNC: _calcEval + _sheetGrid/_sheetEval/_sheetCompute/_sheetFmt below are copied VERBATIM into
+// the shared-sheet reader page (dyva/__init__.py, _SHEET_SHARE_PAGE). Change the compute here and
+// a shared sheet link drifts from the app — update both. See that template's own SYNC note.
 // A sheet is a document whose content is JSON: a 2D array of raw cell strings
 // (plain values, or formulas that start with '='). Formulas reuse the SAME
 // locked-down mathjs instance as calc — cell refs (A1) and ranges (A1:C3) are

@@ -15922,6 +15922,62 @@ def _doc_is_markdown(doc):
     return t == "markdown" or title.endswith(".md")
 
 
+def _doc_is_sheet(doc):
+    """A spreadsheet document (type 'sheet'). Its content is a JSON 2D-array of raw cell
+    strings; a shared link renders it to a formatted, formula-evaluated table rather than
+    dumping the raw JSON."""
+    return (doc.get("type") or "").strip().lower() == "sheet"
+
+
+# ---- Dyva brand badge on shared pages -------------------------------------
+# Every shared doc (markdown + sheet reader pages) carries a small "made with Dyva" lockup
+# pinned to the bottom-right corner: the llama avatar (dyva_96.avif, inlined as a data: URI so a
+# sandboxed opaque-origin page needs no same-origin fetch) beside the Dyva wordmark (the same
+# Slackey display font the dashboard header uses). Avatar and wordmark are vertically centred on
+# one row. Defined ONCE here and injected into both templates, so the two share pages stay in
+# step. The CSS is self-contained (its own light/dark colours, not the pages' tokens, which differ
+# between the two templates) so the same snippet drops into either page unchanged.
+def _share_badge_avatar_uri():
+    try:
+        with open(os.path.join(os.path.dirname(__file__), "static", "dyva_96.avif"), "rb") as fh:
+            return "data:image/avif;base64," + base64.b64encode(fh.read()).decode("ascii")
+    except Exception:
+        return ""   # avatar missing (odd install) — badge still renders as the wordmark alone
+
+_SHARE_BADGE_HEAD = """<link href="https://fonts.googleapis.com/css2?family=Slackey&display=swap" rel="stylesheet">
+<style>
+.dyva-foot{display:flex;justify-content:flex-end;align-items:center;margin-top:44px}
+.dyva-foot .dyva-badge{display:inline-flex;align-items:center;gap:9px;text-decoration:none;color:inherit;opacity:.85;transition:opacity .15s}
+.dyva-foot .dyva-badge:hover{opacity:1}
+.dyva-foot img{width:30px;height:30px;display:block;border-radius:6px;flex:none}
+.dyva-foot .wm{font-family:"Slackey",system-ui,-apple-system,sans-serif;font-weight:400;font-size:19px;line-height:1}
+</style>"""
+
+# The badge links to the DYVA ROOT with a RELATIVE "../../" — NOT "/". The doc is served at
+# <prefix>/docs/{cid}/{doc} (both share routes are that same fixed depth), so relative to the doc
+# URL "../../" climbs docs/{cid}/{doc} back to <prefix>/ = the dyva root. An absolute "/" would hit
+# the reverse proxy's own root (e.g. https://9ol.es/ instead of https://9ol.es/11434/), which may
+# not be dyva at all. Same relative-path trick the code uses elsewhere (e.g. HTTPFound("docs/")).
+# target=_blank + allow-popups is deliberate: the share page is served under a `sandbox` CSP
+# WITHOUT allow-top-navigation, which can block a same-tab self-navigation; a popup works.
+_SHARE_BADGE_BODY = ('<footer class="dyva-foot"><a class="dyva-badge" href="../../" '
+                     'target="_blank" rel="noopener noreferrer" title="Open Dyva">'
+                     '__DYVA_BADGE_IMG__<span class="wm">Dyva</span></a></footer>')
+
+
+def _share_badge_body():
+    uri = _share_badge_avatar_uri()
+    img = '<img src="{}" alt="" width="34" height="34">'.format(uri) if uri else ""
+    return _SHARE_BADGE_BODY.replace("__DYVA_BADGE_IMG__", img)
+
+
+def _apply_share_badge(page):
+    """Inject the Dyva brand badge into a share-page template (its __DYVA_BADGE_HEAD__ /
+    __DYVA_BADGE_BODY__ slots), so markdown and sheet shares share one lockup."""
+    return (page.replace("__DYVA_BADGE_HEAD__", _SHARE_BADGE_HEAD)
+                .replace("__DYVA_BADGE_BODY__", _share_badge_body()))
+
+
 # Reader page for a shared markdown document: the SAME marked@12 + DOMPurify@3 + highlight.js +
 # mermaid@10 stack the dashboard renders chat markdown with, so a shared link looks like the doc
 # does in the app. The markdown is JSON-embedded (</ escaped so it can't break out of the script)
@@ -15945,8 +16001,8 @@ _MD_SHARE_PAGE = """<!doctype html>
 *{box-sizing:border-box}
 html,body{margin:0;background:var(--bg);color:var(--fg)}
 body{font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-text-size-adjust:100%}
-main{max-width:760px;margin:0 auto;padding:40px 20px 96px}
-main>*:first-child{margin-top:0}
+main{max-width:760px;margin:0 auto;padding:40px 20px 72px}
+#doc>*:first-child{margin-top:0}
 h1,h2,h3,h4{line-height:1.25;font-weight:650;margin:1.6em 0 .6em}
 h1{font-size:1.9em}h2{font-size:1.5em;border-bottom:1px solid var(--line);padding-bottom:.3em}h3{font-size:1.25em}
 a{color:var(--link);text-decoration:none}a:hover{text-decoration:underline}
@@ -15963,9 +16019,11 @@ img{max-width:100%;height:auto}
 hr{border:none;border-top:1px solid var(--line);margin:2em 0}
 .mermaid{background:transparent;text-align:center;margin:0 0 1em}
 </style>
+__DYVA_BADGE_HEAD__
 </head>
 <body>
-<main id="doc"></main>
+<main><div id="doc"></div>
+__DYVA_BADGE_BODY__</main>
 <script>
 (function(){
   var SRC=__DOC_SRC__;
@@ -15995,9 +16053,136 @@ hr{border:none;border-top:1px solid var(--line);margin:2em 0}
 def _render_markdown_share(title, md):
     """Build the self-contained reader page for a shared markdown document."""
     src = json.dumps(md or "").replace("</", "<\\/").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
-    return (_MD_SHARE_PAGE
+    return _apply_share_badge(_MD_SHARE_PAGE
             .replace("__DOC_TITLE__", html_mod.escape(title or "Document"))
             .replace("__DOC_SRC__", src))
+
+
+# Reader page for a shared spreadsheet ('sheet' doc). A sheet's content is a JSON 2D-array of raw
+# cell strings (plain values, or formulas starting with '='). The in-app grid evaluates formulas
+# with the SAME locked-down mathjs the `calc` tool uses; a shared link must show the SAME computed
+# values, not the raw JSON — so this page loads mathjs@13 and carries VERBATIM COPIES of the
+# dashboard's sheet-compute helpers (_calcEval, _sheetGrid, _sheetEval, _sheetCompute, _sheetFmt).
+# >>> SYNC: these are copied from dyva/static/dashboard.html (search `_sheetCompute`). If the
+# dashboard's compute logic changes, change it here too, or a shared sheet drifts from the app. <<<
+# The grid JSON is JSON-embedded (</ escaped so a cell can't break out of the script), every cell
+# is HTML-escaped before it reaches the DOM, and the page is served under the same opaque-origin
+# sandbox CSP as an HTML/markdown share, so neither a cell's contents nor mathjs can touch storage.
+_SHEET_SHARE_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__DOC_TITLE__</title>
+<script src="https://cdn.jsdelivr.net/npm/mathjs@13/lib/browser/math.js"></script>
+<style>
+:root{color-scheme:light dark;--bg:#ffffff;--fg:#1b1f24;--dim:#5a636e;--line:#d8dce1;--head-bg:#f0f3f6;--zebra:#f7f9fb;--accent:#0b6cce}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1319;--fg:#dde2e8;--dim:#9aa4b0;--line:#2b333d;--head-bg:#19202a;--zebra:#141a21;--accent:#6cb6ff}}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg)}
+body{font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;-webkit-text-size-adjust:100%}
+main{max-width:1100px;margin:0 auto;padding:28px 18px 80px}
+h1{font-size:1.4em;font-weight:650;margin:0 0 .8em;line-height:1.25;word-break:break-word}
+.wrap{overflow:auto;border:1px solid var(--line);border-radius:8px}
+table.sheet{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}
+table.sheet th,table.sheet td{border:1px solid var(--line);padding:.42em .7em;text-align:left;vertical-align:top;white-space:pre-wrap}
+table.sheet thead th{position:sticky;top:0;background:var(--head-bg);font-weight:650;z-index:1}
+table.sheet tbody tr:nth-child(even){background:var(--zebra)}
+table.sheet td.num{text-align:right;font-variant-numeric:tabular-nums}
+.empty{color:var(--dim)}
+</style>
+__DYVA_BADGE_HEAD__
+</head>
+<body>
+<main><h1>__DOC_TITLE__</h1><div id="sheet"></div>
+__DYVA_BADGE_BODY__</main>
+<script>
+var _SHEET_MAXROWS=200,_SHEET_MAXCOLS=52;
+function _colIdx(s){var n=0;s=String(s).toUpperCase();for(var i=0;i<s.length;i++)n=n*26+(s.charCodeAt(i)-64);return n-1;}
+function _refRC(ref){var m=/^\\s*([A-Za-z]+)(\\d+)\\s*$/.exec(String(ref||''));return m?{r:parseInt(m[2],10)-1,c:_colIdx(m[1])}:null;}
+var _calcMath=null;
+function _calcEval(expr){
+  if(!window.math)throw new Error('calculator is still loading, try again');
+  if(!_calcMath){
+    _calcMath=window.math.create(window.math.all,{number:'BigNumber',precision:64});
+    var _no=function(){throw new Error('disabled')};
+    try{_calcMath.import({'import':_no,'createUnit':_no},{override:true})}catch(e){}
+  }
+  var r=_calcMath.evaluate(String(expr||''));
+  return (r&&r.toString)?r.toString():String(r);
+}
+function _sheetGrid(content){
+  var g;try{g=JSON.parse(content||'[]')}catch(e){g=[]}
+  if(!Array.isArray(g))g=[];
+  var w=0;g.forEach(function(r){if(Array.isArray(r)&&r.length>w)w=r.length});
+  return g.map(function(r){r=Array.isArray(r)?r:[];var out=[];for(var c=0;c<w;c++)out.push(r[c]==null?'':String(r[c]));return out;});
+}
+function _sheetEval(expr,cellVal,cellNum){
+  var s=String(expr);
+  var pure=/^\\s*([A-Za-z]+)(\\d+)\\s*$/.exec(s);
+  if(pure){var rc=_refRC(pure[1]+pure[2]);return cellVal(rc.r,rc.c);}
+  s=s.replace(/([A-Za-z]+)(\\d+)\\s*:\\s*([A-Za-z]+)(\\d+)/g,function(_,a1,n1,a2,n2){
+    var ci1=_colIdx(a1),ci2=_colIdx(a2),ri1=parseInt(n1,10)-1,ri2=parseInt(n2,10)-1,t;
+    if(ci1>ci2){t=ci1;ci1=ci2;ci2=t;} if(ri1>ri2){t=ri1;ri1=ri2;ri2=t;}
+    if((ci2-ci1+1)*(ri2-ri1+1)>_SHEET_MAXROWS*_SHEET_MAXCOLS)throw new Error('range too large');
+    var rows=[];for(var rr=ri1;rr<=ri2;rr++){var rc=[];for(var cc=ci1;cc<=ci2;cc++)rc.push(cellNum(rr,cc));rows.push('['+rc.join(',')+']');}
+    return '['+rows.join(',')+']';
+  });
+  s=s.replace(/([A-Za-z]+)(\\d+)/g,function(_,a1,n1){return String(cellNum(parseInt(n1,10)-1,_colIdx(a1)));});
+  s=s.toLowerCase().replace(/\\baverage\\b/g,'mean').replace(/\\bavg\\b/g,'mean').replace(/\\bproduct\\b/g,'prod');
+  var r=_calcEval(s);
+  return (r!==''&&r!=null&&isFinite(r))?Number(r):r;
+}
+function _sheetCompute(grid){
+  var rows=grid.length,cols=rows?grid[0].length:0,cache={},visiting={};
+  function cellVal(r,c){
+    if(r<0||c<0||r>=grid.length||!grid[r]||c>=grid[r].length)return '';
+    var key=r+':'+c;
+    if(key in cache)return cache[key];
+    if(visiting[key]){return (cache[key]='#CYCLE');}
+    var raw=String(grid[r][c]==null?'':grid[r][c]).trim();
+    if(raw.charAt(0)!=='='){return (cache[key]=(raw!==''&&isFinite(raw))?Number(raw):raw);}
+    visiting[key]=1;
+    var res;try{res=_sheetEval(raw.slice(1),cellVal,cellNum);}catch(e){res='#ERR';}
+    delete visiting[key];
+    return (cache[key]=res);
+  }
+  function cellNum(r,c){var v=cellVal(r,c);var n=(typeof v==='number')?v:((v!==''&&v!=null&&isFinite(v))?Number(v):NaN);return isFinite(n)?n:0;}
+  var values=[];for(var r=0;r<rows;r++){var row=[];for(var c=0;c<cols;c++)row.push(cellVal(r,c));values.push(row);}
+  return {values:values,rows:rows,cols:cols};
+}
+function _sheetFmt(v){
+  if(v==null)return '';
+  if(typeof v==='number'){if(!isFinite(v))return String(v);return ''+(Math.round(v*1e9)/1e9);}
+  return String(v);
+}
+(function(){
+  function esc(s){return String(s).replace(/[&<>]/g,function(m){return m==='&'?'&amp;':m==='<'?'&lt;':'&gt;';});}
+  var el=document.getElementById("sheet");
+  var grid=_sheetGrid(__SHEET_SRC__);
+  if(!grid.length||!grid[0].length){el.innerHTML='<p class="empty">This spreadsheet is empty.</p>';return;}
+  var V=_sheetCompute(grid).values;
+  var h='<div class="wrap"><table class="sheet"><thead><tr>';
+  for(var c=0;c<V[0].length;c++)h+='<th>'+esc(_sheetFmt(V[0][c]))+'</th>';
+  h+='</tr></thead><tbody>';
+  for(var r=1;r<V.length;r++){h+='<tr>';
+    for(var c2=0;c2<V[r].length;c2++){var v=V[r][c2];
+      h+='<td'+((typeof v==='number')?' class="num"':'')+'>'+esc(_sheetFmt(v))+'</td>';}
+    h+='</tr>';}
+  h+='</tbody></table></div>';
+  el.innerHTML=h;
+})();
+</script>
+</body>
+</html>"""
+
+
+def _render_sheet_share(title, content):
+    """Build the self-contained reader page for a shared spreadsheet (formulas evaluated)."""
+    src = json.dumps(content or "[]").replace("</", "<\\/").replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+    return _apply_share_badge(_SHEET_SHARE_PAGE
+            .replace("__DOC_TITLE__", html_mod.escape(title or "Document"))
+            .replace("__SHEET_SRC__", src))
 
 
 async def handle_doc_share(request):
@@ -16031,6 +16216,13 @@ async def handle_doc_share(request):
             break
     if doc is None:
         return web.Response(text="document not found", status=404, content_type="text/plain")
+    if _doc_is_sheet(doc):
+        # A spreadsheet: render it to a formatted, formula-evaluated table (the app's view),
+        # not the raw JSON 2D-array. Served as sandboxed HTML (same opaque-origin CSP as below).
+        body = _render_sheet_share(doc.get("title") or "Document", doc.get("content") or "[]")
+        r = web.Response(text=body, content_type="text/html", charset="utf-8")
+        r.headers["Content-Security-Policy"] = "sandbox allow-scripts allow-popups allow-forms"
+        return r
     ctype = _doc_content_type(doc)
     if ctype != "text/html" and _doc_is_markdown(doc):
         # A markdown doc: render it to the reader page a shared link is expected to show, rather
