@@ -22,7 +22,7 @@ These are all continually tested through reference installations of the current 
 
 Dyva is capable of text generation, embeddings, systemone (JEV) decision models, vision, tool calling, image generation and editing, video generation, TTS, and music generation in a unified interface with state of the art, real-time tunable router providing sub 1s latency. 
 
-It's ollama, opanai, and anthropic compatible so you can use it in coding harnesses, desktop agents like hermes, or even minimal tools, like [llcat](https://github.com/day50-dev/llcat).
+It's ollama, OpenAI, and Anthropic compatible so you can use it in coding harnesses, desktop agents like hermes, or even minimal tools, like [llcat](https://github.com/day50-dev/llcat).
 
 Dyva supports unified workflows for stable diffusion, MiniMax H3, Z-image, LTX 2.2, 2.3, 2.5, Qwen-Image, loras, iris, Flux.1, 2 and 3, including the Klein variations, and much more. You can just chat with the agent and have it do it for you.
 
