@@ -15929,6 +15929,24 @@ def _doc_is_sheet(doc):
     return (doc.get("type") or "").strip().lower() == "sheet"
 
 
+def _doc_is_svg(doc):
+    """An SVG image document (content is SVG markup). A shared link should render the PICTURE,
+    not serve the raw XML as text/plain. Detected by a .svg title, an svg language, or — for a
+    code doc — content that opens with an <svg> tag (optionally behind an xml/doctype prolog).
+    An HTML doc is never treated as SVG (it has its own render path)."""
+    if _doc_content_type(doc) == "text/html":
+        return False
+    title = (doc.get("title") or "").strip().lower()
+    lang = (doc.get("language") or "").strip().lower()
+    if title.endswith(".svg") or lang == "svg":
+        return True
+    if (doc.get("type") or "").strip().lower() == "code":
+        head = (doc.get("content") or "").lstrip()[:256].lower()
+        if head.startswith(("<svg", "<!doctype svg")) or (head.startswith("<?xml") and "<svg" in head):
+            return True
+    return False
+
+
 # ---- Dyva brand badge on shared pages -------------------------------------
 # Every shared doc (markdown + sheet reader pages) carries a small "made with Dyva" lockup
 # pinned to the bottom-right corner: the llama avatar (dyva_96.avif, inlined as a data: URI so a
@@ -16056,6 +16074,45 @@ def _render_markdown_share(title, md):
     return _apply_share_badge(_MD_SHARE_PAGE
             .replace("__DOC_TITLE__", html_mod.escape(title or "Document"))
             .replace("__DOC_SRC__", src))
+
+
+# An SVG share renders the picture, not the source. The SVG is embedded as an <img> with a
+# base64 data: URI: an <img>-loaded SVG runs in the browser's "secure static mode" — no
+# scripts, no external fetches, no interactivity — so even a hostile SVG is inert, and the
+# base64 sidesteps every quoting/breakout hazard. No page scripts are needed, so this is
+# served under a STRICTER sandbox CSP than the markdown/sheet pages (no allow-scripts).
+_SVG_SHARE_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__DOC_TITLE__</title>
+<style>
+:root{color-scheme:light dark;--bg:#f4f6f8;--fg:#1b1f24;--dim:#5a636e;--line:#e5e8ec;--card:#ffffff}
+@media (prefers-color-scheme:dark){:root{--bg:#0f1319;--fg:#dde2e8;--dim:#9aa4b0;--line:#232a33;--card:#ffffff}}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg)}
+body{font:16px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;min-height:100vh;display:flex;flex-direction:column}
+main{flex:1;width:100%;max-width:960px;margin:0 auto;padding:40px 20px 24px;display:flex;flex-direction:column}
+h1{font-size:1.15em;font-weight:650;margin:0 0 18px;word-break:break-word;color:var(--dim)}
+.svg-card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;display:flex;align-items:center;justify-content:center;overflow:auto}
+.svg-card img{max-width:100%;height:auto;display:block}
+</style>
+__DYVA_BADGE_HEAD__
+</head>
+<body>
+<main><h1>__DOC_TITLE__</h1><div class="svg-card"><img src="__SVG_URI__" alt="__DOC_TITLE__"></div>
+__DYVA_BADGE_BODY__</main>
+</body>
+</html>"""
+
+
+def _render_svg_share(title, svg):
+    """Build the self-contained reader page for a shared SVG document (picture, not source)."""
+    uri = "data:image/svg+xml;base64," + base64.b64encode((svg or "").encode("utf-8")).decode("ascii")
+    return _apply_share_badge(_SVG_SHARE_PAGE
+            .replace("__DOC_TITLE__", html_mod.escape(title or "Document"))
+            .replace("__SVG_URI__", uri))
 
 
 # Reader page for a shared spreadsheet ('sheet' doc). A sheet's content is a JSON 2D-array of raw
