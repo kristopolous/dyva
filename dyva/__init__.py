@@ -16062,7 +16062,8 @@ def _render_markdown_share(title, md):
 # cell strings (plain values, or formulas starting with '='). The in-app grid evaluates formulas
 # with the SAME locked-down mathjs the `calc` tool uses; a shared link must show the SAME computed
 # values, not the raw JSON — so this page loads mathjs@13 and carries VERBATIM COPIES of the
-# dashboard's sheet-compute helpers (_calcEval, _sheetGrid, _sheetEval, _sheetCompute, _sheetFmt).
+# dashboard's sheet-compute helpers (_calcEval, _numify, _sheetGrid, _sheetEval, _sheetCompute,
+# _sheetFmt).
 # >>> SYNC: these are copied from dyva/static/dashboard.html (search `_sheetCompute`). If the
 # dashboard's compute logic changes, change it here too, or a shared sheet drifts from the app. <<<
 # The grid JSON is JSON-embedded (</ escaped so a cell can't break out of the script), every cell
@@ -16133,6 +16134,24 @@ function _sheetEval(expr,cellVal,cellNum){
   var r=_calcEval(s);
   return (r!==''&&r!=null&&isFinite(r))?Number(r):r;
 }
+// Currency/percent-aware numeric coercion (SYNC: dashboard.html _numify). A money cell
+// ("$1,299.00", "42%", "(7.50)") coerces to its number so a sum isn't zero; display is
+// untouched — only the math sees the stripped value.
+var _CUR=/[$\\u20ac\\u00a3\\u00a5\\u20b9\\u20a9\\u0e3f\\u00a2]/g;
+function _numify(v){
+  if(typeof v==='number')return isFinite(v)?v:null;
+  var s=String(v==null?'':v).trim();
+  if(s==='')return null;
+  if(isFinite(s))return Number(s);
+  var neg=false,pct=false,m=/^\\((.*)\\)$/.exec(s);
+  if(m){neg=true;s=m[1].trim();}
+  if(/%$/.test(s)){pct=true;s=s.slice(0,-1).trim();}
+  s=s.replace(_CUR,'').replace(/,/g,'').trim();
+  if(/^[-+]?\\d*\\.?\\d+$/.test(s)){
+    var n=Number(s);if(isFinite(n))return (neg?-n:n)*(pct?0.01:1);
+  }
+  return null;
+}
 function _sheetCompute(grid){
   var rows=grid.length,cols=rows?grid[0].length:0,cache={},visiting={};
   function cellVal(r,c){
@@ -16147,7 +16166,7 @@ function _sheetCompute(grid){
     delete visiting[key];
     return (cache[key]=res);
   }
-  function cellNum(r,c){var v=cellVal(r,c);var n=(typeof v==='number')?v:((v!==''&&v!=null&&isFinite(v))?Number(v):NaN);return isFinite(n)?n:0;}
+  function cellNum(r,c){var n=_numify(cellVal(r,c));return n==null?0:n;}
   var values=[];for(var r=0;r<rows;r++){var row=[];for(var c=0;c<cols;c++)row.push(cellVal(r,c));values.push(row);}
   return {values:values,rows:rows,cols:cols};
 }

@@ -32,6 +32,7 @@ def test_render_produces_a_full_html_page_with_mathjs():
     assert "Fares-2026" in page                                       # title substituted
     assert "mathjs@13" in page                                        # the compute engine
     assert "_sheetCompute" in page                                    # the shared compute logic
+    assert "_numify" in page                                          # currency-aware coercion (SYNC w/ dashboard)
     assert "__DOC_TITLE__" not in page and "__SHEET_SRC__" not in page
 
 

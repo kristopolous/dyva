@@ -1088,6 +1088,10 @@ table.sheet{border-collapse:collapse;table-layout:fixed;width:max-content;font-s
 table.sheet th,table.sheet td{border:1px solid var(--border);padding:0;margin:0}
 table.sheet .sheet-colh,table.sheet .sheet-rowh,table.sheet .sheet-corner{background:var(--bg-inset);color:var(--text-muted);text-align:center;font-weight:600;padding:2px 6px;position:sticky;font-size:var(--fs-2xs)}
 table.sheet .sheet-colh{overflow:visible}
+table.sheet .sheet-colh.sortable{cursor:pointer}
+table.sheet .sheet-colh.sortable:hover{color:var(--text)}
+table.sheet .sheet-colh.sorted{color:var(--accent)}
+.sheet-sorti{margin-left:.25em;font-size:.85em;line-height:1}
 .sheet-resize{position:absolute;top:0;right:-3px;width:7px;height:100%;cursor:col-resize;z-index:4}
 .sheet-resize:hover{background:var(--accent)}
 body.sheet-resizing,body.sheet-resizing *{cursor:col-resize!important;user-select:none}
@@ -5529,12 +5533,15 @@ function renderQueue(){
   var el=document.getElementById('queuedMsgs'); if(!el)return;
   var q=(currentChat&&_queued[currentChat.id])||[];
   if(!q.length){el.style.display='none';el.innerHTML='';return;}
-  var html='<span class="queued-head">queued</span>';
+  // 'clear' sits right after the label, not at the end: a wide chip wraps the row, and a
+  // trailing clear then lands alone on a third line. Next to the label it stays on line 1
+  // (always the same spot) and the chips wrap under it — two lines instead of three.
+  var html='<span class="queued-head">queued</span>'
+      + '<button type="button" class="queued-clear" onclick="queueClear(currentChat.id)">clear</button>';
   q.forEach(function(t,i){
     html+='<span class="queued-chip"><span class="queued-text" title="'+escHtml(t)+'">'+escHtml(t)+'</span>'
         + '<button type="button" title="remove" onclick="queueRemove(currentChat.id,'+i+')">×</button></span>';
   });
-  html+='<button type="button" class="queued-clear" onclick="queueClear(currentChat.id)">clear</button>';
   el.innerHTML=html; el.style.display='';
 }
 // Flush the queue as ONE new user turn — used when a generation ends with no tool call
@@ -7875,9 +7882,11 @@ function applyDocOp(chatId,name,args){
   return out;
 }
 // ---- spreadsheets (the 'sheet' document type) ---------------------------
-// SYNC: _calcEval + _sheetGrid/_sheetEval/_sheetCompute/_sheetFmt below are copied VERBATIM into
-// the shared-sheet reader page (dyva/__init__.py, _SHEET_SHARE_PAGE). Change the compute here and
-// a shared sheet link drifts from the app — update both. See that template's own SYNC note.
+// SYNC: _calcEval + _numify/_sheetGrid/_sheetEval/_sheetCompute/_sheetFmt below are copied VERBATIM
+// into the shared-sheet reader page (dyva/__init__.py, _SHEET_SHARE_PAGE). Change the compute here
+// and a shared sheet link drifts from the app — update both. See that template's own SYNC note.
+// (The sort helpers below — _sheetCmp/_sheetSortByCol and the header-click wiring — are app-only:
+// the share page is read-only.)
 // A sheet is a document whose content is JSON: a 2D array of raw cell strings
 // (plain values, or formulas that start with '='). Formulas reuse the SAME
 // locked-down mathjs instance as calc — cell refs (A1) and ranges (A1:C3) are
@@ -7921,6 +7930,26 @@ function _sheetEval(expr,cellVal,cellNum){
   var r=_calcEval(s);                                   // locked-down mathjs (same as calc)
   return (r!==''&&r!=null&&isFinite(r))?Number(r):r;
 }
+// Coerce a cell to a number for formula math. Plain numbers pass; a number dressed as
+// currency/percent ("$1,299.00", "€5", "42%", "(7.50)" accounting-negative) yields its
+// value, so a sum over a money column isn't zero. Anything with other text ("3 bags",
+// "n/a", "HBM3E") is not a number -> null (callers treat as 0). DISPLAY is untouched:
+// only the math sees the stripped number — the literal cell still shows "$5.00".
+var _CUR=/[$€£¥₹₩฿¢]/g;   // $ € £ ¥ ₹ ₩ ฿ ¢
+function _numify(v){
+  if(typeof v==='number')return isFinite(v)?v:null;
+  var s=String(v==null?'':v).trim();
+  if(s==='')return null;
+  if(isFinite(s))return Number(s);                 // plain numeric string (fast path)
+  var neg=false,pct=false,m=/^\((.*)\)$/.exec(s);
+  if(m){neg=true;s=m[1].trim();}                   // accounting negative (1,234.00)
+  if(/%$/.test(s)){pct=true;s=s.slice(0,-1).trim();}
+  s=s.replace(_CUR,'').replace(/,/g,'').trim();    // drop currency symbols + thousands
+  if(/^[-+]?\d*\.?\d+$/.test(s)){                   // what's left must be a bare number
+    var n=Number(s);if(isFinite(n))return (neg?-n:n)*(pct?0.01:1);
+  }
+  return null;
+}
 // Compute every cell. Recursive with a visiting set, so a circular reference
 // resolves to '#CYCLE' rather than hanging. Returns {values:2D, rows, cols}.
 function _sheetCompute(grid){
@@ -7937,7 +7966,7 @@ function _sheetCompute(grid){
     delete visiting[key];
     return (cache[key]=res);
   }
-  function cellNum(r,c){var v=cellVal(r,c);var n=(typeof v==='number')?v:((v!==''&&v!=null&&isFinite(v))?Number(v):NaN);return isFinite(n)?n:0;}
+  function cellNum(r,c){var n=_numify(cellVal(r,c));return n==null?0:n;}
   var values=[];for(var r=0;r<rows;r++){var row=[];for(var c=0;c<cols;c++)row.push(cellVal(r,c));values.push(row);}
   return {values:values,rows:rows,cols:cols};
 }
@@ -7997,6 +8026,9 @@ function applySheetOp(chatId,name,args){
 // Per-sheet column widths (px), kept in memory for the session so a width survives
 // the full re-render on every cell edit. Keyed by doc id, then column index.
 var _sheetColW={},_SHEET_COLW_DEFAULT=96;
+// Smart-sort state per doc (which column, which direction) — drives the header arrow and
+// the asc/desc toggle. In memory for the session, like the column widths.
+var _sheetSort={};
 // Render a sheet into the doc body. `editable` draws <input> cells (latest version,
 // not streaming); otherwise a static grid (an older snapshot). Pads a few spare
 // rows/cols so there's room to type; the grid grows as cells beyond them are set.
@@ -8011,7 +8043,13 @@ function renderSheetDoc(content,editable,body){
   for(var cw=0;cw<nC;cw++){var _ww=widths[cw]||_SHEET_COLW_DEFAULT;_tw+=_ww;_cg+='<col style="width:'+_ww+'px">';}
   _cg+='</colgroup>';
   var h='<div class="sheet-wrap"><table class="sheet" style="width:'+_tw+'px">'+_cg+'<thead><tr><th class="sheet-corner" title="Fit column widths to content"><span class="sheet-fit">↔</span></th>';
-  for(var c2=0;c2<nC;c2++)h+='<th class="sheet-colh">'+_colName(c2)+'<span class="sheet-resize" data-c="'+c2+'" title="Drag to resize"></span></th>';
+  var _SS=_sheetSort[docId];
+  for(var c2=0;c2<nC;c2++){
+    var _act=(editable&&_SS&&_SS.col===c2),_arrow=_act?(_SS.dir==='desc'?'▼':'▲'):'';
+    h+='<th class="sheet-colh'+(editable?' sortable':'')+(_act?' sorted':'')+'" data-c="'+c2+'"'+(editable?' title="Click to sort this column"':'')+'>'
+      + _colName(c2)+(_act?'<span class="sheet-sorti">'+_arrow+'</span>':'')
+      + '<span class="sheet-resize" data-c="'+c2+'" title="Drag to resize"></span></th>';
+  }
   h+='</tr></thead><tbody>';
   for(var r2=0;r2<nR;r2++){
     h+='<tr><th class="sheet-rowh">'+(r2+1)+'</th>';
@@ -8025,6 +8063,12 @@ function renderSheetDoc(content,editable,body){
   body.innerHTML=h+'</tbody></table></div>';
   _wireSheetResize(body,docId);
   if(editable){
+    Array.prototype.forEach.call(body.querySelectorAll('.sheet-colh.sortable'),function(th){
+      th.addEventListener('click',function(e){
+        if(e.target.classList.contains('sheet-resize'))return;   // a drag-handle click isn't a sort
+        _sheetSortByCol(parseInt(th.getAttribute('data-c'),10));
+      });
+    });
     var ins=body.querySelectorAll('.sheet-in');
     Array.prototype.forEach.call(ins,function(inp){
       inp.addEventListener('focus',function(){this.value=this.getAttribute('data-raw')||'';this.select();});
@@ -8102,6 +8146,46 @@ function _commitSheetCell(inp){
   var w=c+1;grid.forEach(function(row){while(row.length<w)row.push('');});
   grid[r][c]=newRaw;
   doc.content=_sheetJSON(grid);doc.updated=Date.now();_docCommitVersion(doc);
+  saveCurrentChat();renderDocPanel();
+}
+// Smart sort. Compare two raw cells: blanks sink to the bottom, numbers (currency/percent
+// aware via _numify) sort numerically and before text, text sorts naturally (so "item10"
+// comes after "item2"). The eponymous "smart": a $-money column and a plain-number column
+// both just work because the key is _numify, the same coercion formulas use.
+function _sheetCmp(a,b){
+  var ea=String(a==null?'':a).trim()==='',eb=String(b==null?'':b).trim()==='';
+  if(ea||eb)return (ea?1:0)-(eb?1:0);                    // blank(s) last
+  var na=_numify(a),nb=_numify(b);
+  if(na!=null&&nb!=null)return na-nb;
+  if(na!=null)return -1; if(nb!=null)return 1;           // numbers before text
+  return String(a).localeCompare(String(b),undefined,{numeric:true,sensitivity:'base'});
+}
+// Sort the content block by one column, toggling asc<->desc on repeat clicks. Block rule:
+// the header is the first non-empty row that is IMMEDIATELY FOLLOWED by another non-empty
+// row; the contiguous non-empty rows after it are the content, and the next empty row ends
+// it. The "followed by" part matters — a model-written sheet often opens with a lone title
+// or caption row and a blank line before the real table ("sloppy" data), and that stray row
+// must be skipped, not mistaken for the header (else the block is empty and nothing sorts).
+// Formula refs are NOT rewritten when rows move — these sheets are near-always literal
+// survey/price data, which is exactly what sorting is for; that edge case is out of scope.
+function _sheetSortByCol(col){
+  var doc=findDoc(currentDocs(),activeDocId);if(!doc||doc.type!=='sheet')return;
+  var prev=_sheetSort[doc.id],dir=(prev&&prev.col===col&&prev.dir==='asc')?'desc':'asc';
+  var grid=_sheetGrid(doc.content);
+  function rowEmpty(row){for(var i=0;i<row.length;i++)if(String(row[i]==null?'':row[i]).trim()!=='')return false;return true;}
+  var hh=-1;for(var r=0;r+1<grid.length;r++){if(!rowEmpty(grid[r])&&!rowEmpty(grid[r+1])){hh=r;break;}}
+  if(hh<0)return;                                        // no header+data pair anywhere
+  var start=hh+1,end=start;
+  while(end<grid.length&&!rowEmpty(grid[end]))end++;      // content = [start,end)
+  if(end-start<2)return;                                 // 0 or 1 rows — nothing to reorder
+  var block=grid.slice(start,end),blanks=[],rowsd=[];
+  block.forEach(function(row){(String(row[col]==null?'':row[col]).trim()===''?blanks:rowsd).push(row);});
+  rowsd.sort(function(A,B){return _sheetCmp(A[col],B[col]);});
+  if(dir==='desc')rowsd.reverse();
+  var sorted=rowsd.concat(blanks);
+  for(var i=0;i<sorted.length;i++)grid[start+i]=sorted[i];
+  doc.content=_sheetJSON(grid);doc.updated=Date.now();_docCommitVersion(doc);
+  _sheetSort[doc.id]={col:col,dir:dir};
   saveCurrentChat();renderDocPanel();
 }
 // ---- inline <file> blocks -----------------------------------------------
