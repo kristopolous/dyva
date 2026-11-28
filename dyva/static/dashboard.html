@@ -8160,31 +8160,59 @@ function _sheetCmp(a,b){
   if(na!=null)return -1; if(nb!=null)return 1;           // numbers before text
   return String(a).localeCompare(String(b),undefined,{numeric:true,sensitivity:'base'});
 }
-// Sort the content block by one column, toggling asc<->desc on repeat clicks. Block rule:
-// the header is the first non-empty row that is IMMEDIATELY FOLLOWED by another non-empty
-// row; the contiguous non-empty rows after it are the content, and the next empty row ends
-// it. The "followed by" part matters — a model-written sheet often opens with a lone title
-// or caption row and a blank line before the real table ("sloppy" data), and that stray row
-// must be skipped, not mistaken for the header (else the block is empty and nothing sorts).
-// Formula refs are NOT rewritten when rows move — these sheets are near-always literal
-// survey/price data, which is exactly what sorting is for; that edge case is out of scope.
+// Rewrite the SINGLE-cell row refs (A1) in one formula through a row permutation
+// (0-based old index -> new index), so when a row moves its own formula keeps
+// pointing at its own data. Range endpoints (A1:B9) are deliberately left alone:
+// we only permute rows WITHIN the block, so a range still spans the same physical
+// cells and any aggregate over it is order-independent. Non-formulas pass through.
+// (Same letters+digits ref grammar as _sheetEval, including its "log2 looks like a
+// ref" quirk — kept identical on purpose so sort and eval agree.)
+function _remapRefs(cell,rowMap){
+  var s=String(cell==null?'':cell);
+  if(s.charAt(0)!=='=')return cell;
+  var ranges=[];                                         // mask ranges so the single-ref pass skips their endpoints
+  s=s.replace(/[A-Za-z]+\d+\s*:\s*[A-Za-z]+\d+/g,function(m){ranges.push(m);return '\u0000'+(ranges.length-1)+'\u0000';});
+  s=s.replace(/([A-Za-z]+)(\d+)/g,function(m,cl,rw){
+    var r0=parseInt(rw,10)-1;
+    return Object.prototype.hasOwnProperty.call(rowMap,r0)?cl+(rowMap[r0]+1):m;
+  });
+  return s.replace(/\u0000(\d+)\u0000/g,function(_,i){return ranges[+i];});
+}
+// Pure sort: reorder the content block of `grid` by `col` (dir 'asc'|'desc') and
+// return a NEW grid, or null if there's no sortable block. Block rule: the header
+// is the first non-empty row IMMEDIATELY FOLLOWED by another non-empty row; the
+// contiguous non-empty rows after it are the content, the next empty row ends it.
+// The "followed by" part matters — a model-written sheet often opens with a lone
+// title/caption row and a blank line before the real table ("sloppy" data), and
+// that stray row must be skipped, not taken for the header (else the block is empty
+// and nothing sorts). The key is the COMPUTED value (so a $/GB formula column sorts
+// by its number, not by the text "=B2/A2"), and single refs are remapped so each
+// moved formula follows its own row. Blank-keyed rows sink to the block's bottom.
+function _sheetSortGrid(grid,col,dir){
+  function rowEmpty(row){for(var i=0;i<row.length;i++)if(String(row[i]==null?'':row[i]).trim()!=='')return false;return true;}
+  var hh=-1;for(var r=0;r+1<grid.length;r++){if(!rowEmpty(grid[r])&&!rowEmpty(grid[r+1])){hh=r;break;}}
+  if(hh<0)return null;                                   // no header+data pair anywhere
+  var start=hh+1,end=start;
+  while(end<grid.length&&!rowEmpty(grid[end]))end++;      // content = [start,end)
+  if(end-start<2)return null;                            // 0 or 1 rows — nothing to reorder
+  var comp=_sheetCompute(grid);                          // sort on computed values, not raw formula text
+  var blanks=[],rowsd=[];                                // tag each block row with its ORIGINAL index
+  for(var i=start;i<end;i++)(String(grid[i][col]==null?'':grid[i][col]).trim()===''?blanks:rowsd).push(i);
+  rowsd.sort(function(a,b){return _sheetCmp(comp.values[a][col],comp.values[b][col]);});
+  if(dir==='desc')rowsd.reverse();
+  var order=rowsd.concat(blanks),rowMap={};              // original grid row -> new grid row
+  for(var k=0;k<order.length;k++)rowMap[order[k]]=start+k;
+  var out=grid.map(function(row){return row.map(function(cell){return _remapRefs(cell,rowMap);});});
+  for(var k2=0;k2<order.length;k2++)out[start+k2]=grid[order[k2]].map(function(cell){return _remapRefs(cell,rowMap);});
+  return out;
+}
+// Sort by one column, toggling asc<->desc on repeat clicks, then persist + re-render.
 function _sheetSortByCol(col){
   var doc=findDoc(currentDocs(),activeDocId);if(!doc||doc.type!=='sheet')return;
   var prev=_sheetSort[doc.id],dir=(prev&&prev.col===col&&prev.dir==='asc')?'desc':'asc';
-  var grid=_sheetGrid(doc.content);
-  function rowEmpty(row){for(var i=0;i<row.length;i++)if(String(row[i]==null?'':row[i]).trim()!=='')return false;return true;}
-  var hh=-1;for(var r=0;r+1<grid.length;r++){if(!rowEmpty(grid[r])&&!rowEmpty(grid[r+1])){hh=r;break;}}
-  if(hh<0)return;                                        // no header+data pair anywhere
-  var start=hh+1,end=start;
-  while(end<grid.length&&!rowEmpty(grid[end]))end++;      // content = [start,end)
-  if(end-start<2)return;                                 // 0 or 1 rows — nothing to reorder
-  var block=grid.slice(start,end),blanks=[],rowsd=[];
-  block.forEach(function(row){(String(row[col]==null?'':row[col]).trim()===''?blanks:rowsd).push(row);});
-  rowsd.sort(function(A,B){return _sheetCmp(A[col],B[col]);});
-  if(dir==='desc')rowsd.reverse();
-  var sorted=rowsd.concat(blanks);
-  for(var i=0;i<sorted.length;i++)grid[start+i]=sorted[i];
-  doc.content=_sheetJSON(grid);doc.updated=Date.now();_docCommitVersion(doc);
+  var out=_sheetSortGrid(_sheetGrid(doc.content),col,dir);
+  if(!out)return;
+  doc.content=_sheetJSON(out);doc.updated=Date.now();_docCommitVersion(doc);
   _sheetSort[doc.id]={col:col,dir:dir};
   saveCurrentChat();renderDocPanel();
 }

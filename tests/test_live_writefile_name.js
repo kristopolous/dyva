@@ -10,7 +10,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const html = fs.readFileSync(path.join(__dirname, 'static', 'dashboard.html'), 'utf8');
+const html = fs.readFileSync(path.join(__dirname, '..', 'dyva', 'static', 'dashboard.html'), 'utf8');
 
 // Pull one top-level `function NAME(...){ ... }` out of the source by brace-matching.
 function extractFn(src, name) {
