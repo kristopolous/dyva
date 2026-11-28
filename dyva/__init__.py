@@ -6528,6 +6528,210 @@ def to_ollama(body):
     return body
 
 
+# --- Anthropic Messages dialect (third INBOUND dialect) ----------------------
+# dyva's front-end speaks OpenAI (/v1/chat/completions) and Ollama (/api/chat);
+# these add Anthropic's /v1/messages as a third inbound dialect. The strategy is
+# the same both ways: translate Anthropic <-> OpenAI at the very edge, and let the
+# existing OpenAI path (to_ollama -> _proxy_chat -> _race_servers, and the OpenAI
+# SSE serializer) do all the routing/racing/failover work unchanged. Nothing about
+# how dyva talks to the pool changes — only the parse/serialize pair at the socket.
+
+def _anthropic_text_of(content):
+    """Flatten an Anthropic `content` (a string, or a list of blocks) to plain
+    text. Used for `system` and for tool_result bodies, where only the text matters."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                parts.append(b.get("text") or "")
+            elif isinstance(b, str):
+                parts.append(b)
+        return "\n".join(parts)
+    return "" if content is None else str(content)
+
+
+def _anthropic_image_part(block):
+    """One Anthropic image block -> one OpenAI `image_url` content part. A base64
+    source becomes a data: URI (what the OpenAI vision path + _flatten_content read);
+    a url source is passed through."""
+    src = block.get("source") or {}
+    if src.get("type") == "url" and src.get("url"):
+        url = src["url"]
+    else:
+        mt = src.get("media_type") or "image/png"
+        url = f"data:{mt};base64,{src.get('data', '')}"
+    return {"type": "image_url", "image_url": {"url": url}}
+
+
+def _anthropic_message_to_openai(role, content):
+    """Translate ONE Anthropic message into one-or-more OpenAI messages.
+
+    Blocks fan out by type: text -> string (or a text part when images are present);
+    image -> an OpenAI image_url part; tool_use (assistant) -> tool_calls; tool_result
+    (user) -> a separate `tool` role message. tool_result messages are emitted first so
+    they directly follow the assistant tool-call turn, as OpenAI requires."""
+    if isinstance(content, str):
+        return [{"role": role, "content": content}]
+
+    pre = []                       # tool-result messages, emitted before the main one
+    text_parts, image_parts, tool_calls = [], [], []
+    for b in content if isinstance(content, list) else []:
+        if not isinstance(b, dict):
+            continue
+        t = b.get("type")
+        if t == "text":
+            text_parts.append({"type": "text", "text": b.get("text") or ""})
+        elif t == "image":
+            image_parts.append(_anthropic_image_part(b))
+        elif t == "tool_use":
+            tool_calls.append({
+                "id": b.get("id") or f"call_{int(time.time())}_{len(tool_calls)}",
+                "type": "function",
+                "function": {"name": b.get("name") or "",
+                             "arguments": json.dumps(b.get("input") or {})},
+            })
+        elif t == "tool_result":
+            pre.append({"role": "tool",
+                        "tool_call_id": b.get("tool_use_id") or "",
+                        "content": _anthropic_text_of(b.get("content"))})
+
+    msg = {"role": role}
+    if image_parts:
+        # vision turn: keep the ordered parts list (text first, then images)
+        msg["content"] = text_parts + image_parts
+    else:
+        msg["content"] = "\n".join(p["text"] for p in text_parts)
+    if tool_calls:
+        msg["tool_calls"] = tool_calls
+
+    out = list(pre)
+    # Drop a now-empty user shell that carried ONLY tool_result blocks (its content is
+    # "" and it has no tool_calls) — the tool messages already carry that turn.
+    if not (pre and msg["role"] != "assistant" and not tool_calls
+            and not image_parts and msg["content"] == ""):
+        out.append(msg)
+    return out
+
+
+def _anthropic_tool_choice(tc):
+    """Anthropic tool_choice -> OpenAI tool_choice."""
+    if not isinstance(tc, dict):
+        return None
+    t = tc.get("type")
+    if t == "auto":
+        return "auto"
+    if t == "any":
+        return "required"
+    if t == "tool" and tc.get("name"):
+        return {"type": "function", "function": {"name": tc["name"]}}
+    if t == "none":
+        return "none"
+    return None
+
+
+def anthropic_to_openai(body):
+    """Anthropic /v1/messages request body -> OpenAI /v1/chat/completions body.
+    The caller then runs the result through to_ollama() like any OpenAI request, so
+    the whole routing/racing pipeline is reused untouched."""
+    out = {"model": body.get("model", "")}
+    messages = []
+    if body.get("system"):
+        messages.append({"role": "system", "content": _anthropic_text_of(body["system"])})
+    for m in body.get("messages") or []:
+        messages.extend(_anthropic_message_to_openai(m.get("role", "user"), m.get("content")))
+    out["messages"] = messages
+
+    if body.get("tools"):
+        out["tools"] = [{"type": "function",
+                         "function": {"name": t.get("name") or "",
+                                      "description": t.get("description") or "",
+                                      "parameters": t.get("input_schema") or {}}}
+                        for t in body["tools"] if isinstance(t, dict)]
+    choice = _anthropic_tool_choice(body.get("tool_choice"))
+    if choice is not None:
+        out["tool_choice"] = choice
+
+    # Sampling / limits (OpenAI names; to_ollama maps max_tokens -> num_predict).
+    if body.get("max_tokens") is not None:
+        out["max_tokens"] = body["max_tokens"]
+    for k in ("temperature", "top_p"):
+        if body.get(k) is not None:
+            out[k] = body[k]
+    if body.get("stop_sequences"):
+        out["stop"] = body["stop_sequences"]
+    if body.get("stream") is not None:
+        out["stream"] = body["stream"]
+    # `metadata`, `top_k`, etc. are dropped: they have no OpenAI equivalent the pool reads.
+    return out
+
+
+_ANTHROPIC_STOP = {"stop": "end_turn", "length": "max_tokens",
+                   "tool_calls": "tool_use", "content_filter": "end_turn"}
+
+
+def _anthropic_stop_reason(done_reason, had_tool):
+    if had_tool:
+        return "tool_use"
+    return _ANTHROPIC_STOP.get(done_reason or "stop", "end_turn")
+
+
+def to_anthropic(resp, model):
+    """Internal ollama-shaped reply -> a complete Anthropic Message object (non-stream)."""
+    msg = dict(resp.get("message") or {})
+    blocks = []
+    think = msg.get("thinking")
+    if think:
+        blocks.append({"type": "thinking", "thinking": think})
+    tcs = msg.get("tool_calls") or []
+    text = msg.get("content")
+    if isinstance(text, str) and (text or not tcs):
+        # always keep at least one text block for a tool-less reply, even if empty
+        blocks.append({"type": "text", "text": text})
+    for i, tc in enumerate(tcs):
+        fn = (tc or {}).get("function") or {}
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args) if args.strip() else {}
+            except Exception:
+                args = {}
+        blocks.append({"type": "tool_use",
+                       "id": tc.get("id") or f"toolu_{int(time.time())}_{i}",
+                       "name": fn.get("name") or "",
+                       "input": args if isinstance(args, dict) else {}})
+    return {
+        "id": f"msg_{int(time.time()*1000):x}",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": blocks,
+        "stop_reason": _anthropic_stop_reason(resp.get("done_reason"), bool(tcs)),
+        "stop_sequence": None,
+        "usage": {"input_tokens": resp.get("prompt_eval_count", 0),
+                  "output_tokens": resp.get("eval_count", 0)},
+    }
+
+
+def to_anthropic_models(models):
+    """dyva's model catalog -> Anthropic's `GET /v1/models` list shape. Anthropic's models
+    endpoint shares the path with OpenAI's, so the handler picks this shape only for clients
+    that send the `anthropic-version` header."""
+    created = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    data = [{"type": "model", "id": m["id"], "display_name": m["id"], "created_at": created}
+            for m in models]
+    return {"data": data, "has_more": False,
+            "first_id": data[0]["id"] if data else None,
+            "last_id": data[-1]["id"] if data else None}
+
+
+def _is_anthropic_client(request):
+    """A real Anthropic SDK/tool always sends the `anthropic-version` header; use it to pick
+    the Anthropic response shape on endpoints (like /v1/models) shared with OpenAI."""
+    return bool((request.headers.get("anthropic-version") or "").strip())
+
+
 def _fmt_tool_calls(tcs):
     out = []
     for i, tc in enumerate(tcs):
@@ -6639,6 +6843,187 @@ def sse_chunk(model, delta, done=False, finish_reason="stop"):
 
 def sse_str(obj):
     return f"data: {json.dumps(obj)}\n\n"
+
+
+def _anthropic_event(etype, data):
+    """One Anthropic SSE event: a `type` field on the data object and an `event:`
+    line (the official SDK dispatches on the event line)."""
+    data = dict(data, type=etype)
+    return f"event: {etype}\ndata: {json.dumps(data)}\n\n".encode()
+
+
+class _OpenAIToAnthropicSSE:
+    """Stateful translator: the OpenAI `chat.completion.chunk` SSE stream dyva
+    already emits -> Anthropic's Messages event stream. Fed the client-bound bytes
+    exactly as the OpenAI serializer writes them (one `data:` record per write, plus
+    the race's `: keepalive` comments), so failover across hosts is invisible here —
+    it is one continuous OpenAI stream regardless of how many hosts contributed.
+
+    Anthropic's stream is a small state machine: message_start, then a sequence of
+    content blocks (text / thinking / tool_use), each framed by content_block_start
+    .. content_block_delta* .. content_block_stop, then message_delta (stop_reason)
+    and message_stop. We open a block lazily on the first delta of each kind and
+    close the previous one when the kind changes."""
+
+    def __init__(self, model):
+        self.model = model
+        self._buf = b""
+        self._started = False       # message_start emitted
+        self._stopped = False       # message_stop emitted (terminal reached)
+        self._next = 0              # next content-block index to assign (monotonic)
+        self._cur = None            # index of the currently OPEN block, None = none open
+        self._kind = None           # kind of the open block: 'text'|'thinking'|'tool_use'
+        self._tool_slots = {}       # openai tool index -> its anthropic block index
+        self._stop_reason = "end_turn"
+
+    # -- framing helpers --
+    def _ensure_started(self):
+        if self._started:
+            return b""
+        self._started = True
+        return _anthropic_event("message_start", {"message": {
+            "id": f"msg_{int(time.time()*1000):x}", "type": "message", "role": "assistant",
+            "model": self.model, "content": [], "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0}}})
+
+    def _close_block(self):
+        if self._cur is None:
+            return b""
+        out = _anthropic_event("content_block_stop", {"index": self._cur})
+        self._cur = None
+        self._kind = None
+        return out
+
+    def _start_block(self, kind, content_block):
+        """Close any open block and open a fresh one at the next monotonic index."""
+        out = self._close_block()
+        self._cur = self._next
+        self._next += 1
+        self._kind = kind
+        out += _anthropic_event("content_block_start",
+                                {"index": self._cur, "content_block": content_block})
+        return out
+
+    # -- per-record handling --
+    def _text_delta(self, kind, dtype, key, text):
+        # dtype is the Anthropic delta type ('text_delta'/'thinking_delta'); key is the
+        # value field Anthropic reads ('text'/'thinking') — the two differ, so pass both.
+        out = self._ensure_started()
+        if self._kind != kind:
+            cb = ({"type": "text", "text": ""} if kind == "text"
+                  else {"type": "thinking", "thinking": ""})
+            out += self._start_block(kind, cb)
+        out += _anthropic_event("content_block_delta",
+                                {"index": self._cur, "delta": {"type": dtype, key: text}})
+        return out
+
+    def _tool_delta(self, tc):
+        out = self._ensure_started()
+        oai_i = tc.get("index", 0)
+        fn = tc.get("function") or {}
+        if oai_i not in self._tool_slots:
+            out += self._start_block("tool_use", {"type": "tool_use",
+                "id": tc.get("id") or f"toolu_{int(time.time())}_{oai_i}",
+                "name": fn.get("name") or "", "input": {}})
+            self._tool_slots[oai_i] = self._cur
+        args = fn.get("arguments")
+        if args:
+            out += _anthropic_event("content_block_delta",
+                {"index": self._tool_slots[oai_i],
+                 "delta": {"type": "input_json_delta", "partial_json": args}})
+        return out
+
+    def _terminal(self, finish_reason):
+        self._stop_reason = _ANTHROPIC_STOP.get(finish_reason or "stop", "end_turn")
+        out = self._close_block()
+        out += _anthropic_event("message_delta",
+            {"delta": {"stop_reason": self._stop_reason, "stop_sequence": None},
+             "usage": {"output_tokens": 0}})
+        out += _anthropic_event("message_stop", {})
+        self._stopped = True
+        return out
+
+    def _record(self, lines):
+        # SSE comment (keepalive): forward verbatim; it carries no event and is ignored.
+        if lines and all(l.startswith(":") for l in lines):
+            return ("\n".join(lines) + "\n\n").encode()
+        data = None
+        for l in lines:
+            if l.startswith("data:"):
+                data = l[len("data:"):].strip()
+        if data is None or data == "[DONE]":
+            return b""
+        try:
+            obj = json.loads(data)
+        except Exception:
+            return b""
+        if isinstance(obj, dict) and obj.get("error"):
+            e = obj["error"]
+            msg = e.get("message") if isinstance(e, dict) else str(e)
+            return _anthropic_event("error", {"error": {"type": "api_error", "message": msg}})
+        if self._stopped:
+            return b""
+        choice = (obj.get("choices") or [{}])[0]
+        delta = choice.get("delta") or {}
+        out = b""
+        if delta.get("content"):
+            out += self._text_delta("text", "text_delta", "text", delta["content"])
+        for k in REASONING_KEYS:
+            if delta.get(k):
+                out += self._text_delta("thinking", "thinking_delta", "thinking", delta[k])
+        for tc in delta.get("tool_calls") or []:
+            out += self._tool_delta(tc)
+        if choice.get("finish_reason"):
+            out += self._terminal(choice["finish_reason"])
+        return out
+
+    def feed(self, data):
+        """Translate a chunk of client-bound OpenAI-SSE bytes -> Anthropic-SSE bytes."""
+        self._buf += data
+        out = b""
+        while b"\n\n" in self._buf:
+            record, self._buf = self._buf.split(b"\n\n", 1)
+            lines = [l for l in record.decode(errors="replace").split("\n") if l != ""]
+            if lines:
+                out += self._record(lines)
+        return out
+
+    def close(self):
+        """Flush any trailing partial record and, if the upstream never sent a terminal
+        finish chunk (a mid-stream drop), synthesize message_stop so the client ends."""
+        out = b""
+        tail = self._buf.strip()
+        self._buf = b""
+        if tail:
+            lines = [l for l in tail.decode(errors="replace").split("\n") if l != ""]
+            if lines:
+                out += self._record(lines)
+        if self._started and not self._stopped:
+            out += self._terminal("stop")
+        return out
+
+
+class _AnthropicStreamResponse(web.StreamResponse):
+    """A StreamResponse that looks exactly like the SSE response the OpenAI path writes,
+    but translates every write through _OpenAIToAnthropicSSE on the way to the socket.
+    Because it IS a StreamResponse, the keepalive wrapper, _stream_chat_failover and
+    _pump_stream drive it unchanged (openai_format=True); only the bytes are reshaped."""
+
+    def __init__(self, model):
+        super().__init__()
+        self._tr = _OpenAIToAnthropicSSE(model)
+
+    async def write(self, data):
+        out = self._tr.feed(data)
+        if out:
+            await super().write(out)
+
+    async def write_eof(self, data=b""):
+        with contextlib.suppress(Exception):
+            tail = self._tr.close()
+            if tail:
+                await super().write(tail)
+        return await super().write_eof(data)
 
 
 def _host_url(host, path):
@@ -9554,7 +9939,8 @@ def _resume_dropped_stream(tool_arg_chars, tool_resume=None):
     return tool_arg_chars <= 0 or bool(tool_resume)
 
 
-async def _race_sse_keepalive(request, session, model, servers, payload, req_caps, job_wid):
+async def _race_sse_keepalive(request, session, model, servers, payload, req_caps, job_wid,
+                              response=None):
     """Race for a host while keeping a streaming SSE client's connection warm.
 
     dyva adds pre-first-token latency raw ollama doesn't (the race, hedge delay,
@@ -9569,7 +9955,11 @@ async def _race_sse_keepalive(request, session, model, servers, payload, req_cap
     must be written in-stream. result=None means no host won, the client hung up during
     the wait, or the race raised; in every such case the prepared response is returned so
     the caller finishes it on the same object."""
-    response = web.StreamResponse()
+    # `response`, when supplied, is a StreamResponse the caller pre-made (the Anthropic
+    # translating wrapper) — use it so every keepalive/stream write is reshaped on the way
+    # out. Default: a plain SSE StreamResponse, as before.
+    if response is None:
+        response = web.StreamResponse()
     response.headers["Content-Type"] = "text/event-stream"
     response.headers["Cache-Control"] = "no-cache"
     try:
@@ -10054,7 +10444,9 @@ async def _drain_stream(resp, first_line, upstream_openai, model,
     return data, outcome
 
 
-def chat_fmt(data, model, openai_format):
+def chat_fmt(data, model, openai_format, anthropic=False):
+    if anthropic:
+        return web.json_response(to_anthropic(data, model))
     if openai_format:
         return web.json_response(to_openai(data, model))
     else:
@@ -10654,7 +11046,8 @@ async def _stream_info_test_all(request, session, model_in, tools, openai_format
     return resp
 
 
-async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_format):
+async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_format,
+                      anthropic=False):
     # ';caps=...' override (universal): strip it off the model string up front so the split and
     # everything downstream see a clean model; the override is applied to req_caps below.
     model_in, _caps_ov = _strip_caps_directive(model_in)
@@ -10765,8 +11158,13 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                 # short idle timeout doesn't bail while dyva is still finding a host. This
                 # prepares the response early, so a no-host outcome is written in-stream
                 # (the 200 is already committed) rather than returned as a 502.
+                # Anthropic clients get a wrapping StreamResponse that reshapes the OpenAI
+                # SSE this path writes into Anthropic's event stream; OpenAI clients get the
+                # default plain SSE response. Everything downstream is identical.
+                _wrap = _AnthropicStreamResponse(model_in) if anthropic else None
                 ka_resp, result, errors, stopped = await _race_sse_keepalive(
-                    request, session, model, _servers, opayload, req_caps, job_wid)
+                    request, session, model, _servers, opayload, req_caps, job_wid,
+                    response=_wrap)
                 if result:
                     return await _stream_chat_failover(
                         request, session, model, _servers, opayload,
@@ -10890,7 +11288,7 @@ async def _proxy_chat(request, session, model_in, opayload, do_stream, openai_fo
                             f"context too large: the conversation fills even a {sent_ctx}-token "
                             "window — trim the history or start a new chat"), status=413)
                     await account_tokens(job_wid, host, full, data, sent_ctx)
-                    out = chat_fmt(data, model, openai_format)
+                    out = chat_fmt(data, model, openai_format, anthropic=anthropic)
                     out.headers["X-Dyva-Host"] = re.sub(r"^https?://", "", host)
                     out.headers["X-Dyva-Model"] = full
                     out.headers["X-Dyva-Service"] = service_of(host)
@@ -12738,6 +13136,10 @@ async def handle_v1_models(request):
     if resp:
         return resp
     models = listed_models()
+    # Anthropic's models endpoint is the SAME path as OpenAI's; an Anthropic client
+    # (anthropic-version header) gets the Anthropic list shape so its model picker works.
+    if _is_anthropic_client(request):
+        return web.json_response(to_anthropic_models(models))
     filter_mods = None
     fm = request.query.get("output_modalities")
     if fm:
@@ -14380,6 +14782,54 @@ async def handle_openai_chat(request):
         opayload = to_ollama(body)
         log.debug(f"OpenAI request: model={model}, stream={do_stream}")
         return await _proxy_chat(request, session, model, opayload, do_stream, openai_format=True)
+
+
+async def handle_anthropic_messages(request):
+    """
+    Chat completion (Anthropic Messages format)
+    ---
+    tags: [Chat]
+    summary: Chat completion using Anthropic /v1/messages format. Translates to the internal
+             pipeline (via OpenAI) and proxies/races the pool, exactly like /v1/chat/completions.
+    responses:
+      '200':
+        description: Message response (SSE event stream or JSON Message)
+        content:
+          text/event-stream:
+            schema:
+              type: string
+          application/json:
+            schema:
+              type: object
+      '400':
+        description: Invalid request
+      '404':
+        description: Model not found
+      '502':
+        description: All servers failed
+    """
+    resp = await _check_local(request)
+    if resp:
+        return resp
+    async with request.app["semaphore"]:
+        session = request.app["session"]
+        try:
+            body = await request.json()
+        except json.JSONDecodeError:
+            return web.json_response(err_obj("invalid JSON"), status=400)
+        model = body.get("model", "")
+        if not model:
+            return web.json_response(err_obj("model is required", "missing_model"), status=400)
+        do_stream = bool(body.get("stream", False))
+        oai_body = anthropic_to_openai(body)
+        _drop_nameless_tool_calls(oai_body.get("messages"))   # strip echoed garbage calls
+        opayload = to_ollama(oai_body)
+        log.debug(f"Anthropic request: model={model}, stream={do_stream}")
+        # Anthropic reuses the OpenAI SSE transport (openai_format=True) end to end; the
+        # `anthropic` flag only swaps the serializer — a wrapping StreamResponse for streams
+        # and to_anthropic() for the one buffered return.
+        return await _proxy_chat(request, session, model, opayload, do_stream,
+                                 openai_format=True, anthropic=True)
 
 
 async def handle_ollama_generate(request):
@@ -16298,6 +16748,14 @@ async def handle_doc_share(request):
         body = _render_sheet_share(doc.get("title") or "Document", doc.get("content") or "[]")
         r = web.Response(text=body, content_type="text/html", charset="utf-8")
         r.headers["Content-Security-Policy"] = "sandbox allow-scripts allow-popups allow-forms"
+        return r
+    if _doc_is_svg(doc):
+        # An SVG image: render the picture, not its XML source. Embedded as an inert <img>
+        # data-URI (secure static mode — no scripts/fetches), under a stricter sandbox CSP
+        # than below (no allow-scripts; the page runs none).
+        body = _render_svg_share(doc.get("title") or "Document", doc.get("content") or "")
+        r = web.Response(text=body, content_type="text/html", charset="utf-8")
+        r.headers["Content-Security-Policy"] = "sandbox allow-popups"
         return r
     ctype = _doc_content_type(doc)
     if ctype != "text/html" and _doc_is_markdown(doc):
@@ -24423,7 +24881,7 @@ def make_app():
 
     swagger = SwaggerDocs(
         app,
-        info=SwaggerInfo(title="dyva", version=VERSION, description="Ollama/OpenAI-compatible proxy that routes to free servers"),
+        info=SwaggerInfo(title="dyva", version=VERSION, description="Proprietary and secret Ollama/OpenAI/Anthropic-compatible proxy"),
         swagger_ui_settings=SwaggerUiSettings(path="/docs"),
     )
 
@@ -24479,6 +24937,7 @@ def make_app():
     swagger.add_post("/api/generate", handle_ollama_generate)
     swagger.add_post("/v1/chat/completions", handle_openai_chat)
     swagger.add_post("/chat/completions", handle_openai_chat)
+    swagger.add_post("/v1/messages", handle_anthropic_messages)
     swagger.add_get("/sdapi/v1/sd-models", handle_sd_models)
     swagger.add_post("/sdapi/v1/txt2img", handle_txt2img)
     swagger.add_get("/sdapi/v1/images", handle_image_history)
