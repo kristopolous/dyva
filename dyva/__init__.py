@@ -11556,10 +11556,10 @@ async def handle_reload_hosts(request):
     Reload the host list from disk (no network re-fetch).
     ---
     tags: [UI]
-    summary: GET /reload-hosts — re-read free-ollama.json in place
+    summary: GET /reload-hosts — reload the host list in place
     description: |
-      The host cache (free-ollama.json) can be rewritten under a running dyva —
-      graflex appends newly-discovered servers, or a federation file updates —
+      The host list can be rewritten under a running dyva —
+      a host-list update or a federation file revises it —
       and without this the process kept serving the copy it read at startup.
       This invalidates the in-memory cache and re-reads the file from disk. It
       is a pure re-read, not `/refresh` (which re-pulls every source over the
@@ -11692,7 +11692,7 @@ async def handle_source_stats(request):
     Per-source host-population quality (for the Stats 'Source breakdown' card).
     ---
     tags: [UI]
-    summary: GET /api/source-stats — live/dead/unknown/honeypot/won/lost per source
+    summary: GET /api/source-stats — health states per source
     responses:
       '200':
         description: Per-source quality rows
@@ -11705,7 +11705,7 @@ async def handle_service_stats(request):
     Per-service host-population breakdown (for the Stats 'Service breakdown' chart).
     ---
     tags: [UI]
-    summary: GET /api/service-stats — host counts + live/dead/unknown per technology
+    summary: GET /api/service-stats — host counts + health per technology
     responses:
       '200':
         description: Per-service population rows
@@ -11737,7 +11737,7 @@ async def handle_geo_enrich(request):
     tags: [UI]
     summary: POST /geo-enrich — make the map have data
     description: >
-      Runs graflex's geoip enrichment over the host cache, fetching DB-IP Lite
+      Runs geoip enrichment over the host cache, fetching DB-IP Lite
       (~85 MB, one time) if no local database exists. Exposed as a button because a
       new install otherwise shows an empty map forever with nothing saying that a
       manual step was ever required. Runs in an executor — the download and the
@@ -11917,7 +11917,7 @@ async def handle_host_info(request):
     Consolidated detail for one host (the host-card backing data).
     ---
     tags: [UI]
-    summary: GET /host-info?host=… — cache record + geo joined with the reputation DB
+    summary: GET /host-info?host=… — cache record + geo joined with the health DB
     responses:
       '200':
         description: Host detail
@@ -12455,10 +12455,10 @@ async def handle_dashboard_models(request):
     Dashboard models (JSON)
     ---
     tags: [UI]
-    summary: Normalized server list (each host once) for client-side model/host rendering
+    summary: Normalized host list (each host once) for client-side model/host rendering
     responses:
       '200':
-        description: Server list with per-host service, models, and checked time
+        description: Host list with per-host service, models, and checked time
         content:
           application/json:
             schema:
@@ -12624,7 +12624,7 @@ async def handle_host_status_query(request):
     Query the host-status table (JSON)
     ---
     tags: [UI]
-    summary: GET /dashboard/host-status?q=<;key op value;...> — reputation rows matching a filter
+    summary: GET /dashboard/host-status?q=<;key op value;...> — health rows matching a filter
     description: >
       A ;-delimited `key op value` filter (ops = > < >= <=) compiled to a
       parameterized WHERE over host_status; keys are whitelisted to the table's
@@ -12655,7 +12655,7 @@ async def handle_model_facets(request):
     Models matching a host facet (JSON)
     ---
     tags: [UI]
-    summary: GET /dashboard/model-facets?q=<model + ;key op value> — model names served by a host whose reputation matches the facets
+    summary: GET /dashboard/model-facets?q=<model + ;key op value> — model names served by a host whose health matches the facets
     description: >
       Splits the query like routing does (model token plus ';'-delimited host_status
       facets). With no facets the response has facets=false and the caller keeps its
@@ -12950,7 +12950,7 @@ async def handle_settings_test(request):
     Test additional sources (JSON)
     ---
     tags: [UI]
-    summary: Fetch each configured source and report how many servers/models it yields
+    summary: Fetch each configured source and report how many hosts/models it yields
     responses:
       '200':
         description: Per-source results
@@ -13058,7 +13058,7 @@ async def handle_server_count(request):
     Matching server count (JSON)
     ---
     tags: [UI]
-    summary: Number of servers whose models match the given chat model string
+    summary: Number of hosts in the pool whose models match the given chat model string
     parameters:
       - in: query
         name: q
@@ -13616,7 +13616,7 @@ async def handle_api_version(request):
     Get server version
     ---
     tags: [Info]
-    summary: Return the dyva proxy version
+    summary: Return the dyva version
     responses:
       '200':
         description: Version info
@@ -13636,7 +13636,7 @@ async def handle_api_activity(request):
     Activity stream (SSE)
     ---
     tags: [Monitoring]
-    summary: Server-sent events stream of real-time proxy activity
+    summary: Server-sent events stream of real-time activity
     responses:
       '200':
         description: SSE stream of activity events
@@ -13682,10 +13682,10 @@ async def handle_refresh(request):
     Refresh server cache
     ---
     tags: [Admin]
-    summary: Re-fetch server lists from every source (network), then reload the pool
+    summary: Refresh the host list from every source (network), then reload the pool
     description: |
       Unlike /reload-hosts (a pure disk re-read), this re-pulls all configured and
-      built-in sources over the network, rewrites free-ollama.json, and reloads the
+      built-in sources over the network, rewrites the host list, and reloads the
       in-memory pool — the full job behind the dashboard's host-count button. Returns
       the new server/model counts so the UI can update in place.
     responses:
@@ -14023,7 +14023,7 @@ async def handle_api_embeddings(request):
     Text embeddings (Ollama /api/embeddings format)
     ---
     tags: [Generation]
-    summary: Embed text via a discovered embedding host. Proxies to upstream Ollama/OpenAI servers, failing over across hosts.
+    summary: Embed text via an embedding host in the pool. Served by hosts in the pool, failing over across hosts.
     requestBody:
       required: true
       content:
@@ -14132,11 +14132,11 @@ async def handle_systemone(request):
     Decision models (Ollama /v1/systemone)
     ---
     tags: [Generation]
-    summary: Evaluate a state against typed questions via a discovered decision-model host (clef-flash, laya, tev1, nimble, …). Proxies to upstream Ollama servers, failing over across hosts.
+    summary: Evaluate a state against typed questions via a decision-model host in the pool (clef-flash, laya, tev1, nimble, …). Served by hosts in the pool, failing over across hosts.
     description: >
       Ollama's /v1/systemone endpoint (TypeSafe's Jev API): a `state` plus a map of
       1-64 named `questions` returns typed probabilistic `answers`. Just another
-      discovered-host endpoint — dyva resolves the model by name (the decision models
+      pool endpoint — dyva resolves the model by name (the decision models
       list in /api/tags like any other) and forwards the body verbatim through the SAME
       host race as chat (availability-first, reputation, hedge, failover, /workers). It
       is single-shot: no streaming, tools or context sizing.
@@ -14303,7 +14303,7 @@ async def handle_ollama_stop(request):
     Stop the dyva server
     ---
     tags: [Admin]
-    summary: Shut down the dyva proxy server immediately
+    summary: Shut down dyva immediately
     responses:
       '200':
         description: Server shutting down
@@ -14328,7 +14328,7 @@ async def handle_api_pull(request):
     Pull/refresh models (Ollama-compatible)
     ---
     tags: [Admin]
-    summary: Refresh server cache (Ollama /api/pull format)
+    summary: Refresh host cache (Ollama /api/pull format)
     responses:
       '200':
         description: Cache refreshed
@@ -14440,7 +14440,7 @@ async def handle_ollama_chat(request):
     Chat completion (Ollama format)
     ---
     tags: [Chat]
-    summary: Chat completion using Ollama /api/chat format. Proxies to upstream Ollama servers.
+    summary: Chat completion using Ollama /api/chat format. Served by hosts in the pool.
     responses:
       '200':
         description: Chat completion response (NDJSON stream or JSON)
@@ -14747,7 +14747,7 @@ async def handle_openai_chat(request):
     Chat completion (OpenAI format)
     ---
     tags: [Chat]
-    summary: Chat completion using OpenAI /v1/chat/completions format. Translates to Ollama format and proxies upstream.
+    summary: Chat completion using OpenAI /v1/chat/completions format. Translates to the internal format.
     responses:
       '200':
         description: Chat completion response (SSE stream or JSON)
@@ -14790,7 +14790,7 @@ async def handle_anthropic_messages(request):
     ---
     tags: [Chat]
     summary: Chat completion using Anthropic /v1/messages format. Translates to the internal
-             pipeline (via OpenAI) and proxies/races the pool, exactly like /v1/chat/completions.
+             pipeline (via OpenAI) and races the pool, exactly like /v1/chat/completions.
     responses:
       '200':
         description: Message response (SSE event stream or JSON Message)
@@ -14837,7 +14837,7 @@ async def handle_ollama_generate(request):
     Text generation (Ollama format)
     ---
     tags: [Generation]
-    summary: Text completion using Ollama /api/generate format. Proxies to upstream Ollama servers.
+    summary: Text completion using Ollama /api/generate format. Served by hosts in the pool.
     requestBody:
       required: true
       content:
@@ -14865,7 +14865,7 @@ async def handle_sd_models(request):
     List available SD models across all A1111 hosts
     ---
     tags: [Image]
-    summary: List Stable Diffusion models available on discovered A1111 hosts
+    summary: List Stable Diffusion models available on image hosts in the pool
     responses:
       '200':
         description: List of SD models
@@ -17252,7 +17252,7 @@ async def handle_txt2img(request):
     Text-to-image generation (A1111 format)
     ---
     tags: [Image]
-    summary: Generate images from text prompts. Proxies to A1111 Stable Diffusion WebUI servers.
+    summary: Generate images from text prompts. Served by image hosts in the pool.
     requestBody:
       required: true
       content:
@@ -17309,7 +17309,7 @@ async def handle_txt2img(request):
       '400':
         description: Invalid request
       '502':
-        description: Upstream error
+        description: Backend error
       '503':
         description: No available image-gen hosts
     """
@@ -18147,11 +18147,11 @@ async def handle_comfyui_proxy(request):
     ComfyUI pass-through proxy
     ---
     tags: [ComfyUI]
-    summary: Proxy any ComfyUI API request to a discovered host. Supports /prompt, /queue, /history, /view, /models, /system_stats, etc.
+    summary: Forward any ComfyUI API request to a host in the pool. Supports /prompt, /queue, /history, /view, /models, /system_stats, etc.
     description: |
-      Forward ComfyUI workflow requests to a discovered ComfyUI host.
+      Forward ComfyUI workflow requests to a host in the pool.
 
-      Strip the `/comfyui` prefix and proxy to a working host. Use `?host=ip:port` to target a specific host.
+      Strip the `/comfyui` prefix and forward to a working host in the pool. Use `?host=ip:port` to target a specific host.
 
       Supported endpoints:
       - `POST /comfyui/prompt` — Submit a workflow
@@ -18172,9 +18172,9 @@ async def handle_comfyui_proxy(request):
         description: Target a specific ComfyUI host (ip:port)
     responses:
       '200':
-        description: Proxied response from ComfyUI host
+        description: Response from the pool host
       '502':
-        description: Upstream error
+        description: Backend error
       '503':
         description: No available ComfyUI hosts
     """
@@ -21952,7 +21952,7 @@ async def handle_video_models(request):
     List available video models
     ---
     tags: [Video]
-    summary: GET /v1/videos/models — video-class models across discovered ComfyUI hosts
+    summary: GET /v1/videos/models — video-class models across ComfyUI hosts in the pool
     description: |
       Only files that are actually the thing you sample with: VAEs, text
       encoders, LoRAs and upscalers are excluded even when their names carry a
@@ -22249,7 +22249,7 @@ async def handle_tts_speech(request):
     OpenAI-compatible text-to-speech
     ---
     tags: [Audio]
-    summary: POST /v1/audio/speech — generate speech from text on a discovered ComfyUI host
+    summary: POST /v1/audio/speech — generate speech from text on a host in the pool
     description: |
       Accepts the OpenAI `/v1/audio/speech` shape (`model`, `input`, `voice`,
       `response_format`, `speed`) and returns binary audio. Backed by ComfyUI
@@ -22655,11 +22655,11 @@ async def handle_transcriptions(request):
     OpenAI-compatible speech-to-text
     ---
     tags: [Audio]
-    summary: POST /v1/audio/transcriptions — transcribe audio on a discovered fish ASR host
+    summary: POST /v1/audio/transcriptions — transcribe audio on an ASR host in the pool
     description: |
       Accepts the OpenAI `/v1/audio/transcriptions` multipart shape (`file`, optional
       `model`, `language`, `response_format`) and returns the transcript. Backed by
-      discovered fish-speech hosts that advertise the `asr` capability, raced best-first
+      fish-speech hosts in the pool that advertise the `asr` capability, raced best-first
       through the same reputation / 👎 / activity machinery as every other capability — a
       host that advertises the route without a loaded ASR model just fails that attempt and
       the race moves on. `response_format` supports `json` (default, `{"text": ...}`),
@@ -23718,7 +23718,7 @@ async def handle_edit_models(request):
     List available image-edit models
     ---
     tags: [Image]
-    summary: GET /v1/images/edit-models — edit-class models across discovered ComfyUI hosts
+    summary: GET /v1/images/edit-models — edit-class models across ComfyUI hosts in the pool
     description: |
       Edit models are a different population from SD checkpoints: these are the
       files the model classifier tags `edit` (Qwen-Image-Edit, Flux Kontext,
@@ -23765,7 +23765,7 @@ async def handle_image_edit(request):
     summary: POST /v1/images/edits — prompt-driven image editing on ComfyUI hosts
     description: |
       Takes a prompt and **zero or more** reference images and races the job
-      across discovered ComfyUI hosts running an edit model (Qwen-Image-Edit,
+      across ComfyUI hosts in the pool running an edit model (Qwen-Image-Edit,
       Flux Kontext, Flux.2, ...). Distinct from `/sdapi/v1/txt2img`, which is
       classic text-to-image; with no images this still runs, as a plain
       generation on the edit model.
