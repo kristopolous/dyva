@@ -6115,7 +6115,31 @@ def _dashboard_alias_rows():
     return _alias_rows_cache[1]
 
 
+# SPIKE (LAZY_TIERS): cache the whole candidate-list build. find_servers(sub, caps) is a pure
+# function of (pool, reputation, query) — none of which move second-to-second — yet a '*'-storm
+# rebuilds a byte-identical ~12k list per request (the _find_servers_raw matching loop + the
+# load_* calls that dominate once the sort/fit are lazy). A short TTL collapses N identical builds
+# into ~1/TTL and folds in load_incompatible/load_* too. Gated by LAZY_TIERS so the default path
+# (and the routing tests that assert on a fresh find_servers each call) are untouched.
+_FIND_CACHE = cachetools.TTLCache(maxsize=512, ttl=REPUTATION_CACHE_TTL)
+_find_cache_lock = threading.Lock()
+
+
 def find_servers(sub, caps=None):
+    if not LAZY_TIERS:
+        return _find_servers_impl(sub, caps)
+    key = (sub, None if caps is None else frozenset(caps))
+    with _find_cache_lock:
+        hit = _FIND_CACHE.get(key)
+    if hit is not None:
+        return hit
+    val = _find_servers_impl(sub, caps)
+    with _find_cache_lock:
+        _FIND_CACHE[key] = val
+    return val
+
+
+def _find_servers_impl(sub, caps=None):
     # Alias pre-pass: a leading `!name` segment is expanded to its configured query before any
     # parsing below. Every call site funnels through here, so they all get aliases for free; the
     # expansion is a no-op (fast path) when the query has no `!` or no aliases are configured.
@@ -8712,6 +8736,85 @@ def _is_tool_continuation(messages):
     return False
 
 
+# --- SPIKE (flag-gated, default OFF): lazy per-tier candidate ordering ---------------------
+# A '*' race assembles the whole pool (~12k) and sorts ALL of it up front, though the race
+# contacts candidates in WAVES and usually wins in an early tier — so most of that sort is
+# wasted. _LazyTierCandidates partitions by (segment, reputation tier) in one cheap O(n) pass
+# (prio is already on every tuple, no key computation), then sorts each tier ONLY when the
+# race draws from it. Win in tier 1 and the unknown/bad tiers are never ordered. Flag OFF
+# keeps the exact eager two-sort path. Toggle: DYVA_LAZY_TIERS=1.
+LAZY_TIERS = os.getenv("DYVA_LAZY_TIERS", "").strip().lower() not in ("", "0", "false", "no")
+
+
+class _LazyTierCandidates:
+    """Best-first candidate view that defers each tier's ordering until the race reaches it.
+    Supports len() and [0] — the racer needs the count (worker sizing / logging) and the single
+    current-best (its hedge check at entries[0]) — and iterates tier by tier, each tier sorted
+    lazily by the SAME within-tier key the eager path converges to: idle-first load-awareness,
+    then the reputation/size/favourability order (order_fn === the eager `_order`). Approximate
+    vs eager only in the rare TIER_LAST busy-demotion, which moves at most the one warm sticky."""
+    def __init__(self, items, order_fn, active, inflight, seg, fit=None):
+        self._order_fn, self._active, self._inflight, self._fit = order_fn, active, inflight, fit
+        self._n = len(items)
+        self._raw = {}
+        for it in items:
+            bk = ((seg.get(it[1], 0) if seg else 0), it[0])   # (segment, tier) — cheap partition
+            self._raw.setdefault(bk, []).append(it)
+        self._keys = sorted(self._raw)                        # tier order: best bucket first
+        self._prepped = {}
+
+    def __len__(self):
+        return self._n                                        # upper bound; the racer only sizes workers by it
+
+    def _within(self, it):
+        host = it[1]
+        return (self._inflight.get(host, 0) + (1 if host in self._active else 0), self._order_fn(it))
+
+    def _prep(self, bk):
+        # Sort AND (when a prompt set a ctx ceiling) fit-filter this ONE tier, lazily — reduce each
+        # host to its fitting models, drop hosts with none. An unreached tier is never fit-checked
+        # nor sorted, which is the whole point. Cached: a tier is prepared at most once.
+        out = self._prepped.get(bk)
+        if out is None:
+            items = self._raw[bk]
+            if self._fit is not None:
+                kept = []
+                for (p, h, ms) in items:
+                    g = [m for m in ms if self._fit(h, m)]
+                    if g:
+                        kept.append((p, h, g))
+                items = kept
+            out = sorted(items, key=self._within)
+            self._prepped[bk] = out
+        return out
+
+    def __getitem__(self, i):
+        if i != 0:
+            raise IndexError(i)
+        for bk in self._keys:                                 # first fitting candidate, best tier first
+            p = self._prep(bk)
+            if p:
+                return p[0]
+        for bk in self._keys:                                 # nothing fit: raw global best (last resort)
+            if self._raw[bk]:
+                return self._raw[bk][0]
+        raise IndexError(0)
+
+    def __iter__(self):
+        any_fit = False
+        for bk in self._keys:
+            for it in self._prep(bk):
+                any_fit = True
+                yield it
+        if not any_fit and self._fit is not None:
+            # nothing fit the prompt anywhere — mirror the eager filter's last resort: try every
+            # host (fitting models first) rather than fail the race instantly on a thin big-prompt pool.
+            for bk in self._keys:
+                for (p, h, ms) in sorted(self._raw[bk], key=self._within):
+                    yield (p, h, [m for m in ms if self._fit(h, m)] +
+                                 [m for m in ms if not self._fit(h, m)])
+
+
 async def _race_servers(session, model, servers, payload, do_stream, endpoint="/api/chat", remote=None, caps=None, job_wid=None, hedge_delay=0):
     # Mid-tool-loop continuations pin to the warm host: give it the whole round
     # before racing the pool (failover still fires instantly on a real failure).
@@ -8756,7 +8859,8 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
         if lim is None:
             lim = _ctx.get((host, canon_pattern(m)))
         return lim is None or lim >= _need
-    if _ctx:
+    if _ctx and not LAZY_TIERS:
+        # (LAZY_TIERS runs this fit-filter lazily per-tier inside _LazyTierCandidates instead.)
         # HARD ceiling: a (host,model) whose recorded ctx_limit is below this prompt physically
         # CANNOT serve it (the window is fixed), so don't race it to a guaranteed "won't fit" 400
         # every request. Drop the too-small pairs — and hosts left with no fitting model. BUT keep
@@ -8801,10 +8905,16 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
         return _race_key_with_segment(host, _race_sort_key(prio, _vote(host, ms),
                               _sizeband(_need, _maxok, CTX_CONFIDENT_FRACTION, host, ms),
                               warm0, _toobig(host, ms), favk), _seg)
-    servers = sorted(servers, key=_order)
-    for _i, (_p, _h, _m) in enumerate(servers):     # stamp final try-order rank for the log
-        if _h in _fav:
-            _fav[_h]["rank"] = _i
+    if LAZY_TIERS:
+        # SPIKE: defer per-tier ordering. The rank stamp (diagnostic only) and the second
+        # (load-aware) sort below are both folded into the lazy within-tier key, so skip them.
+        servers = _LazyTierCandidates(servers, _order, _active_hosts(), _inflight, _seg or {},
+                                      fit=(_fits if _ctx else None))
+    else:
+        servers = sorted(servers, key=_order)
+        for _i, (_p, _h, _m) in enumerate(servers):     # stamp final try-order rank for the log
+            if _h in _fav:
+                _fav[_h]["rank"] = _i
     errors = []
     errors_lock = asyncio.Lock()
     # Runaway-context clamp state (see _strip_should_trip): wall clock from race start, a
@@ -9224,7 +9334,9 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
         load = _inflight.get(host, 0) + (1 if host in _active else 0)
         eff = TIER_GOOD if (prio == TIER_LAST and load > 0) else prio
         return (eff, load)
-    servers = sorted(servers, key=_order_key)   # stable: recency order survives ties
+    if not LAZY_TIERS:
+        servers = sorted(servers, key=_order_key)   # stable: recency order survives ties
+    # (LAZY_TIERS folds this load-aware reorder into _LazyTierCandidates' within-tier key.)
     # Tag the worker with WHAT this request was routing for — the capability set
     # from needs_caps (vision / tools / audio / completion) and whether tools were
     # offered this turn — so the job record says what we were looking for. That's

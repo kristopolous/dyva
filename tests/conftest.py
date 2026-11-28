@@ -23,6 +23,9 @@ def _clear_reputation_caches():
         yield
         return
     _reset_rep_caches(dyva)
+    fc = getattr(dyva, "_FIND_CACHE", None)   # find_servers result cache (LAZY_TIERS fast path)
+    if fc is not None:
+        fc.clear()
     yield
 
 
