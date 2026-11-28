@@ -3131,7 +3131,7 @@ function renderWorkers(workers){
   // Notification badge on the Activity button: the number of live workers, or
   // hidden entirely when there are none.
   var _ab=document.getElementById('actBadge');
-  if(_ab){var _n=liveArr.length;_ab.textContent=_n>99?'99+':String(_n);_ab.hidden=!_n;}
+  if(_ab){var _n=liveArr.length;_ab.textContent=String(_n);_ab.hidden=!_n;}
   c.innerHTML='';
   // the empty-state line belongs only to a genuinely empty pane; finished
   // cards are content, not emptiness

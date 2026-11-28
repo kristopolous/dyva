@@ -32,6 +32,7 @@ import importlib.metadata
 
 import aiohttp
 import aiosqlite
+import cachetools               # TTL memo for the find_servers reputation set-builders
 try:
     import sqlite_vec           # loadable SQLite KNN extension (vec0); optional at runtime
 except ImportError:             # pragma: no cover - semantic search falls back to keyword
@@ -1933,6 +1934,14 @@ def is_active(host, except_wid=None):
                for w in _workers.values())
 
 
+def _active_hosts(except_wid=None):
+    """The set form of is_active(): every host carrying a live (not-done) worker, with
+    except_wid excluded. Built once so a candidate sort can test membership in O(1) instead
+    of re-scanning _workers per candidate — is_active() stays for cheap single-host checks."""
+    return {w.get("host") for w in _workers.values()
+            if w.get("host") and not w.get("done") and w.get("wid") != except_wid}
+
+
 # In-flight ATTEMPT count per host — incremented the moment a race worker starts an
 # attempt (before the first token), decremented when it resolves. is_active() only
 # sees a host once it's "found" (first token in hand), which misses the cold-start
@@ -3269,6 +3278,13 @@ def _get_db():
                 "COMMIT;")
         # The dashboard's per-model bars count rows by state, so index it.
         _status_db.execute("CREATE INDEX IF NOT EXISTS ix_host_status_state ON host_status(state)")
+        # find_servers' reputation loaders all filter `state=? AND is_query=0 AND deleted_at
+        # IS NULL` and read back (host, model). A covering composite answers those straight
+        # from the index — no per-row table lookup to re-check is_query/deleted_at — so each
+        # rebuild (after the TTL cache lapses) is cheap even at 35k+ rows.
+        _status_db.execute(
+            "CREATE INDEX IF NOT EXISTS ix_host_status_live "
+            "ON host_status(state, is_query, deleted_at, host, model)")
         # Per-(host, model) capabilities — dyva's runtime-discovered source of truth,
         # folded in from the legacy known-hosts.json. Keyed on the EXACT /api/tags
         # model name (a different namespace from host_status's canon'd query keys),
@@ -3397,6 +3413,22 @@ def _state_of(host, model):
     return row[0] if row else None
 
 
+# find_servers rebuilds these reputation sets on EVERY request — each a full host_status
+# scan allocating a ~19k-element set of f"{host} {model}" strings — which pegged the event
+# loop under a request burst (200 sequential calls = ~1200 rebuilds). They're pure functions
+# of host_status, but it's written on every verdict, so exact (total_changes) invalidation
+# would bust the cache on nearly every call mid-race and cache nothing; a short TTL decouples
+# cache life from write rate instead. Staleness <= REPUTATION_CACHE_TTL is harmless — a
+# just-flipped host simply loses (or is tried in) one more race before the set refreshes.
+# The shared lock keeps the caches safe if a background thread also loads (sqlite3 is opened
+# check_same_thread=False). Time-based loaders (load_unreachable_cooling) are NOT cached here.
+REPUTATION_CACHE_TTL = 1.0          # seconds a reputation set is reused before a rebuild
+_REP_CACHE_MAX = 16                 # distinct cache entries (states) to retain
+_rep_cache_lock = threading.Lock()
+
+
+@cachetools.cached(cachetools.TTLCache(maxsize=_REP_CACHE_MAX, ttl=REPUTATION_CACHE_TTL),
+                   lock=_rep_cache_lock)
 def _keys_with_state(state):
     return {f"{h} {m}" for h, m in _get_db().execute(
         f"SELECT host, model FROM host_status WHERE state=? AND {_LIVE_REAL}", (state,)).fetchall()}
@@ -3466,6 +3498,7 @@ _STRUCTURAL_FAIL_RE = re.compile(
     re.I)
 
 
+@cachetools.cached(cachetools.TTLCache(maxsize=1, ttl=REPUTATION_CACHE_TTL), lock=_rep_cache_lock)
 def load_incompatible():
     """{f'{host} {model}'} pairs whose recorded failure is STRUCTURAL (see
     _STRUCTURAL_FAIL_RE). find_servers HARD-EXCLUDES these — they never work, so
@@ -4848,6 +4881,7 @@ def node_survey_for(host, capability, ttl=NODE_SURVEY_TTL):
         return None
 
 
+@cachetools.cached(cachetools.TTLCache(maxsize=1, ttl=REPUTATION_CACHE_TTL), lock=_rep_cache_lock)
 def load_unreachable():
     # Host-wide exclusion set: hosts carrying EITHER host-wide-bad sentinel —
     # UNREACHABLE_KEY (dead socket) or HONEYPOT_KEY (conclusive honeypot). Kept as
@@ -9181,9 +9215,13 @@ async def _race_servers(session, model, servers, payload, do_stream, endpoint="/
     # sticky/last host: it earns a head start when uncontended, but the moment it's
     # already busy it loses that lead (demoted to its underlying good tier) so a
     # burst spreads across idle good hosts instead of queueing on the warm one.
+    # _workers can't change across this synchronous sort (no await), so resolve the active-host
+    # set ONCE instead of rescanning _workers per candidate inside the key — the per-request
+    # candidate x workers cost that pegged the event loop on a whole-pool query.
+    _active = _active_hosts()
     def _order_key(it):
         prio, host = it[0], it[1]
-        load = _inflight.get(host, 0) + (1 if is_active(host) else 0)
+        load = _inflight.get(host, 0) + (1 if host in _active else 0)
         eff = TIER_GOOD if (prio == TIER_LAST and load > 0) else prio
         return (eff, load)
     servers = sorted(servers, key=_order_key)   # stable: recency order survives ties
