@@ -66,6 +66,24 @@ def test_states_do_not_collide_in_the_cache(monkeypatch):
     assert bad is not good                                 # keyed by state, not one shared entry
 
 
+def test_default_ttl_is_five():
+    assert dyva.REPUTATION_CACHE_TTL == 5.0
+
+
+def test_set_cache_ttl_swaps_every_cache():
+    old = dyva.REPUTATION_CACHE_TTL
+    try:
+        dyva._set_cache_ttl(12.5)
+        assert dyva.REPUTATION_CACHE_TTL == 12.5
+        assert dyva._keys_with_state.cache.ttl == 12.5
+        assert dyva.load_incompatible.cache.ttl == 12.5
+        assert dyva.load_unreachable.cache.ttl == 12.5
+        assert dyva._FIND_CACHE.ttl == 12.5
+    finally:
+        dyva._set_cache_ttl(old)
+    assert dyva.REPUTATION_CACHE_TTL == old
+
+
 def test_cache_rebuild_reflects_current_table(monkeypatch):
     conn = _db([("http://h1:1", "m", "bad")])
     monkeypatch.setattr(dyva, "_status_db", conn, raising=False)

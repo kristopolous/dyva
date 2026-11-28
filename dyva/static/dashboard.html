@@ -1990,6 +1990,8 @@ body.dragging-image .hist-item{cursor:grabbing}
 <div class="settings-card">
 <div class="settings-card-title">Behavior<span class="dirty-flag">needs save</span></div>
 <label class="setting"><span class="setting-text"><span class="setting-name">Explore mode</span><small class="setting-help">Discover more of the unknown network: route hosts we haven't visited (unknown state) to the front of the line, ahead of known-good ones. Deliberately slower — a request may probe cold hosts first — but it maps out the pool. Off by default. <b>Caution:</b> the unvisited frontier is where the canary honeypots live, and poking a burst of fresh IPs is exactly what trips Cloudflare/WAF reputation — so this raises the chance of a soft IP ban on your egress. Use it for deliberate survey passes, not routine routing.</small></span><input type="checkbox" id="setExplore" onchange="updateExploreLogo()"></label>
+<label class="setting"><span class="setting-text"><span class="setting-name">Lazy tier routing</span><small class="setting-help">Prepare the candidate pool one reputation tier at a time — sort and ctx-fit-filter each tier only as the race reaches it, and cache the per-query candidate list — instead of sorting the whole pool up front on every request. A large CPU win for broad (<code>*</code>/any) queries that race the entire network: it does <b>not</b> change which hosts are raced, the tier order, or the exhaustive search. Recommended on.</small></span><input type="checkbox" id="setLazyTiers"></label>
+<label class="setting"><span class="setting-text"><span class="setting-name">Reputation cache (s)</span><small class="setting-help">How long dyva reuses the computed reputation and candidate-list sets before rebuilding them from the host DB. Higher = less CPU on broad (<code>*</code>/any) queries that scan the whole pool, at the cost of staleness: a host that just changed state is routed on the previous verdict for up to this long. 5s is a sane default and the exhaustive race self-corrects; drop it toward 1s only if you need near-instant reputation changes and don't mind the CPU.</small></span><input type="number" id="setRepCacheTtl" min="0.5" max="300" step="0.5"></label>
 <div class="setting"><span class="setting-text"><span class="setting-name">Thinking token key</span><small class="setting-help">For OpenAI <code>/v1</code> requests, which key(s) carry the model's reasoning. Every ticked key is emitted with the same text. OpenAI never standardized this field, so clones diverged — tick what <b>your</b> client reads. Emitting more than one can break a strict client that rejects unknown fields, so the default is the single OpenAI key. (The ollama <code>/api/chat</code> path always uses <code>thinking</code> and is unaffected.)</small>
 <div class="rk-opts">
 <label class="rk-opt"><input type="checkbox" id="rkReasoningContent"> OpenAI &mdash; <code>reasoning_content</code></label>
@@ -11240,6 +11242,7 @@ function populateSettings(s){
   document.getElementById('setStripKeepLast').value=('strip_keep_last' in s)?s.strip_keep_last:3;
   document.getElementById('setFanout').value=s.fanout;
   document.getElementById('setHedge').value=('hedge_delay' in s)?s.hedge_delay:30;
+  document.getElementById('setRepCacheTtl').value=('reputation_cache_ttl' in s)?s.reputation_cache_ttl:5;
   // connect-wait: null/absent = OFF, shown as the full lead (== hedge) so its grip rests at the
   // lead end; a number shows the connect sub-phase.
   var _wcw=('warm_connect_wait' in s)&&s.warm_connect_wait!=null?s.warm_connect_wait:(('hedge_delay' in s)?s.hedge_delay:30);
@@ -11262,6 +11265,7 @@ function populateSettings(s){
   var _al=document.getElementById('setAliases');if(_al&&s.aliases!==undefined)_al.value=s.aliases||'';
   document.getElementById('setLocal').checked=!!s.local;
   document.getElementById('setExplore').checked=!!s.explore;
+  document.getElementById('setLazyTiers').checked=!!s.lazy_tiers;
   document.getElementById('setHideDyva').checked=!!s.hide_dyva;
   updateExploreLogo();
   setReasoningKeys(s.reasoning_keys);
@@ -11397,6 +11401,7 @@ function saveSettings(){
     strip_keep_last:parseInt(document.getElementById('setStripKeepLast').value,10),
     fanout:parseInt(document.getElementById('setFanout').value,10),
     hedge_delay:parseInt(document.getElementById('setHedge').value,10),
+    reputation_cache_ttl:parseFloat(document.getElementById('setRepCacheTtl').value),
     // connect-wait >= hedge means OFF -> send null; otherwise the connect sub-phase in seconds.
     warm_connect_wait:(function(){var cw=parseInt(document.getElementById('setConnectWait').value,10),hd=parseInt(document.getElementById('setHedge').value,10);return(isNaN(cw)||cw>=hd)?null:cw;})(),
     min_count:parseInt(document.getElementById('setMinCount').value,10),
@@ -11408,6 +11413,7 @@ function saveSettings(){
     aliases:document.getElementById('setAliases').value,
     local:document.getElementById('setLocal').checked,
     explore:document.getElementById('setExplore').checked,
+    lazy_tiers:document.getElementById('setLazyTiers').checked,
     hide_dyva:document.getElementById('setHideDyva').checked,
     reasoning_keys:collectReasoningKeys(),
     cloudskip:_collectCloudSkip(),
@@ -11431,6 +11437,7 @@ function saveSettings(){
   if(isNaN(body.workers)||body.workers<1)delete body.workers;
   if(isNaN(body.timeout)||body.timeout<1)delete body.timeout;
   if(isNaN(body.hedge_delay)||body.hedge_delay<0)delete body.hedge_delay;
+  if(isNaN(body.reputation_cache_ttl)||body.reputation_cache_ttl<=0)delete body.reputation_cache_ttl;
   if(isNaN(body.worker_max)||body.worker_max<0)delete body.worker_max;   // 0 is valid (disables)
   if(isNaN(body.race_watchdog)||body.race_watchdog<0)delete body.race_watchdog;   // 0 is valid (off)
   if(isNaN(body.strip_after_hosts)||body.strip_after_hosts<0)delete body.strip_after_hosts;   // 0 = off
@@ -11469,6 +11476,7 @@ function saveSettings(){
   document.getElementById('setStripKeepLast').value=('strip_keep_last' in s)?s.strip_keep_last:3;
   document.getElementById('setFanout').value=s.fanout;
       document.getElementById('setHedge').value=('hedge_delay' in s)?s.hedge_delay:30;
+      document.getElementById('setRepCacheTtl').value=('reputation_cache_ttl' in s)?s.reputation_cache_ttl:5;
       document.getElementById('setConnectWait').value=('warm_connect_wait' in s)&&s.warm_connect_wait!=null?s.warm_connect_wait:(('hedge_delay' in s)?s.hedge_delay:30);
   _wireFanoutImpl();
       document.getElementById('setMinCount').value=s.min_count;
@@ -11479,6 +11487,7 @@ function saveSettings(){
   var _al=document.getElementById('setAliases');if(_al&&s.aliases!==undefined)_al.value=s.aliases||'';
       document.getElementById('setLocal').checked=!!s.local;
       document.getElementById('setExplore').checked=!!s.explore;
+      document.getElementById('setLazyTiers').checked=!!s.lazy_tiers;
       document.getElementById('setHideDyva').checked=!!s.hide_dyva;
       setReasoningKeys(s.reasoning_keys);
       renderCloudSkip(s.cloudskip||[]);

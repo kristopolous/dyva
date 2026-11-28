@@ -843,7 +843,7 @@ def model_modalities(model):
 def load_settings():
     """Apply persisted runtime settings (workers/timeout/min_count/local) over
     the CLI defaults, so changes made in the dashboard survive restarts."""
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION, RERANK_BUSY_SECS, RERANK_UP_SECS, RERANK_DOWN_SECS, AFFINITY_PREFIX_MSGS, AFFINITY_MIN_TOKENS, AFFINITY_TTL_SECS, AFFINITY_MAX_ENTRIES, AFFINITY_FLOOR_HOSTS, EMBED_MODEL, ALIASES, ALIASES_TEXT, STRIP_ENABLED, STRIP_AFTER_HOSTS, STRIP_AFTER_SECS, STRIP_KEEP_LAST
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, LAZY_TIERS, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION, RERANK_BUSY_SECS, RERANK_UP_SECS, RERANK_DOWN_SECS, AFFINITY_PREFIX_MSGS, AFFINITY_MIN_TOKENS, AFFINITY_TTL_SECS, AFFINITY_MAX_ENTRIES, AFFINITY_FLOOR_HOSTS, EMBED_MODEL, ALIASES, ALIASES_TEXT, STRIP_ENABLED, STRIP_AFTER_HOSTS, STRIP_AFTER_SECS, STRIP_KEEP_LAST
     if not os.path.exists(SETTINGS_FILE):
         return
     try:
@@ -894,6 +894,10 @@ def load_settings():
         _LOCAL = s["local"]
     if isinstance(s.get("explore"), bool):
         EXPLORE_MODE = s["explore"]
+    if isinstance(s.get("lazy_tiers"), bool):
+        LAZY_TIERS = s["lazy_tiers"]
+    if isinstance(s.get("reputation_cache_ttl"), (int, float)) and s["reputation_cache_ttl"] > 0:
+        _set_cache_ttl(float(s["reputation_cache_ttl"]))
     if isinstance(s.get("hide_dyva"), bool):
         HIDE_DYVA = s["hide_dyva"]
     if "model_list" in s:
@@ -3422,7 +3426,8 @@ def _state_of(host, model):
 # just-flipped host simply loses (or is tried in) one more race before the set refreshes.
 # The shared lock keeps the caches safe if a background thread also loads (sqlite3 is opened
 # check_same_thread=False). Time-based loaders (load_unreachable_cooling) are NOT cached here.
-REPUTATION_CACHE_TTL = 1.0          # seconds a reputation set is reused before a rebuild
+REPUTATION_CACHE_TTL = 5.0          # seconds a reputation set is reused before a rebuild; live
+                                    # setting "reputation_cache_ttl" (_set_cache_ttl swaps the caches)
 _REP_CACHE_MAX = 16                 # distinct cache entries (states) to retain
 _rep_cache_lock = threading.Lock()
 
@@ -6123,6 +6128,18 @@ def _dashboard_alias_rows():
 # (and the routing tests that assert on a fresh find_servers each call) are untouched.
 _FIND_CACHE = cachetools.TTLCache(maxsize=512, ttl=REPUTATION_CACHE_TTL)
 _find_cache_lock = threading.Lock()
+
+
+def _set_cache_ttl(ttl):
+    """Rebuild the reputation + find-servers caches with a new TTL (seconds). cachetools bakes the
+    TTL into each cache at construction, so a live change means swapping the cache objects (the
+    @cached wrappers read their .cache attribute). Called from load_settings / handle_settings_post."""
+    global REPUTATION_CACHE_TTL, _FIND_CACHE
+    REPUTATION_CACHE_TTL = float(ttl)
+    _keys_with_state.cache = cachetools.TTLCache(maxsize=_REP_CACHE_MAX, ttl=REPUTATION_CACHE_TTL)
+    load_incompatible.cache = cachetools.TTLCache(maxsize=1, ttl=REPUTATION_CACHE_TTL)
+    load_unreachable.cache = cachetools.TTLCache(maxsize=1, ttl=REPUTATION_CACHE_TTL)
+    _FIND_CACHE = cachetools.TTLCache(maxsize=512, ttl=REPUTATION_CACHE_TTL)
 
 
 def find_servers(sub, caps=None):
@@ -12932,6 +12949,8 @@ async def handle_settings_get(request):
                               "strip_enabled": STRIP_ENABLED, "strip_after_hosts": STRIP_AFTER_HOSTS, "strip_after_secs": STRIP_AFTER_SECS, "strip_keep_last": STRIP_KEEP_LAST,
                               "min_count": MIN_COUNT, "local": _LOCAL,
                               "explore": EXPLORE_MODE, "hide_dyva": HIDE_DYVA,
+                              "lazy_tiers": LAZY_TIERS,
+                              "reputation_cache_ttl": REPUTATION_CACHE_TTL,
                               "cloudskip": sorted(CLOUD_SKIP),
                               "base_path": BASE_PATH,
                               "admin_pw_set": bool(ADMIN_PW),
@@ -12956,7 +12975,7 @@ async def handle_settings_post(request):
       '200':
         description: Updated settings
     """
-    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION, RERANK_BUSY_SECS, RERANK_UP_SECS, RERANK_DOWN_SECS, AFFINITY_PREFIX_MSGS, AFFINITY_MIN_TOKENS, AFFINITY_TTL_SECS, AFFINITY_MAX_ENTRIES, AFFINITY_FLOOR_HOSTS, EMBED_MODEL, ALIASES, ALIASES_TEXT, STRIP_ENABLED, STRIP_AFTER_HOSTS, STRIP_AFTER_SECS, STRIP_KEEP_LAST
+    global WORKER_COUNT, TIMEOUT, MIN_COUNT, ADMIN_PW, _LOCAL, MODEL_LIST, MODEL_LIST_ON, HEDGE_DELAY, INPUT_RATE, TIMEOUT_MAX, FANOUT, REASONING_KEYS, EXPLORE_MODE, LAZY_TIERS, CLOUD_SKIP, BASE_PATH, WORKER_MAX, WORKER_MAX_FAILOVER, TOOL_RESUME, RACE_WATCHDOG, WARM_CONNECT_WAIT, GOSSIPER_URL, GOSSIPER_ENABLED, HIDE_DYVA, CTX_CONFIDENT_FRACTION, RERANK_BUSY_SECS, RERANK_UP_SECS, RERANK_DOWN_SECS, AFFINITY_PREFIX_MSGS, AFFINITY_MIN_TOKENS, AFFINITY_TTL_SECS, AFFINITY_MAX_ENTRIES, AFFINITY_FLOOR_HOSTS, EMBED_MODEL, ALIASES, ALIASES_TEXT, STRIP_ENABLED, STRIP_AFTER_HOSTS, STRIP_AFTER_SECS, STRIP_KEEP_LAST
     resp = await _check_local(request) or _check_admin(request)
     if resp:
         return resp
@@ -13010,6 +13029,10 @@ async def handle_settings_post(request):
         _LOCAL = body["local"]
     if isinstance(body.get("explore"), bool):
         EXPLORE_MODE = body["explore"]
+    if isinstance(body.get("lazy_tiers"), bool):
+        LAZY_TIERS = body["lazy_tiers"]
+    if isinstance(body.get("reputation_cache_ttl"), (int, float)) and body["reputation_cache_ttl"] > 0:
+        _set_cache_ttl(float(body["reputation_cache_ttl"]))
     if isinstance(body.get("hide_dyva"), bool):
         HIDE_DYVA = body["hide_dyva"]
     if isinstance(body.get("cloudskip"), list):
@@ -13080,6 +13103,8 @@ async def handle_settings_post(request):
                               "strip_enabled": STRIP_ENABLED, "strip_after_hosts": STRIP_AFTER_HOSTS, "strip_after_secs": STRIP_AFTER_SECS, "strip_keep_last": STRIP_KEEP_LAST,
                               "min_count": MIN_COUNT, "local": _LOCAL,
                               "explore": EXPLORE_MODE, "hide_dyva": HIDE_DYVA,
+                              "lazy_tiers": LAZY_TIERS,
+                              "reputation_cache_ttl": REPUTATION_CACHE_TTL,
                               "cloudskip": sorted(CLOUD_SKIP),
                               "base_path": BASE_PATH,
                               "admin_pw_set": bool(ADMIN_PW),
